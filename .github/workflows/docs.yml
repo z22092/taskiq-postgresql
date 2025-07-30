@@ -1,0 +1,121 @@
+name: Documentation
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  check-readme:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Check README links
+        run: |
+          # Install markdown-link-check if needed
+          npm install -g markdown-link-check
+          markdown-link-check README.md --config .github/markdown-link-check.json || true
+
+      - name: Validate code examples in README
+        run: |
+          # Extract and validate Python code blocks from README
+          python -c "
+          import re
+          import tempfile
+          import subprocess
+          import sys
+          
+          with open('README.md', 'r') as f:
+              content = f.read()
+          
+          # Find Python code blocks
+          python_blocks = re.findall(r'```python\n(.*?)\n```', content, re.DOTALL)
+          
+          for i, block in enumerate(python_blocks):
+              if 'import' in block and 'taskiq_postgresql' in block:
+                  # Create temporary file
+                  with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+                      tmp.write(block)
+                      tmp_path = tmp.name
+                  
+                  # Check syntax
+                  result = subprocess.run(['python', '-m', 'py_compile', tmp_path], 
+                                        capture_output=True, text=True)
+                  
+                  if result.returncode != 0:
+                      print(f'Syntax error in code block {i+1}:')
+                      print(result.stderr)
+                      sys.exit(1)
+                  
+                  print(f'Code block {i+1} is valid')
+          
+          print('All Python code blocks are syntactically valid')
+          "
+
+  check-docstrings:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Check docstring coverage
+        run: |
+          uv run python -c "
+          import ast
+          import os
+          
+          def check_docstrings(file_path):
+              with open(file_path, 'r') as file:
+                  content = file.read()
+              
+              tree = ast.parse(content)
+              missing_docstrings = []
+              
+              for node in ast.walk(tree):
+                  if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                      if not ast.get_docstring(node):
+                          missing_docstrings.append(f'{node.name} at line {node.lineno}')
+              
+              return missing_docstrings
+          
+          # Check all Python files in taskiq_postgresql
+          missing_total = []
+          for root, dirs, files in os.walk('taskiq_postgresql'):
+              for file in files:
+                  if file.endswith('.py') and not file.startswith('__'):
+                      file_path = os.path.join(root, file)
+                      missing = check_docstrings(file_path)
+                      if missing:
+                          missing_total.extend([f'{file_path}: {item}' for item in missing])
+          
+          if missing_total:
+              print('Missing docstrings in:')
+              for item in missing_total:
+                  print(f'  - {item}')
+              print(f'Total: {len(missing_total)} missing docstrings')
+          else:
+              print('All public functions and classes have docstrings!')
+          "

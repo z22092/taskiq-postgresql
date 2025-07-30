@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --dev
+
+      - name: Run ruff check
+        run: uv run ruff check --output-format=github .
+
+      - name: Run ruff format
+        run: uv run ruff format --check .
+
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
+        driver: ["asyncpg", "psycopg", "psqlpy"]
+        include:
+          - driver: asyncpg
+            extra: asyncpg
+          - driver: psycopg
+            extra: psycopg
+          - driver: psqlpy
+            extra: psqlpy
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+          POSTGRES_DB: taskiq_test
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: |
+          uv sync --dev --group ${{ matrix.extra }}
+
+      - name: Run tests with pytest
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/taskiq_test
+          TEST_DRIVER: ${{ matrix.driver }}
+        run: |
+          uv run pytest tests/ -v --cov=taskiq_postgresql --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        if: matrix.python-version == '3.12' && matrix.driver == 'asyncpg' && secrets.CODECOV_TOKEN != ''
+        with:
+          file: ./coverage.xml
+          fail_ci_if_error: false
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  integration-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+        with:
+          version: "latest"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Start services
+        run: docker-compose up -d
+
+      - name: Wait for PostgreSQL
+        run: |
+          for i in {1..30}; do
+            if docker-compose exec -T postgres pg_isready -U postgres; then
+              echo "PostgreSQL is ready"
+              break
+            fi
+            echo "Waiting for PostgreSQL... ($i/30)"
+            sleep 2
+          done
+
+      - name: Install all driver dependencies
+        run: |
+          uv sync --dev --group asyncpg --group psycopg --group psqlpy
+
+      - name: Run integration tests
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
+        run: |
+          uv run pytest tests/ -v -m "integration" --tb=short
+
+      - name: Stop services
+        if: always()
+        run: docker-compose down
