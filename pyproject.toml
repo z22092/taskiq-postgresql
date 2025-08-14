@@ -1,10 +1,11 @@
 [project]
 name = "taskiq-postgresql"
-version = "0.1.0"
+version = "0.1.2"
 description = "PostgreSQL integration for taskiq"
 readme = "README.md"
 authors = [
-    { name = "jeffersonsilva-mb", email = "jefferson.silva@mb.com.br" },{ name = "Jefferson Venceslau", email = "jeff.venceslau@gmail.com" }
+    { name = "jeffersonsilva-mb", email = "jefferson.silva@mb.com.br" },
+    { name = "Jefferson Venceslau", email = "jeff.venceslau@gmail.com" }
 ]
 dependencies = ["taskiq>=0.11.7"]
 license = "MIT"
@@ -44,6 +45,19 @@ keywords = [
     "psycopg3",
 ]
 packages = [{ include = "taskiq_postgresql" }]
+
+[project.optional-dependencies]
+asyncpg = [
+    "asyncpg>=0.30.0",
+]
+
+psqlpy = [
+    "psqlpy>=0.11.3",
+]
+psycopg = [
+    "psycopg[binary,pool]>=3.2.9",
+]
+
 
 [build-system]
 requires = ["hatchling"]
@@ -166,15 +180,3 @@ allow_dirty = false
 commit = false
 message = "Bump version: {current_version} → {new_version}"
 commit_args = ""
-
-[dependency-groups]
-asyncpg = [
-    "asyncpg>=0.30.0",
-]
-
-psqlpy = [
-    "psqlpy>=0.11.3",
-]
-psycopg = [
-    "psycopg[binary,pool]>=3.2.9",
-]

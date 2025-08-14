@@ -85,14 +85,8 @@ class AsyncpgDriver(QueryDriver):
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Connection]:
-        connection = None
-        try:
-            connection = await self.pool.acquire()
-
+        async with self.pool.acquire() as connection:
             yield connection
-        finally:
-            if connection is not None:
-                await self.pool.release(connection)
 
     async def __aenter__(self) -> Connection:
         """Enter the context manager."""

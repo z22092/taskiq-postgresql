@@ -45,7 +45,7 @@ cd taskiq-postgresql
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install dependencies
-uv sync --dev --group asyncpg --group psycopg --group psqlpy --group pg8000
+uv sync --dev --all-extras
 
 # Set up pre-commit hooks (optional but recommended)
 uv run pre-commit install
