@@ -164,6 +164,22 @@ class AsyncpgDriver(QueryDriver):
                 value,
             )
 
+    async def delete_returning(
+        self,
+        where_column: Column,
+        value: Any,
+        returning: Sequence[Column],
+    ) -> Optional[dict[str, Any]]:
+        """Atomically delete a row and return requested columns."""
+        async with self, self.connection() as connection:
+            row = await connection.fetchrow(
+                self.delete_returning_query.make_query(where_column, returning),
+                value,
+            )
+            if row is None:
+                return None
+            return {column.name: row[column.name] for column in returning}
+
     async def select(
         self,
         columns: Sequence[Column],

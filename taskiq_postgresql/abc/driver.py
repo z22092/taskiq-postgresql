@@ -12,6 +12,7 @@ from taskiq_postgresql.abc.query import (
     CreateTableQuery,
     DeleteByDateQuery,
     DeleteQuery,
+    DeleteReturningQuery,
     InsertOrUpdateQuery,
     InsertQuery,
     SelectQuery,
@@ -49,6 +50,7 @@ class QueryDriver(ABC):
             self.table_name,
         )
         self.delete_query = DeleteQuery(self.table_name)
+        self.delete_returning_query = DeleteReturningQuery(self.table_name)
         self.delete_by_date_query = DeleteByDateQuery(self.table_name)
         self.select_query = SelectQuery(
             self.table_name,
@@ -100,6 +102,19 @@ class QueryDriver(ABC):
     @abstractmethod
     async def delete(self, column: Column, value: Any) -> Any:
         """Delete a row from a table."""
+
+    @abstractmethod
+    async def delete_returning(
+        self,
+        where_column: Column,
+        value: Any,
+        returning: Sequence[Column],
+    ) -> Optional[dict[str, Any]]:
+        """Atomically delete a row and return requested columns.
+
+        Returns a dictionary mapping column names to values for the deleted row,
+        or None if no row matched (e.g., already claimed by another worker).
+        """
 
     @abstractmethod
     async def delete_by_date(
