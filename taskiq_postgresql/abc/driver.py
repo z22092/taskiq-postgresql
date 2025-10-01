@@ -30,6 +30,7 @@ class QueryDriver(ABC):
         primary_key: Column,
         created_at: Optional[Column] = None,
         index_columns: Optional[Sequence[Column]] = None,
+        run_migrations: bool = False,
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the backend."""
@@ -56,7 +57,8 @@ class QueryDriver(ABC):
             self.table_name,
         )
         self.insert_or_update_query = InsertOrUpdateQuery(self.table_name)
-
+        self.run_migrations = run_migrations
+        
     @abstractmethod
     async def __aenter__(self) -> Self:
         """Enter the context manager."""

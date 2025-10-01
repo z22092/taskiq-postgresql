@@ -44,6 +44,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         field_for_task_id: Literal["VarChar", "Text", "Uuid"] = "Uuid",
         serializer: Optional[TaskiqSerializer] = None,
         driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
+        run_migrations: bool = False,
         **connect_kwargs: Any,
     ) -> None:
         """
@@ -75,6 +76,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             ],
             primary_key=self.columns.primary_key,
             index_columns=[self.columns.primary_key],
+            run_migrations=run_migrations,
             **connect_kwargs,
         )
 
