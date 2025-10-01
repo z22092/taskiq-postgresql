@@ -195,6 +195,26 @@ class PsycopgDriver(QueryDriver):
                     return next(iter(value))
             return None
 
+    async def delete_returning(
+        self,
+        where_column: Column,
+        value: Any,
+        returning: Sequence[Column],
+    ) -> Optional[dict[str, Any]]:
+        """Atomically delete a row and return requested columns."""
+        async with self, self.connection() as connection:
+            cursor = connection.cursor(row_factory=dict_row)
+            cursor = await cursor.execute(
+                self.delete_returning_query.make_query(where_column, returning),
+                params=self.__parser_params([where_column], [value]),
+            )
+            if cursor.rownumber is not None:
+                row = await cursor.fetchone()
+                if row is not None:
+                    # row is already a dict thanks to dict_row
+                    return {column.name: row[column.name] for column in returning}
+            return None
+
     async def select(
         self,
         columns: Sequence[Column],

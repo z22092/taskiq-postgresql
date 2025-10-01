@@ -166,6 +166,24 @@ class PsqlpyDriver(QueryDriver):
             )
             return results.result(as_tuple=True)
 
+    async def delete_returning(
+        self,
+        where_column: Column,
+        value: Any,
+        returning: Sequence[Column],
+    ) -> Optional[dict[str, Any]]:
+        """Atomically delete a row and return requested columns."""
+        async with self, self.connection() as connection:
+            results = await connection.fetch(
+                self.delete_returning_query.make_query(where_column, returning),
+                self.__parser_query([where_column], [value]),
+            )
+            rows = results.result()
+            if not rows:
+                return None
+            row = rows[0]
+            return {column.name: row[column.name] for column in returning}
+
     async def select(
         self,
         columns: Sequence[Column],

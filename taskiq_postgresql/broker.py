@@ -214,31 +214,50 @@ class PostgresqlBroker(AsyncBroker):
 
         Yields messages as they are received.
 
+        This method atomically claims messages using DELETE ... RETURNING, ensuring
+        that only a single worker processes each message even though NOTIFY is
+        broadcast to all listeners.
+
         :yields: AckableMessage instances.
         """
         while True:
             try:
                 async for message_id in self.listen_driver:
-                    message: Optional[bytes] = next(
-                        iter(
-                            await self.driver.select(
-                                [self.columns.primary_key, self.columns.message],
-                                [self.columns.primary_key],
-                                [message_id],
-                            ),
-                        ),
-                        {},
-                    ).get(self.columns.message.name)
+                    # Normalize payload to integer ID (psycopg may yield string payloads).
+                    try:
+                        normalized_id = int(message_id)  # type: ignore[arg-type]
+                    except (TypeError, ValueError):
+                        logger.warning(
+                            "Invalid NOTIFY payload %r on channel %s",
+                            message_id,
+                            self.channel_name,
+                        )
+                        continue
+
+                    # Atomically claim the message row. If None is returned, another
+                    # worker has already claimed it.
+                    row = await self.driver.delete_returning(
+                        self.columns.primary_key,
+                        normalized_id,
+                        [self.columns.message],
+                    )
+
+                    if row is None:
+                        # Claimed elsewhere or missing; skip.
+                        continue
+
+                    message: Optional[bytes] = row.get(self.columns.message.name)
 
                     if message is None:
                         logger.warning(
-                            "Message with id %s not found in database.",
+                            "Message with id %s has no payload.",
                             message_id,
                         )
                         continue
 
-                    async def ack(*, _message_id: int = message_id) -> None:
-                        await self.driver.delete(self.columns.primary_key, _message_id)
+                    async def ack(*, _message_id: int = message_id) -> None:  # noqa: ARG001
+                        # No-op: the row was already deleted when claimed.
+                        return None
 
                     yield AckableMessage(data=message, ack=ack)
             except Exception as error:

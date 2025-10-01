@@ -164,6 +164,22 @@ class DeleteQuery(QueryBase):
         return f"DELETE FROM {self.table_name} WHERE {column.name} = $1"  # noqa: S608
 
 
+class DeleteReturningQuery(QueryBase):
+    """Query to delete a row from a table and return specified columns."""
+
+    def __init__(self, table_name: str) -> None:
+        """Initialize the query."""
+        super().__init__(table_name)
+
+    def make_query(self, where_column: Column, returning: Sequence[Column]) -> str:
+        """Return the query as a string."""
+        return (
+            f"DELETE FROM {self.table_name} "  # noqa: S608
+            f"WHERE {where_column.name} = $1 "
+            f"RETURNING {', '.join(column.name for column in returning)}"
+        )
+
+
 class DeleteByDateQuery(QueryBase):
     """Query to delete a row from a table by date."""
 
