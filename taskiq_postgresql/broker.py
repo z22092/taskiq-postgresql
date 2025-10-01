@@ -66,6 +66,7 @@ class PostgresqlBroker(AsyncBroker):
         max_retry_attempts: int = 5,
         connection_kwargs: dict[str, Any] | None = None,
         pool_kwargs: dict[str, Any] | None = None,
+        run_migrations: bool = False,
     ) -> None:
         """
         Construct a new broker.
@@ -120,6 +121,7 @@ class PostgresqlBroker(AsyncBroker):
             primary_key=self.columns.primary_key,
             created_at=self.columns.created_at,
             index_columns=[self.columns.primary_key],
+            run_migrations=run_migrations,
             **self.connection_kwargs,
         )
         self.listen_driver: ListenDriver = get_db_listen_driver(driver)(

@@ -27,6 +27,7 @@ class PsqlpyDriver(QueryDriver):
         primary_key: Column,
         created_at: Optional[Column] = None,
         index_columns: Optional[Sequence[Column]] = None,
+        run_migrations: bool = False,
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the backend."""
@@ -37,6 +38,7 @@ class PsqlpyDriver(QueryDriver):
             primary_key,
             created_at,
             index_columns,
+            run_migrations,
             **connection_kwargs,
         )
 
@@ -225,12 +227,13 @@ class PsqlpyDriver(QueryDriver):
 
     async def on_startup(self) -> None:
         """On startup."""
-        async with self, self.connection() as connection:
-            transaction = connection.transaction()
-            await transaction.begin()
-            await self.create_table()
-            await self.create_index()
-            await transaction.commit()
+        if self.run_migrations:
+            async with self, self.connection() as connection:
+                transaction = connection.transaction()
+                await transaction.begin()
+                await self.create_table()
+                await self.create_index()
+                await transaction.commit()
 
     async def on_shutdown(self) -> None:
         """On shutdown."""

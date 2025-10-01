@@ -44,6 +44,7 @@ class PsycopgDriver(QueryDriver):
         primary_key: Column,
         created_at: Optional[Column] = None,
         index_columns: Optional[Sequence[Column]] = None,
+        run_migrations: bool = False,
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the backend."""
@@ -54,6 +55,7 @@ class PsycopgDriver(QueryDriver):
             primary_key,
             created_at,
             index_columns,
+            run_migrations,
             **connection_kwargs,
         )
 
@@ -270,10 +272,11 @@ class PsycopgDriver(QueryDriver):
 
     async def on_startup(self) -> None:
         """On startup."""
-        async with self, self.connection() as connection:  # noqa: SIM117
-            async with connection.transaction():
-                await self.create_table()
-                await self.create_index()
+        if self.run_migrations:
+            async with self, self.connection() as connection:  # noqa: SIM117
+                async with connection.transaction():
+                    await self.create_table()
+                    await self.create_index()
 
     async def on_shutdown(self) -> None:
         """On shutdown."""

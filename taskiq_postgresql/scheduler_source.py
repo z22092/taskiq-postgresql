@@ -53,6 +53,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
         driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
         startup_schedule: Optional[dict[str, list[dict[str, Any]]]] = None,
         broker: Optional[AsyncBroker] = None,
+        run_migrations: bool = False,
         **connect_kwargs: Any,
     ) -> None:
         """Initialize the PostgreSQL scheduler source.
@@ -114,6 +115,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
             primary_key=self.columns.primary_key,
             created_at=self.columns.created_at,
             index_columns=[self.columns.primary_key, self.columns.task_name],
+            run_migrations=run_migrations,
             **connect_kwargs,
         )
 
