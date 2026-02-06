@@ -4,6 +4,7 @@ from typing import Any, Callable, Final, Literal, Optional, TypeVar, Union
 
 from taskiq import AsyncResultBackend, TaskiqResult
 from taskiq.abc.serializer import TaskiqSerializer
+from taskiq.depends.progress_tracker import TaskProgress
 from taskiq.serializers.pickle import PickleSerializer
 
 from taskiq_postgresql.abc.driver import QueryDriver
@@ -22,6 +23,12 @@ class Table:
     result: Column = Column(  # noqa: RUF009
         name="result",
         type_="BYTEA",
+        nullable=True,
+    )
+    progress: Column = Column(  # noqa: RUF009
+        name="progress",
+        type_="BYTEA",
+        nullable=True,
     )
 
 
@@ -73,6 +80,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             table_name,
             columns=[
                 self.columns.result,
+                self.columns.progress,
             ],
             primary_key=self.columns.primary_key,
             index_columns=[self.columns.primary_key],
@@ -190,6 +198,66 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             taskiq_result.log = None
 
         return taskiq_result
+
+    async def set_progress(
+        self,
+        task_id: Any,
+        progress: TaskProgress[Any],
+    ) -> None:
+        """
+        Set progress to the PostgreSQL table.
+
+        Args:
+            task_id (Any): ID of the task.
+            progress (TaskProgress[Any]): progress of the task.
+
+        """
+        await self.driver.insert_or_update(
+            [
+                self.columns.primary_key,
+                self.columns.progress,
+            ],
+            [
+                task_id,
+                self.serializer.dumpb(progress),
+            ],
+            [
+                self.columns.primary_key,
+            ],
+            [
+                self.columns.progress,
+            ],
+        )
+
+    async def get_progress(
+        self,
+        task_id: Any,
+    ) -> Optional[TaskProgress[Any]]:
+        """
+        Retrieve progress of the task.
+
+        :param task_id: task's id.
+        :return: TaskProgress or None.
+        """
+        data = await self.driver.select(
+            [
+                self.columns.progress,
+            ],
+            [
+                self.columns.primary_key,
+            ],
+            [task_id],
+        )
+
+        if len(data) == 0:
+            return None
+
+        progress_bytes = next(iter(data))["progress"]
+
+        if progress_bytes is None:
+            return None
+
+        return self.serializer.loadb(progress_bytes)
 
     async def delete_by_date(
         self,
