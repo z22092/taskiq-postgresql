@@ -4,6 +4,8 @@ from typing import Any, Callable, Final, Literal, Optional, TypeVar, Union
 
 from taskiq import AsyncResultBackend, TaskiqResult
 from taskiq.abc.serializer import TaskiqSerializer
+from taskiq.compat import model_dump, model_validate
+from taskiq.depends.progress_tracker import TaskProgress
 from taskiq.serializers.pickle import PickleSerializer
 
 from taskiq_postgresql.abc.driver import QueryDriver
@@ -12,6 +14,8 @@ from taskiq_postgresql.exceptions import ResultIsMissingError
 from taskiq_postgresql.utils import get_db_driver
 
 _ReturnType = TypeVar("_ReturnType")
+
+PROGRESS_KEY_SUFFIX = "__progress"
 
 
 @dataclass
@@ -204,3 +208,81 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             to_date (datetime | date | None): Date to which to delete results.
         """
         await self.driver.delete_by_date(from_date, to_date)
+        
+
+    async def set_progress(
+        self,
+        task_id: Any,
+        progress: TaskProgress[_ReturnType],
+    ) -> None:
+        """
+        Store task progress.
+
+        Args:
+            task_id: ID of the task.
+            progress: Progress payload.
+        """
+        await self.driver.insert_or_update(
+            [
+                self.columns.primary_key,
+                self.columns.result,
+            ],
+            [
+                f"{task_id}{PROGRESS_KEY_SUFFIX}",
+                self.serializer.dumpb(model_dump(progress)),
+            ],
+            [
+                self.columns.primary_key,
+            ],
+            [
+                self.columns.result,
+            ],
+        )
+
+    async def get_progress(
+        self,
+        task_id: Any,
+    ) -> TaskProgress[_ReturnType] | None:
+        """
+        Retrieve task progress.
+
+        Args:
+            task_id: ID of the task.
+
+        Returns:
+            TaskProgress instance or None.
+        """
+        data = await self.driver.select(
+            [
+                self.columns.result,
+            ],
+            [
+                self.columns.primary_key,
+            ],
+            [f"{task_id}{PROGRESS_KEY_SUFFIX}"],
+        )
+
+        if not data:
+            return None
+
+        progress_bytes = data[0]["result"]
+
+        if progress_bytes is None:
+            return None
+
+        return model_validate(
+            TaskProgress[_ReturnType],
+            self.serializer.loadb(progress_bytes),
+        )
+
+    async def delete_progress(self, task_id: Any) -> None:
+        """
+        Delete stored progress for a task.
+
+        Args:
+            task_id: ID of the task.
+        """
+        await self.driver.delete(
+            self.columns.primary_key,
+            f"{task_id}{PROGRESS_KEY_SUFFIX}",
+        )
