@@ -1,17 +1,46 @@
-from asyncio import Queue as AsyncQueue
-from contextlib import asynccontextmanager
+from asyncio import Event
+from asyncio import TimeoutError as AsyncioTimeoutError
+from collections import deque
+from collections.abc import Callable
+from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime
 from types import TracebackType
 from typing import Any, AsyncIterator, Optional, Sequence, Union
 from uuid import UUID
 
 from asyncpg import Connection, Pool, connect, create_pool
+from asyncpg.exceptions import (
+    AdminShutdownError,
+    CannotConnectNowError,
+    CrashShutdownError,
+    IdleSessionTimeoutError,
+    InterfaceError,
+    PostgresConnectionError,
+    PostgresError,
+    TooManyConnectionsError,
+)
 from asyncpg.transaction import Transaction
 from taskiq.compat import IS_PYDANTIC2
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
-from taskiq_postgresql.exceptions import DatabaseConnectionError
+from taskiq_postgresql.exceptions import (
+    DatabaseConnectionError,
+    ListenerDisconnectedError,
+    TransientDatabaseConnectionError,
+)
+
+_TRANSIENT_CONNECTION_ERRORS = (
+    OSError,
+    TimeoutError,
+    AsyncioTimeoutError,
+    PostgresConnectionError,
+    AdminShutdownError,
+    CrashShutdownError,
+    CannotConnectNowError,
+    IdleSessionTimeoutError,
+    TooManyConnectionsError,
+)
 
 if IS_PYDANTIC2:
     from pydantic_core import to_json
@@ -87,8 +116,20 @@ class AsyncpgDriver(QueryDriver):
 
     @asynccontextmanager
     async def connection(self) -> AsyncIterator[Connection]:
-        async with self.pool.acquire() as connection:
-            yield connection
+        connection: Optional[Connection] = None
+        try:
+            async with self.pool.acquire() as connection:
+                yield connection
+        except _TRANSIENT_CONNECTION_ERRORS:
+            raise TransientDatabaseConnectionError(
+                "PostgreSQL query connection failed.",
+            ) from None
+        except InterfaceError:
+            if connection is not None and connection.is_closed():
+                raise TransientDatabaseConnectionError(
+                    "PostgreSQL query connection failed.",
+                ) from None
+            raise
 
     async def __aenter__(self) -> Connection:
         """Enter the context manager."""
@@ -199,6 +240,38 @@ class AsyncpgDriver(QueryDriver):
                 {column.name: row[column.name] for column in columns} for row in rows
             ]
 
+    async def max_value(self, column: Column) -> int:
+        """Return the greatest value in a column."""
+        async with self, self.connection() as connection:
+            value = await connection.fetchval(self.max_value_query.make_query(column))
+            return int(value)
+
+    async def select_available_ids(
+        self,
+        *,
+        primary_key: Column,
+        labels: Column,
+        created_at: Column,
+        channel_name: str,
+        after_id: int,
+        through_id: int,
+        limit: int,
+    ) -> list[int]:
+        """Return a bounded page of message IDs that are ready to run."""
+        async with self, self.connection() as connection:
+            rows = await connection.fetch(
+                self.select_available_ids_query.make_query(
+                    primary_key,
+                    labels,
+                    created_at,
+                ),
+                after_id,
+                through_id,
+                channel_name,
+                limit,
+            )
+            return [int(row[primary_key.name]) for row in rows]
+
     async def exists(self, id: Any) -> bool:
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
@@ -222,17 +295,23 @@ class AsyncpgDriver(QueryDriver):
 
     async def on_startup(self) -> None:
         """On startup."""
-        if self.run_migrations:
-            async with self, self.connection() as connection:
-                transaction = connection.transaction()
-                await transaction.start()
-                await self.create_table()
-                await self.create_index()
-                await transaction.commit()
+        try:
+            if self.run_migrations:
+                async with self, self.connection() as connection:
+                    transaction = connection.transaction()
+                    await transaction.start()
+                    await self.create_table()
+                    await self.create_index()
+                    await transaction.commit()
+        except BaseException:
+            with suppress(Exception):
+                await self.on_shutdown()
+            raise
 
     async def on_shutdown(self) -> None:
         """On shutdown."""
-        await self.pool.close()
+        if self.pool is not None:
+            await self.pool.close()
         self.pool = None
 
     async def execute(self, query: str, *values: Any) -> str:
@@ -252,26 +331,114 @@ class AsyncpgListenDriver(ListenDriver):
     ) -> None:
         """Initialize the listen driver."""
         super().__init__(connection_string, channel_name, **connection_kwargs)
-        self._queue: AsyncQueue[int] = AsyncQueue()
+        self.connection: Optional[Connection] = None
+        self._messages: deque[int] = deque()
+        self._state_changed = Event()
+        self._stopping = False
+        self._disconnected = False
+        self._termination_callback: Callable[[Connection], None] = (
+            self._termination_handler
+        )
 
     async def on_startup(self) -> None:
         """On startup."""
-        self.connection = await connect(
-            self.connection_string,
-            **self.connection_kwargs,
-        )
-        await self.connection.add_listener(
-            self.channel_name,
-            self._notification_handler,
-        )
+        self._messages.clear()
+        self._state_changed.clear()
+        self._stopping = False
+        self._disconnected = False
+
+        connection: Optional[Connection] = None
+        termination_registered = False
+        listener_registered = False
+        try:
+            connection = await connect(
+                self.connection_string,
+                **self.connection_kwargs,
+            )
+            self.connection = connection
+            connection.add_termination_listener(self._termination_callback)
+            termination_registered = True
+            await connection.add_listener(
+                self.channel_name,
+                self._notification_handler,
+            )
+            listener_registered = True
+        except BaseException as error:
+            self._stopping = True
+            await self._close_connection(
+                connection,
+                termination_registered=termination_registered,
+                listener_registered=listener_registered,
+                propagate_errors=False,
+            )
+            if self.connection is connection:
+                self.connection = None
+            connection_closed = connection is not None and connection.is_closed()
+            if isinstance(error, _TRANSIENT_CONNECTION_ERRORS) or (
+                isinstance(error, InterfaceError) and connection_closed
+            ):
+                raise TransientDatabaseConnectionError(
+                    "PostgreSQL listener connection failed.",
+                ) from None
+            if isinstance(
+                error,
+                (PostgresError, InterfaceError, ValueError, TypeError),
+            ):
+                raise DatabaseConnectionError(
+                    "PostgreSQL listener configuration failed.",
+                ) from None
+            raise
 
     async def on_shutdown(self) -> None:
         """On shutdown."""
-        await self.connection.remove_listener(
-            self.channel_name,
-            self._notification_handler,
+        self._stopping = True
+        self._state_changed.set()
+        connection, self.connection = self.connection, None
+        await self._close_connection(
+            connection,
+            termination_registered=True,
+            listener_registered=True,
         )
-        await self.connection.close()
+
+    async def _close_connection(
+        self,
+        connection: Optional[Connection],
+        *,
+        termination_registered: bool,
+        listener_registered: bool,
+        propagate_errors: bool = True,
+    ) -> None:
+        """Close a listener connection without skipping later cleanup steps."""
+        if connection is None:
+            return
+
+        first_error: Optional[Exception] = None
+        if termination_registered:
+            try:
+                connection.remove_termination_listener(self._termination_callback)
+            except Exception as error:  # pragma: no cover - defensive cleanup
+                first_error = error
+        if listener_registered:
+            try:
+                await connection.remove_listener(
+                    self.channel_name,
+                    self._notification_handler,
+                )
+            except Exception as error:  # pragma: no cover - defensive cleanup
+                first_error = first_error or error
+        try:
+            await connection.close()
+        except Exception as error:  # pragma: no cover - defensive cleanup
+            first_error = first_error or error
+
+        if first_error is not None and propagate_errors:
+            raise first_error
+
+    def _termination_handler(self, connection: Connection) -> None:
+        """Wake consumers when the active connection terminates unexpectedly."""
+        if connection is self.connection and not self._stopping:
+            self._disconnected = True
+            self._state_changed.set()
 
     def _notification_handler(
         self,
@@ -291,11 +458,22 @@ class AsyncpgListenDriver(ListenDriver):
             **channel**: name of the channel the notification was sent to;
             **payload**: the payload.
         """
-        if self._queue is not None:
-            self._queue.put_nowait(int(payload))
+        if con_ref is self.connection and not self._stopping:
+            self._messages.append(int(payload))
+            self._state_changed.set()
 
     async def __aiter__(self) -> AsyncIterator[Any]:
         """Iterate over the queue."""
-        while not self.connection.is_closed():
-            message_id = await self._queue.get()
-            yield message_id
+        while True:
+            if self._stopping:
+                return
+            if self._disconnected:
+                raise ListenerDisconnectedError(
+                    "PostgreSQL listener connection was lost.",
+                )
+            if self._messages:
+                yield self._messages.popleft()
+                continue
+
+            self._state_changed.clear()
+            await self._state_changed.wait()

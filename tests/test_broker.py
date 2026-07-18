@@ -1,6 +1,8 @@
 import asyncio
 import json
+import os
 import uuid
+from collections.abc import AsyncGenerator
 from typing import Literal, Union
 
 import pytest
@@ -8,6 +10,7 @@ from taskiq import AckableMessage, BrokerMessage
 from taskiq.utils import maybe_awaitable
 
 from taskiq_postgresql import PostgresqlBroker
+from taskiq_postgresql.abc.query import BROKER_CHANNEL_LABEL
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 pytestmark = pytest.mark.anyio
@@ -25,6 +28,31 @@ async def get_first_task(
     async for message in broker.listen():
         return message
     return b""
+
+
+@pytest.fixture
+async def recovery_broker(
+    postgresql_dsn: str,
+    postgres_table: str,
+) -> AsyncGenerator[PostgresqlBroker, None]:
+    """Create the asyncpg broker used by listener-recovery regressions."""
+    if os.environ.get("TEST_DRIVER") not in (None, "asyncpg"):
+        pytest.skip("listener recovery is implemented for asyncpg")
+    pytest.importorskip("asyncpg")
+    dsn = os.environ.get("TEST_DATABASE_URL") or postgresql_dsn
+    broker = PostgresqlBroker(
+        dsn=dsn,
+        channel_name=f"{postgres_table}_channel",
+        table_name=postgres_table,
+        driver="asyncpg",
+        run_migrations=True,
+    )
+    await broker.startup()
+    yield broker
+
+    async with broker.driver, broker.driver.connection() as connection:
+        await connection.execute(f"DROP TABLE {postgres_table}")
+    await broker.shutdown()
 
 
 @pytest.mark.parametrize("driver", ["asyncpg", "psqlpy", "psycopg"])
@@ -137,6 +165,198 @@ async def test_listen(
 
     # Acknowledge the message
     await maybe_awaitable(message.ack())
+
+
+async def test_reconciliation_is_scoped_to_message_channel(
+    recovery_broker: PostgresqlBroker,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A missed notification is recovered only by its logical channel."""
+    broker = recovery_broker
+
+    original_labels = {"source": "channel-scope-test"}
+    expected = BrokerMessage(
+        task_id=uuid.uuid4().hex,
+        task_name="test_task",
+        message=b"missed-notification",
+        labels=original_labels,
+    )
+
+    async def skip_notification(_message_id: int) -> None:
+        return None
+
+    monkeypatch.setattr(broker, "_send_notification", skip_notification)
+    await broker.kick(expected)
+
+    rows = await broker.driver.select([broker.columns.labels])
+    stored_labels = rows[0][broker.columns.labels.name]
+    if isinstance(stored_labels, str):
+        stored_labels = json.loads(stored_labels)
+    assert isinstance(stored_labels, dict)
+    assert stored_labels[BROKER_CHANNEL_LABEL] == broker.channel_name
+    assert expected.labels == original_labels
+
+    other_broker = PostgresqlBroker(
+        dsn=broker.dsn,
+        channel_name=f"{broker.channel_name}_other",
+        table_name=broker.table_name,
+        driver="asyncpg",
+    )
+    await other_broker.startup()
+    try:
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(get_first_task(other_broker), timeout=0.1)
+
+        message = await asyncio.wait_for(get_first_task(broker), timeout=1.0)
+    finally:
+        await other_broker.shutdown()
+
+    assert message.data == expected.message
+
+
+async def test_reconciliation_and_queued_notification_claim_once(
+    recovery_broker: PostgresqlBroker,
+) -> None:
+    """A scanned row and its queued NOTIFY must not yield two messages."""
+    broker = recovery_broker
+
+    message_id = await broker.driver.insert(
+        columns=[
+            broker.columns.task_id,
+            broker.columns.task_name,
+            broker.columns.message,
+            broker.columns.labels,
+        ],
+        values=[
+            uuid.uuid4().hex,
+            "test_task",
+            b"single-delivery",
+            json.dumps({BROKER_CHANNEL_LABEL: broker.channel_name}),
+        ],
+        returning=[broker.columns.primary_key],
+    )
+    await broker.driver.execute(
+        f"NOTIFY {broker.channel_name}, '{message_id}'",
+    )
+    await asyncio.sleep(0.05)
+
+    message = await asyncio.wait_for(get_first_task(broker), timeout=1.0)
+
+    assert message.data == b"single-delivery"
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(get_first_task(broker), timeout=0.1)
+
+
+async def test_reconciliation_delivers_only_due_rows(
+    recovery_broker: PostgresqlBroker,
+) -> None:
+    """Due rows are recovered without releasing future or malformed delays."""
+    broker = recovery_broker
+
+    rows = [
+        (b"due-numeric", {"delay": 1.9}),
+        (b"future", {"delay": 60}),
+        (b"malformed", {"delay": "not-an-integer"}),
+        (b"due-boolean", {"delay": False}),
+    ]
+    for message, labels in rows:
+        await broker.driver.insert(
+            columns=[
+                broker.columns.task_id,
+                broker.columns.task_name,
+                broker.columns.message,
+                broker.columns.labels,
+            ],
+            values=[
+                uuid.uuid4().hex,
+                "test_task",
+                message,
+                json.dumps(
+                    {
+                        **labels,
+                        BROKER_CHANNEL_LABEL: broker.channel_name,
+                    },
+                ),
+            ],
+            returning=[broker.columns.primary_key],
+        )
+    legacy_message_id = await broker.driver.insert(
+        columns=[
+            broker.columns.task_id,
+            broker.columns.task_name,
+            broker.columns.message,
+            broker.columns.labels,
+        ],
+        values=[
+            uuid.uuid4().hex,
+            "test_task",
+            b"legacy-unmarked",
+            json.dumps({}),
+        ],
+        returning=[broker.columns.primary_key],
+    )
+    await broker.driver.execute(
+        f"INSERT INTO {broker.table_name} "  # noqa: S608
+        "(task_id, task_name, message, labels) "
+        "VALUES ($1::text::uuid, $2, $3, "
+        "to_jsonb('invalid-label-shape'::text))",
+        uuid.uuid4().hex,
+        "test_task",
+        b"scalar-labels",
+    )
+
+    await asyncio.sleep(1.1)
+    iterator = broker.listen()
+    recovered = [(await iterator.__anext__()).data for _ in range(2)]
+    await iterator.aclose()
+
+    assert recovered == [b"due-numeric", b"due-boolean"]
+    remaining = await broker.driver.select([broker.columns.message])
+    assert {row[broker.columns.message.name] for row in remaining} == {
+        b"future",
+        b"malformed",
+        b"legacy-unmarked",
+        b"scalar-labels",
+    }
+
+    await broker.driver.execute(
+        f"NOTIFY {broker.channel_name}, '{legacy_message_id}'",
+    )
+    legacy_message = await asyncio.wait_for(get_first_task(broker), timeout=1.0)
+    assert legacy_message.data == b"legacy-unmarked"
+
+
+async def test_asyncpg_listener_recovers_without_restarting_consumer(
+    recovery_broker: PostgresqlBroker,
+) -> None:
+    """A killed asyncpg LISTEN backend must reconnect and reconcile its gap."""
+    broker = recovery_broker
+
+    old_listener = broker.listen_driver
+    old_connection = old_listener.connection
+    listener_pid = await old_connection.fetchval("SELECT pg_backend_pid()")
+    broker._listener_retry_delay = lambda _attempt: 0.2
+    consumer = asyncio.create_task(get_first_task(broker))
+    await asyncio.sleep(0.05)
+
+    await broker.driver.execute("SELECT pg_terminate_backend($1)", listener_pid)
+    for _ in range(20):
+        if old_connection.is_closed():
+            break
+        await asyncio.sleep(0.01)
+    assert old_connection.is_closed()
+
+    expected = BrokerMessage(
+        task_id=uuid.uuid4().hex,
+        task_name="test_task",
+        message=b"published-during-listener-gap",
+        labels={},
+    )
+    await broker.kick(expected)
+
+    received = await asyncio.wait_for(consumer, timeout=3.0)
+    assert received.data == expected.message
+    assert broker.listen_driver is not old_listener
 
 
 async def test_wrong_format(

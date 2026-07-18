@@ -1,6 +1,8 @@
 from abc import ABC, abstractmethod
 from typing import Any, Literal, Optional, Sequence
 
+BROKER_CHANNEL_LABEL = "__taskiq_postgresql_channel__"
+
 
 class QueryBase(ABC):
     """Base class for all queries."""
@@ -216,6 +218,43 @@ class SelectQuery(QueryBase):
                 if where_columns is not None
                 else ""
             )
+        )
+
+
+class MaxValueQuery(QueryBase):
+    """Query the greatest value of a column."""
+
+    def make_query(self, column: Column) -> str:
+        """Return a MAX query that uses zero for an empty table."""
+        return f"SELECT COALESCE(MAX({column.name}), 0) FROM {self.table_name}"  # noqa: S608
+
+
+class SelectAvailableIdsQuery(QueryBase):
+    """Query available message IDs within a fixed high-watermark."""
+
+    def make_query(
+        self,
+        primary_key: Column,
+        labels: Column,
+        created_at: Column,
+    ) -> str:
+        """Return the bounded keyset query for ready messages."""
+        return (
+            f"SELECT {primary_key.name} FROM {self.table_name} "  # noqa: S608
+            f"WHERE {primary_key.name} > $1 AND {primary_key.name} <= $2 "
+            f"AND {labels.name}->>'{BROKER_CHANNEL_LABEL}' = $3 "
+            f"AND ({labels.name}->>'delay' IS NULL "
+            "OR EXTRACT(EPOCH FROM "
+            f"(CURRENT_TIMESTAMP - {created_at.name})) >= CASE "
+            f"WHEN jsonb_typeof({labels.name}->'delay') = 'number' "
+            f"THEN trunc(({labels.name}->>'delay')::numeric) "
+            f"WHEN jsonb_typeof({labels.name}->'delay') = 'string' "
+            f"AND btrim({labels.name}->>'delay') ~ '^[+-]?[0-9]+$' "
+            f"THEN btrim({labels.name}->>'delay')::numeric "
+            f"WHEN jsonb_typeof({labels.name}->'delay') = 'boolean' "
+            f"THEN CASE WHEN ({labels.name}->>'delay')::boolean THEN 1 ELSE 0 END "
+            "END) "
+            f"ORDER BY {primary_key.name} LIMIT $4"
         )
 
 

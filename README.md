@@ -157,6 +157,18 @@ async def setup_schedule():
 | `driver` | `Literal["asyncpg", "psycopg", "psqlpy"]` | `"asyncpg"` | Database driver |
 | `**connect_kwargs` | `Any` | - | Additional driver-specific connection parameters |
 
+#### Listener recovery
+
+After an established asyncpg listener is disconnected, the broker creates a
+fresh listener with capped exponential backoff. Once `LISTEN` is registered,
+it reconciles ready rows through the same atomic claim path, so notifications
+lost during the connection gap do not strand tasks. Initial connection and
+configuration failures remain fail-fast. Driver-specific disconnect recovery
+for psycopg and psqlpy is not yet guaranteed. Reconciliation is scoped by an
+internal channel marker stored in the database; it does not mutate task labels.
+Rows written by earlier versions without the marker are not auto-reconciled,
+because their original channel cannot be determined safely.
+
 ### PostgresqlResultBackend
 
 | Parameter | Type | Default | Description |

@@ -1,22 +1,43 @@
 from __future__ import annotations
 
-from asyncio import Queue as AsyncQueue
-from asyncio import Task, get_running_loop
+from asyncio import (
+    CancelledError,
+    Event,
+    Lock,
+    Task,
+    TimeoutError,
+    create_task,
+    get_running_loop,
+    wait_for,
+)
 from dataclasses import dataclass
 from logging import getLogger
+from random import uniform
+from time import monotonic
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, TypeVar, Union
 
 from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessage
 
 from taskiq_postgresql.abc.driver import ListenDriver
-from taskiq_postgresql.abc.query import Column, CreatedAtColumn, PrimaryKeyColumn
+from taskiq_postgresql.abc.query import (
+    BROKER_CHANNEL_LABEL,
+    Column,
+    CreatedAtColumn,
+    PrimaryKeyColumn,
+)
+from taskiq_postgresql.exceptions import (
+    ListenerDisconnectedError,
+    TransientDatabaseConnectionError,
+)
 from taskiq_postgresql.utils import get_db_driver, get_db_listen_driver
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, AsyncIterator
 
 
 _T = TypeVar("_T")
+_RECONCILIATION_BATCH_SIZE = 100
+_MAX_LISTENER_RETRY_DELAY = 30.0
 
 logger = getLogger("taskiq.asyncpg_broker")
 
@@ -105,7 +126,17 @@ class PostgresqlBroker(AsyncBroker):
         )
         self.pool_kwargs: dict[str, Any] = pool_kwargs if pool_kwargs else {}
         self.max_retry_attempts: int = max_retry_attempts
-        self._queue: AsyncQueue[str] | None = None
+        self._driver_name = driver
+        self._shutdown_event = Event()
+        self._lifecycle_lock = Lock()
+        self._listener_recovery_lock = Lock()
+        self._shutdown_requests = 0
+        self._base_started = False
+        self._query_driver_started = False
+        self._listener_started = False
+        self._listener_generation = 0
+        self._pending_listen_driver: ListenDriver | None = None
+        self._listener_start_task: Task[None] | None = None
 
         self.columns = Table(task_id=Column(name="task_id", type_=field_for_task_id))
 
@@ -124,7 +155,12 @@ class PostgresqlBroker(AsyncBroker):
             run_migrations=run_migrations,
             **self.connection_kwargs,
         )
-        self.listen_driver: ListenDriver = get_db_listen_driver(driver)(
+        self._listen_driver_factory = get_db_listen_driver(driver)
+        self.listen_driver: ListenDriver = self._new_listen_driver()
+
+    def _new_listen_driver(self) -> ListenDriver:
+        """Create an isolated listener generation."""
+        return self._listen_driver_factory(
             connection_string=self.dsn,
             channel_name=self.channel_name,
             **self.connection_kwargs,
@@ -143,16 +179,145 @@ class PostgresqlBroker(AsyncBroker):
 
     async def startup(self) -> None:
         """Initialize the broker."""
-        await super().startup()
+        async with self._lifecycle_lock:
+            if self._shutdown_requests:
+                raise RuntimeError("Broker shutdown is in progress.")
+            if self._base_started:
+                return
+            self._shutdown_event.clear()
+            try:
+                self._base_started = True
+                await super().startup()
+                self._raise_if_shutdown_requested()
 
-        await self.driver.on_startup()
-        await self.listen_driver.on_startup()
+                self._query_driver_started = True
+                await self.driver.on_startup()
+                self._raise_if_shutdown_requested()
+
+                self._listener_started = True
+                startup_task = create_task(self.listen_driver.on_startup())
+                self._listener_start_task = startup_task
+                try:
+                    await startup_task
+                finally:
+                    if self._listener_start_task is startup_task:
+                        self._listener_start_task = None
+                self._raise_if_shutdown_requested()
+                self._listener_generation = 1
+            except BaseException:
+                self._shutdown_event.set()
+                await self._shutdown_active_listener()
+                await self._shutdown_query_driver()
+                await self._shutdown_base_broker()
+                raise
+
+    def _raise_if_shutdown_requested(self) -> None:
+        """Cancel startup when shutdown won the lifecycle race."""
+        if self._shutdown_event.is_set():
+            raise CancelledError
 
     async def shutdown(self) -> None:
         """Close all connections on shutdown."""
-        await super().shutdown()
-        await self.driver.on_shutdown()
-        await self.listen_driver.on_shutdown()
+        self._shutdown_requests += 1
+        self._shutdown_event.set()
+        startup_task = self._listener_start_task
+        if startup_task is not None and not startup_task.done():
+            startup_task.cancel()
+        try:
+            async with self._lifecycle_lock:
+                errors = [
+                    await self._cancel_listener_startup(),
+                    await self._shutdown_pending_listener(),
+                    await self._shutdown_base_broker(),
+                    await self._shutdown_query_driver(),
+                    await self._shutdown_active_listener(),
+                ]
+                first_error = next(
+                    (error for error in errors if error is not None),
+                    None,
+                )
+                if first_error is not None:
+                    raise first_error
+        finally:
+            self._shutdown_requests -= 1
+
+    async def _cancel_listener_startup(self) -> Exception | None:
+        """Cancel a listener generation that is still connecting."""
+        startup_task, self._listener_start_task = self._listener_start_task, None
+        if startup_task is None:
+            return None
+        if not startup_task.done():
+            startup_task.cancel()
+        try:
+            await startup_task
+        except CancelledError:
+            return None
+        except Exception as error:  # pragma: no cover - defensive cleanup
+            return error
+        return None
+
+    async def _shutdown_pending_listener(self) -> Exception | None:
+        """Close a listener generation that has not been promoted."""
+        candidate, self._pending_listen_driver = self._pending_listen_driver, None
+        if candidate is None:
+            return None
+        return await self._shutdown_listener(candidate)
+
+    async def _shutdown_active_listener(self) -> Exception | None:
+        """Close the active listener generation once."""
+        if not self._listener_started:
+            return None
+        self._listener_started = False
+        return await self._shutdown_listener(self.listen_driver)
+
+    async def _shutdown_listener(
+        self,
+        listen_driver: ListenDriver,
+    ) -> Exception | None:
+        """Close a listener without allowing cleanup to hide a primary error."""
+        try:
+            await listen_driver.on_shutdown()
+        except Exception as error:  # pragma: no cover - defensive cleanup
+            logger.warning(
+                "PostgreSQL listener cleanup failed "
+                "(driver=%s channel=%s exception=%s)",
+                self._driver_name,
+                self.channel_name,
+                type(error).__name__,
+            )
+            return error
+        return None
+
+    async def _shutdown_query_driver(self) -> Exception | None:
+        """Close the query driver and record its lifecycle state."""
+        if not self._query_driver_started:
+            return None
+        self._query_driver_started = False
+        try:
+            await self.driver.on_shutdown()
+        except Exception as error:  # pragma: no cover - defensive cleanup
+            logger.warning(
+                "PostgreSQL query driver cleanup failed (driver=%s exception=%s)",
+                self._driver_name,
+                type(error).__name__,
+            )
+            return error
+        return None
+
+    async def _shutdown_base_broker(self) -> Exception | None:
+        """Close Taskiq-owned resources and record their lifecycle state."""
+        if not self._base_started:
+            return None
+        self._base_started = False
+        try:
+            await super().shutdown()
+        except Exception as error:  # pragma: no cover - defensive cleanup
+            logger.warning(
+                "Taskiq broker cleanup failed (exception=%s)",
+                type(error).__name__,
+            )
+            return error
+        return None
 
     async def kick(self, message: BrokerMessage) -> None:
         """
@@ -162,6 +327,10 @@ class PostgresqlBroker(AsyncBroker):
 
         :param message: Message to send.
         """
+        stored_labels = {
+            **message.labels,
+            BROKER_CHANNEL_LABEL: self.channel_name,
+        }
         message_inserted_id = await self.driver.insert(
             [
                 self.columns.task_id,
@@ -173,7 +342,7 @@ class PostgresqlBroker(AsyncBroker):
                 message.task_id,
                 message.task_name,
                 message.message,
-                message.labels,
+                stored_labels,
             ],
             [
                 self.columns.primary_key,
@@ -222,46 +391,233 @@ class PostgresqlBroker(AsyncBroker):
 
         :yields: AckableMessage instances.
         """
-        while True:
+        query_failure_attempt = 0
+        while not self._shutdown_event.is_set():
+            listen_driver = self.listen_driver
+            listener_generation = self._listener_generation
             try:
-                async for message_id in self.listen_driver:
-                    # Normalize payload to integer ID (psycopg may yield string payloads).
-                    try:
-                        normalized_id = int(message_id)  # type: ignore[arg-type]
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            "Invalid NOTIFY payload %r on channel %s",
-                            message_id,
-                            self.channel_name,
-                        )
-                        continue
+                async for message in self._messages_from_ids(self._reconcile_ids()):
+                    yield message
+                query_failure_attempt = 0
 
-                    # Atomically claim the message row. If None is returned, another
-                    # worker has already claimed it.
-                    row = await self.driver.delete_returning(
-                        self.columns.primary_key,
-                        normalized_id,
-                        [self.columns.message],
-                    )
+                async for message in self._messages_from_ids(listen_driver):
+                    yield message
 
-                    if row is None:
-                        # Claimed elsewhere or missing; skip.
-                        continue
-
-                    message: Optional[bytes] = row.get(self.columns.message.name)
-
-                    if message is None:
-                        logger.warning(
-                            "Message with id %s has no payload.",
-                            message_id,
-                        )
-                        continue
-
-                    async def ack(*, _message_id: int = message_id) -> None:  # noqa: ARG001
-                        # No-op: the row was already deleted when claimed.
-                        return None
-
-                    yield AckableMessage(data=message, ack=ack)
+                if self._shutdown_event.is_set():
+                    return
+                self._handle_listener_completion()
+            except ListenerDisconnectedError:
+                if not await self._recover_listener(
+                    listen_driver,
+                    listener_generation,
+                ):
+                    return
+            except TransientDatabaseConnectionError as error:
+                query_failure_attempt += 1
+                delay = self._listener_retry_delay(query_failure_attempt)
+                logger.warning(
+                    "PostgreSQL query connection unavailable "
+                    "(driver=%s attempt=%s delay=%.3f exception=%s)",
+                    self._driver_name,
+                    query_failure_attempt,
+                    delay,
+                    type(error).__name__,
+                )
+                if await self._wait_for_shutdown(delay):
+                    return
             except Exception as error:
-                logger.exception("Error processing message: %s", error)
+                self._handle_unexpected_listener_error(error)
+
+    def _handle_listener_completion(self) -> None:
+        """Keep legacy drivers unchanged and recover asyncpg completion."""
+        if self._driver_name == "asyncpg":
+            raise ListenerDisconnectedError(
+                "PostgreSQL listener stopped unexpectedly.",
+            )
+
+    def _handle_unexpected_listener_error(self, error: Exception) -> None:
+        """Preserve legacy retries while surfacing asyncpg contract failures."""
+        if self._driver_name == "asyncpg":
+            raise error
+        logger.exception("Error processing message: %s", error)
+
+    async def _reconcile_ids(self) -> AsyncGenerator[int, None]:
+        """Yield ready row IDs that may have missed a transient notification."""
+        through_id = await self.driver.max_value(self.columns.primary_key)
+        after_id = 0
+        while after_id < through_id:
+            message_ids = await self.driver.select_available_ids(
+                primary_key=self.columns.primary_key,
+                labels=self.columns.labels,
+                created_at=self.columns.created_at,
+                channel_name=self.channel_name,
+                after_id=after_id,
+                through_id=through_id,
+                limit=_RECONCILIATION_BATCH_SIZE,
+            )
+            if not message_ids:
+                return
+            for message_id in message_ids:
+                yield message_id
+            after_id = message_ids[-1]
+
+    async def _messages_from_ids(
+        self,
+        message_ids: AsyncIterator[Any],
+    ) -> AsyncGenerator[AckableMessage, None]:
+        """Claim and decode IDs without advancing past database failures."""
+        async for message_id in message_ids:
+            message = await self._claim_message(message_id)
+            if message is not None:
+                yield message
+
+    async def _claim_message(self, message_id: Any) -> AckableMessage | None:
+        """Atomically claim one database row and build its Taskiq message."""
+        try:
+            normalized_id = int(message_id)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid NOTIFY payload on channel %s",
+                self.channel_name,
+            )
+            return None
+
+        row = await self.driver.delete_returning(
+            self.columns.primary_key,
+            normalized_id,
+            [self.columns.message],
+        )
+        if row is None:
+            return None
+
+        message: Optional[bytes] = row.get(self.columns.message.name)
+        if message is None:
+            logger.warning("Message with id %s has no payload.", normalized_id)
+            return None
+
+        async def ack() -> None:
+            return None
+
+        return AckableMessage(data=message, ack=ack)
+
+    async def _recover_listener(
+        self,
+        failed_driver: ListenDriver,
+        failed_generation: int,
+    ) -> bool:
+        """Recover one failed generation exactly once across consumers."""
+        async with self._listener_recovery_lock:
+            if self._shutdown_event.is_set():
+                return False
+            if (
+                failed_driver is not self.listen_driver
+                or failed_generation != self._listener_generation
+            ):
+                return True
+            return await self._recover_current_listener(failed_generation)
+
+    async def _recover_current_listener(self, generation: int) -> bool:
+        """Replace a disconnected listener using bounded exponential backoff."""
+        disconnected_at = monotonic()
+        logger.warning(
+            "PostgreSQL listener disconnected (driver=%s channel=%s generation=%s)",
+            self._driver_name,
+            self.channel_name,
+            generation,
+        )
+
+        if self._listener_started:
+            self._listener_started = False
+            await self._shutdown_listener(self.listen_driver)
+
+        attempt = 0
+        while not self._shutdown_event.is_set():
+            attempt += 1
+            delay = self._listener_retry_delay(attempt)
+            logger.info(
+                "PostgreSQL listener reconnect attempt "
+                "(driver=%s channel=%s attempt=%s delay=%.3f)",
+                self._driver_name,
+                self.channel_name,
+                attempt,
+                delay,
+            )
+            if await self._wait_for_shutdown(delay):
+                return False
+
+            candidate = self._new_listen_driver()
+            if not await self._start_listener_candidate(candidate, attempt):
                 continue
+
+            self.listen_driver = candidate
+            self._listener_started = True
+            self._listener_generation = generation + 1
+            logger.info(
+                "PostgreSQL listener reconnected "
+                "(driver=%s channel=%s attempts=%s downtime=%.3f generation=%s)",
+                self._driver_name,
+                self.channel_name,
+                attempt,
+                monotonic() - disconnected_at,
+                self._listener_generation,
+            )
+            return True
+        return False
+
+    async def _start_listener_candidate(
+        self,
+        candidate: ListenDriver,
+        attempt: int,
+    ) -> bool:
+        """Start and validate one listener reconnect candidate."""
+        self._pending_listen_driver = candidate
+        startup_task = create_task(candidate.on_startup())
+        self._listener_start_task = startup_task
+        try:
+            await startup_task
+        except CancelledError:
+            await self._shutdown_listener(candidate)
+            if self._shutdown_event.is_set():
+                return False
+            raise
+        except TransientDatabaseConnectionError as error:
+            await self._shutdown_listener(candidate)
+            logger.warning(
+                "PostgreSQL listener reconnect failed "
+                "(driver=%s channel=%s attempt=%s exception=%s)",
+                self._driver_name,
+                self.channel_name,
+                attempt,
+                type(error).__name__,
+            )
+            return False
+        except BaseException:
+            await self._shutdown_listener(candidate)
+            raise
+        finally:
+            if self._listener_start_task is startup_task:
+                self._listener_start_task = None
+            if self._pending_listen_driver is candidate:
+                self._pending_listen_driver = None
+
+        if self._shutdown_event.is_set():
+            await self._shutdown_listener(candidate)
+            return False
+        return True
+
+    def _listener_retry_delay(self, attempt: int) -> float:
+        """Return capped exponential backoff with bounded jitter."""
+        exponent = max(0, min(attempt - 1, 6))
+        base_delay = min(0.5 * (2**exponent), _MAX_LISTENER_RETRY_DELAY)
+        return min(
+            base_delay * uniform(0.8, 1.2),  # noqa: S311
+            _MAX_LISTENER_RETRY_DELAY,
+        )
+
+    async def _wait_for_shutdown(self, delay: float) -> bool:
+        """Wait for either shutdown or the reconnect delay."""
+        try:
+            await wait_for(self._shutdown_event.wait(), timeout=delay)
+        except TimeoutError:
+            return False
+        return True

@@ -15,6 +15,8 @@ from taskiq_postgresql.abc.query import (
     DeleteReturningQuery,
     InsertOrUpdateQuery,
     InsertQuery,
+    MaxValueQuery,
+    SelectAvailableIdsQuery,
     SelectQuery,
 )
 
@@ -56,6 +58,8 @@ class QueryDriver(ABC):
         self.select_query = SelectQuery(
             self.table_name,
         )
+        self.max_value_query = MaxValueQuery(self.table_name)
+        self.select_available_ids_query = SelectAvailableIdsQuery(self.table_name)
         self.insert_or_update_query = InsertOrUpdateQuery(self.table_name)
         self.run_migrations = run_migrations
         
@@ -134,6 +138,24 @@ class QueryDriver(ABC):
         where_values: Optional[Sequence[Any]] = None,
     ) -> list[dict[str, Any]]:
         """Select a row from a table."""
+
+    async def max_value(self, column: Column) -> int:
+        """Disable reconciliation for legacy custom drivers by default."""
+        return 0
+
+    async def select_available_ids(
+        self,
+        *,
+        primary_key: Column,
+        labels: Column,
+        created_at: Column,
+        channel_name: str,
+        after_id: int,
+        through_id: int,
+        limit: int,
+    ) -> list[int]:
+        """Return no reconciliation rows for legacy custom drivers."""
+        return []
 
     @abstractmethod
     async def exists(self, id: Any) -> bool:
