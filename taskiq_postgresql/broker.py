@@ -257,7 +257,7 @@ class PostgresqlBroker(AsyncBroker):
                         )
                         continue
 
-                    async def ack(*, _message_id: int = message_id) -> None:  # noqa: ARG001
+                    async def ack(*, _message_id: int = message_id) -> None:
                         # No-op: the row was already deleted when claimed.
                         return None
 

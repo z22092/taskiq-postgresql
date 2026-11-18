@@ -136,15 +136,15 @@ async def process_task(
     timeout: Optional[float] = None,
 ) -> TaskResult:
     """Process a task with the given parameters.
-    
+
     Args:
         task_id: Unique identifier for the task.
         data: Task data to process.
         timeout: Optional timeout in seconds.
-        
+
     Returns:
         The result of task processing.
-        
+
     Raises:
         TaskProcessingError: If task processing fails.
     """
@@ -291,19 +291,20 @@ tests/
 import pytest
 from taskiq_postgresql import PostgresqlBroker
 
+
 class TestPostgresqlBroker:
     """Test PostgreSQL broker functionality."""
-    
+
     async def test_broker_startup_and_shutdown(
         self,
         postgres_dsn: str,
     ) -> None:
         """Test broker can start up and shut down properly."""
         broker = PostgresqlBroker(dsn=postgres_dsn)
-        
+
         await broker.startup()
         assert broker.is_ready
-        
+
         await broker.shutdown()
         assert not broker.is_ready
 

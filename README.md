@@ -90,14 +90,14 @@ async def calculate_sum(a: int, b: int) -> int:
 async def main():
     # Startup the broker
     await broker.startup()
-    
+
     # Send a task
     task = await calculate_sum.kiq(10, 20)
-    
+
     # Wait for result
     result = await task.wait_result()
     print(f"Result: {result}")  # Result: 30
-    
+
     # Shutdown the broker
     await broker.shutdown()
 
@@ -113,15 +113,13 @@ from taskiq_postgresql import PostgresqlBroker, PostgresqlSchedulerSource
 from taskiq import TaskiqScheduler
 
 # Initialize broker
-broker = PostgresqlBroker(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db"
-)
+broker = PostgresqlBroker(dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db")
 
 # Initialize scheduler source
 scheduler_source = PostgresqlSchedulerSource(
     dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
     table_name="taskiq_schedules",
-    driver="asyncpg"
+    driver="asyncpg",
 )
 
 # Create scheduler
@@ -130,9 +128,11 @@ scheduler = TaskiqScheduler(
     sources=[scheduler_source],
 )
 
+
 @broker.task
 async def scheduled_task():
     print("This task runs on schedule!")
+
 
 # Schedule task to run every minute
 async def setup_schedule():
@@ -141,7 +141,7 @@ async def setup_schedule():
         task_name="scheduled_task",
         cron="* * * * *",  # Every minute
         args=[],
-        kwargs={}
+        kwargs={},
     )
 ```
 
@@ -319,6 +319,7 @@ dsn = "postgresql://username:password@host:port/database"
 
 # Check PostgreSQL is running and accessible
 import asyncpg
+
 conn = await asyncpg.connect(dsn)
 await conn.close()
 ```
@@ -407,6 +408,6 @@ This project is licensed under the MIT License. See the LICENSE file for details
 
 - **[TaskIQ Documentation](https://taskiq-python.github.io/)** - Main TaskIQ framework
 - **[AsyncPG Documentation](https://magicstack.github.io/asyncpg/)** - AsyncPG driver docs
-- **[Psycopg Documentation](https://www.psycopg.org/psycopg3/)** - Psycopg3 driver docs  
+- **[Psycopg Documentation](https://www.psycopg.org/psycopg3/)** - Psycopg3 driver docs
 - **[PostgreSQL Documentation](https://www.postgresql.org/docs/)** - PostgreSQL database docs
 - **[GitHub Repository](https://github.com/z22092/taskiq-postgresql)** - Source code and issues
