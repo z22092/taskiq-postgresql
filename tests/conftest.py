@@ -12,7 +12,8 @@ from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 
 _ReturnType = TypeVar("_ReturnType")
 
-POSTGRES_IMAGE = "postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317"
+# Kept on one line: scripts/check_pins.py matches it with a regex.
+POSTGRES_IMAGE = "postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317"  # noqa: E501
 
 
 @pytest.fixture(scope="session")
@@ -56,12 +57,8 @@ def postgresql_dsn() -> Generator[str, None, None]:
         yield external_dsn
         return
 
-    with PostgresContainer(
-        POSTGRES_IMAGE,
-        username="postgres",
-        password="postgres",  # noqa: S106
-        dbname="postgres",
-    ) as container:
+    # The DSN is built from the credentials the container itself holds.
+    with PostgresContainer(POSTGRES_IMAGE) as container:
         yield container.get_connection_url(driver=None)
 
 
