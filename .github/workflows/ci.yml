@@ -30,6 +30,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
 
       # The ruff and check_pins hooks run from this environment.
       - name: Install the lint group
@@ -60,6 +61,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
           python-version: ${{ matrix.python-version }}
 
       # The suite parametrizes every test over the three drivers, so all
@@ -97,6 +99,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
           python-version: "3.10"
 
       # The lock holds the highest resolution, so --locked cannot apply here.
@@ -133,5 +136,10 @@ jobs:
         with:
           use_oidc: true
           files: ./coverage.xml
+          disable_search: true
+          plugins: noop
+          # The action downloads the Codecov CLI at run time; pin the release
+          # so this job, the only one with an OIDC token, runs known code.
+          version: "v11.3.2"
           # Flip to true once the first upload shows up on codecov.io.
           fail_ci_if_error: false

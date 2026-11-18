@@ -35,6 +35,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
           enable-cache: false # release jobs never share a cache
 
       - name: Verify the lock is current
@@ -95,8 +96,10 @@ jobs:
         with:
           subject-path: dist/*
 
-  # Installs the built wheel the way a user would, but from the locked,
-  # hash-checked requirements, so the smoke test never resolves anything.
+  # Installs the locked, hash-checked requirements and then the wheel with
+  # --no-deps, so nothing is resolved at smoke time; uv pip check then fails
+  # if that set does not satisfy the wheel's base dependencies (it does not
+  # look at dependencies gated on an extra).
   smoke:
     name: smoke
     needs: build
@@ -112,6 +115,7 @@ jobs:
         uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
           version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
           enable-cache: false
 
       - name: Download the distributions
@@ -126,6 +130,7 @@ jobs:
           uv venv "$RUNNER_TEMP/smoke"
           uv pip install --python "$RUNNER_TEMP/smoke" --require-hashes --requirement "$RUNNER_TEMP/requirements.txt"
           uv pip install --python "$RUNNER_TEMP/smoke" --no-deps dist/*.whl
+          uv pip check --python "$RUNNER_TEMP/smoke"
 
       # -I keeps the checkout's taskiq_postgresql/ off sys.path, so the import
       # can only come from the installed wheel.
