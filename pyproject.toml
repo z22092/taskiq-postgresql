@@ -155,6 +155,7 @@ ignore = [
     "PLR0913", # Too many arguments for function call
     "D106",    # Missing docstring in public nested class
     "COM812",  # Use of assert detected
+    "PLR0917", # Too many positional args; fixing breaks public API callers
 ]
 
 [tool.ruff.lint.pydocstyle]

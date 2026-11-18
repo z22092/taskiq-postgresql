@@ -81,7 +81,7 @@ class PsycopgDriver(QueryDriver):
 
         new_values = [*values]
 
-        for index, (column, value) in enumerate(zip(columns, values)):
+        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
             if column.type.upper() == "JSONB" and isinstance(value, dict):
                 new_values[index] = dumps(value)
 

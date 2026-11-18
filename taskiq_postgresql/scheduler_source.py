@@ -76,6 +76,8 @@ class PostgresqlSchedulerSource(ScheduleSource):
                 optional 'args', 'kwargs', and 'cron_offset' keys.
             broker: The TaskIQ broker instance to use for finding and managing tasks.
                 Required if startup_schedule is provided.
+            run_migrations: Create the table and indexes on startup. Defaults to
+                False.
             **connect_kwargs: Additional keyword arguments passed to the database
                 connection pool. These are driver-specific connection parameters.
 
