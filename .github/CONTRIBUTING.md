@@ -9,8 +9,10 @@ Thank you for your interest in contributing to TaskIQ PostgreSQL! This document 
 - [Development Setup](#development-setup)
 - [Running Tests](#running-tests)
 - [Code Style](#code-style)
+- [Dependency Policy](#dependency-policy)
 - [Submitting Changes](#submitting-changes)
 - [Reporting Issues](#reporting-issues)
+- [Release Process](#release-process)
 
 ## Code of Conduct
 
@@ -29,8 +31,8 @@ This project follows the [Contributor Covenant Code of Conduct](https://www.cont
 
 ### Prerequisites
 
-- Python 3.10 to 3.14
-- [UV](https://github.com/astral-sh/uv) 0.12.16 to 0.13.7
+- A supported Python version (see `requires-python` in `pyproject.toml`)
+- [UV](https://github.com/astral-sh/uv) within the `required-version` range in `pyproject.toml`
 - Docker or Podman (the tests start PostgreSQL through testcontainers)
 - Git
 
@@ -44,7 +46,7 @@ cd taskiq-postgresql
 # Install UV if you haven't already
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
-# Install dependencies
+# Install everything (all driver extras and all dependency groups)
 uv sync --locked --all-extras --all-groups
 
 # Set up pre-commit hooks (optional but recommended)
@@ -56,18 +58,25 @@ uv run pre-commit install
 The test suite starts a throwaway PostgreSQL container by itself
 (testcontainers, image pinned by digest), so no setup is needed.
 
-To run the tests against a database you already have, set `POSTGRESQL_URL`:
+To run the tests against a database you already have, set `POSTGRESQL_URL`
+(credentials come from your environment, never from the repository):
 
 ```bash
 export POSTGRESQL_URL="postgresql://<user>@<host>:5432/<database>"
 ```
 
-`docker-compose.yml` starts a local PostgreSQL whose credentials are set in that file (user, database and password); build
-`POSTGRESQL_URL` from them:
+For manual work, `docker-compose.yml` starts a local PostgreSQL bound to
+`127.0.0.1:5432` with trust authentication (development only), so the DSN has
+no password:
 
 ```bash
 docker compose up -d --wait
+export POSTGRESQL_URL="postgresql://postgres@localhost:5432/postgres"
 ```
+
+Port 5432 must be free on the host. The tests do not need the compose
+database; the `postgresql_dsn` fixture uses `POSTGRESQL_URL` when it is set and
+starts a container otherwise.
 
 #### Podman
 
@@ -93,19 +102,31 @@ uv run pytest tests/test_broker.py
 
 # Run a single driver (the driver is part of the test id)
 uv run pytest -k asyncpg
+```
 
-# Check the lowest supported dependency versions
-uv run --resolution lowest-direct --all-extras pytest
+### Lowest supported dependency versions
+
+CI runs `test (py3.10, lowest-direct)` against the floor of every direct
+dependency:
+
+```bash
+uv run --resolution lowest-direct --all-extras --group dev pytest
+```
+
+This command rewrites `uv.lock` on disk. Restore it afterwards so the lock
+change does not leak into your commit:
+
+```bash
+git restore uv.lock
 ```
 
 ## Code Style
 
-This project uses several tools to maintain code quality:
-
-### Linting and Formatting
+Ruff is the only formatter and linter. The configuration lives in
+`pyproject.toml`.
 
 ```bash
-# Format code with ruff
+# Format code
 uv run ruff format
 
 # Check for linting issues
@@ -113,8 +134,14 @@ uv run ruff check
 
 # Fix auto-fixable issues
 uv run ruff check --fix
+```
 
-
+CI runs the same checks through pre-commit (`pre-commit run --all-files` over
+the `lint` group). The ruff hooks are `repo: local` and call
+`uv run --no-sync ruff ...`, so the version is the one pinned in `pyproject.toml`
+and not a second copy in `.pre-commit-config.yaml`. `scripts/check_pins.py` is
+also a local pre-commit hook: it fails when a pinned version is declared
+differently in two places.
 
 ### Code Style Guidelines
 
@@ -122,14 +149,15 @@ uv run ruff check --fix
 - Use type hints for all public APIs
 - Write docstrings for all public functions and classes
 - Use Google-style docstrings
-- Keep line length to 88 characters (Black default)
+- Keep line length to 88 characters (the ruff default)
 - Use descriptive variable names
-- Add comments for complex logic
+- Comments explain why, not what
 
 ### Example Code Style
 
 ```python
-from typing import Optional
+from typing import Any, Optional
+
 
 async def process_task(
     task_id: str,
@@ -153,12 +181,57 @@ async def process_task(
     pass
 ```
 
+## Dependency Policy
+
+- Runtime dependencies use closed ranges, `>=floor,<next-minor`, so a consumer's
+  resolver is never blocked by an exact pin and a new upstream minor is never
+  picked up untested. Raising a ceiling is a deliberate change that needs the
+  suite green on the new version.
+- Tooling, GitHub Actions (full commit SHA), container images (digest) and the
+  lock are exact.
+- Supply-chain scanning has its own `audit` dependency group (pip-audit), so it
+  does not leak into the dev environment.
+- Dependabot waits 14 days before proposing a release, matching
+  `exclude-newer = "14 days"` in `[tool.uv]`.
+- The Postgres image is declared in both `tests/conftest.py` and
+  `docker-compose.yml`. `scripts/check_pins.py` fails when they differ, and a
+  Dependabot docker PR needs the matching manual bump in `tests/conftest.py`.
+
+### Regenerating the build-constraint hashes
+
+`[tool.uv] build-constraint-dependencies` in `pyproject.toml` pins the build
+backend (`hatchling`) and everything it pulls in, each with its sha256 set, so
+`uv build` cannot be fed a swapped build dependency. When you bump the
+`hatchling` pin under `[build-system]`:
+
+1. List the new build requirements, one exact pin per line, in a scratch
+   file outside the repository (`build-pins.in`). Resolve `hatchling==<new>`
+   without hashes first (`uv pip compile --universal --python-version 3.10`)
+   to see which dependencies it needs, then pin each one exactly. Keep any
+   environment marker (for example `tomli==<version>; python_version < "3.11"`).
+2. Generate the hashes:
+
+   ```bash
+   uv pip compile build-pins.in --generate-hashes --universal \
+       --python-version 3.10 --no-header --no-annotate
+   ```
+
+   `--python-version 3.10` is required: with the default interpreter, uv
+   evaluates the `python_version < "3.11"` marker and drops `tomli` from the output.
+3. Copy each `--hash=sha256:...` set into the matching `{ requirement, hashes }`
+   entry, and keep the `requirement` strings identical to the pins.
+4. Check the result with `uv lock --check` and `uv build`.
+
+The sha256 sets for the pins checked into the repository were reproduced
+with this exact command, with an empty diff for all eight entries, including
+`hatchling` and `tomli`.
+
 ## Submitting Changes
 
 ### Before Submitting
 
 1. **Run all tests**: Ensure all tests pass
-2. **Check code style**: Run linting and formatting tools
+2. **Check code style**: Run `pre-commit run --all-files` (or the ruff commands above)
 3. **Update documentation**: Update README, docstrings, etc.
 4. **Add tests**: For new features or bug fixes
 5. **Check typing**: Ensure type hints are correct
@@ -180,7 +253,7 @@ async def process_task(
 3. **Write good commit messages**:
    - Use conventional commit format: `type(scope): description`
    - Types: feat, fix, docs, style, refactor, test, chore
-   - Keep the first line under 50 characters
+   - Keep the first line under 72 characters
    - Add more details in the body if needed
 
 4. **Update CHANGELOG**: Add entry for your changes (if applicable)
@@ -256,7 +329,6 @@ Use the feature request template and include:
 
 ### Performance Considerations
 
-- **Benchmark changes**: Run performance tests for significant changes
 - **Memory usage**: Consider memory implications
 - **Connection handling**: Ensure proper connection cleanup
 - **Async best practices**: Follow asyncio best practices
@@ -267,23 +339,21 @@ Use the feature request template and include:
 
 ```
 tests/
+├── conftest.py                 # Fixtures: postgresql_dsn, drivers, teardown
 ├── test_broker.py              # Broker functionality tests
 ├── test_result_backend.py      # Result backend tests
-├── test_scheduler_source.py    # Scheduler tests
-├── drivers/                    # Driver-specific tests
-│   ├── test_asyncpg.py
-│   ├── test_psycopg.py
-│   └── ...
-├── integration/                # Integration tests
-└── performance/               # Performance benchmarks
+└── test_scheduler_source.py    # Scheduler tests
 ```
+
+All tests run against a real PostgreSQL, through testcontainers or
+`POSTGRESQL_URL`.
 
 ### Writing Tests
 
 1. **Use descriptive names**: Test names should describe what they test
 2. **Test edge cases**: Include boundary conditions and error cases
 3. **Use fixtures**: Leverage pytest fixtures for setup
-4. **Mock external dependencies**: Use mocks for external services
+4. **Prefer the real database**: Use the `postgresql_dsn` fixture rather than mocking the driver
 5. **Test all drivers**: Ensure tests work with all supported drivers
 
 ### Test Example
@@ -298,10 +368,10 @@ class TestPostgresqlBroker:
 
     async def test_broker_startup_and_shutdown(
         self,
-        postgres_dsn: str,
+        postgresql_dsn: str,
     ) -> None:
         """Test broker can start up and shut down properly."""
-        broker = PostgresqlBroker(dsn=postgres_dsn)
+        broker = PostgresqlBroker(dsn=postgresql_dsn)
 
         await broker.startup()
         assert broker.is_ready
@@ -312,37 +382,45 @@ class TestPostgresqlBroker:
     @pytest.mark.parametrize("driver", ["asyncpg", "psycopg", "psqlpy"])
     async def test_broker_with_different_drivers(
         self,
-        postgres_dsn: str,
+        postgresql_dsn: str,
         driver: str,
     ) -> None:
         """Test broker works with different drivers."""
-        broker = PostgresqlBroker(dsn=postgres_dsn, driver=driver)
+        broker = PostgresqlBroker(dsn=postgresql_dsn, driver=driver)
         # Test implementation
 ```
 
 ## Release Process
 
-Releases are automated through GitHub Actions, but here's the process:
+Releases are cut by publishing a GitHub Release. There is no version bump
+commit and no bumpversion: the version comes from the tag.
 
-1. **Update version**: Use bump2version or update manually
-2. **Update CHANGELOG**: Add release notes
-3. **Create PR**: Submit changes for review
-4. **Merge to main**: After approval
-5. **Create tag**: GitHub Actions will handle the release
-6. **Verify release**: Check PyPI and GitHub releases
+1. **Update CHANGELOG** (if present) and merge the change to `main` through a PR.
+2. **Publish a GitHub Release** with tag `vX.Y.Z` on `main`. The `pypi`
+   environment only accepts deployments from `v*` tags.
+3. `cd.yml` sets the package version from the tag (normalized with
+   `uv version --short`), builds the sdist and wheel, uploads them as a
+   workflow artifact and attests build provenance.
+4. A separate job smoke-tests the wheel, installed from locked requirements
+   with hashes (`--require-hashes`).
+5. The publish job waits for the owner's approval on the `pypi` environment,
+   then publishes through PyPI trusted publishing (OIDC, no stored token).
+6. **Verify the release**: check the new version on PyPI and its provenance
+   attestation.
+
+`workflow_dispatch` on `cd.yml` publishes to TestPyPI only (the `testpypi`
+environment), which is the way to rehearse the pipeline without a release.
 
 ## Getting Help
 
 - **GitHub Issues**: For bugs and feature requests
 - **GitHub Discussions**: For questions and general discussion
-- **Discord/Slack**: [Add links if available]
 
 ## Recognition
 
 Contributors will be recognized in the project:
 
-- **CONTRIBUTORS.md**: List of all contributors
 - **Release notes**: Acknowledgment in release notes
 - **GitHub**: Contributor graph and statistics
 
-Thank you for contributing to TaskIQ PostgreSQL! 🚀
+Thank you for contributing to TaskIQ PostgreSQL!
