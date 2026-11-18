@@ -8,7 +8,7 @@ authors = [
     { name = "Jefferson Venceslau", email = "jeff.venceslau@gmail.com" }
 ]
 dependencies = [
-    "taskiq>=0.11.7,<0.13",
+    "taskiq>=0.11.7,<0.14",
     "typing-extensions>=4.0.0,<5",
 ]
 license = "MIT"
