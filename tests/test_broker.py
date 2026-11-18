@@ -9,7 +9,6 @@ from taskiq.utils import maybe_awaitable
 
 from taskiq_postgresql import PostgresqlBroker
 from taskiq_postgresql.exceptions import DatabaseConnectionError
-from tests.conftest import FailureDsns
 
 pytestmark = pytest.mark.anyio
 
@@ -30,12 +29,12 @@ async def get_first_task(
 
 async def test_failure_connection_database(
     driver: str,
-    failure_dsns: FailureDsns,
+    missing_database_dsn: str,
 ) -> None:
     """Test exception raising in connection database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         await PostgresqlBroker(
-            dsn=failure_dsns.missing_database,
+            dsn=missing_database_dsn,
             table_name="postgres_table",
             driver=driver,
         ).startup()

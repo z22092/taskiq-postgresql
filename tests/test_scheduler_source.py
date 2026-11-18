@@ -8,7 +8,7 @@ from taskiq import ScheduledTask
 
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
-from tests.conftest import FailureDsns, _drop_and_shutdown
+from tests.helpers import drop_and_shutdown
 
 pytestmark = pytest.mark.anyio
 
@@ -50,11 +50,11 @@ def time_based_scheduled_task() -> ScheduledTask:
     )
 
 
-async def test_failure_connection_database(failure_dsns: FailureDsns) -> None:
+async def test_failure_connection_database(missing_database_dsn: str) -> None:
     """Test exception raising when connecting to invalid database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         scheduler = PostgresqlSchedulerSource(
-            dsn=failure_dsns.missing_database,
+            dsn=missing_database_dsn,
             table_name="test_table",
             run_migrations=True,
         )
@@ -291,7 +291,7 @@ async def test_startup_schedule_processing(
         assert cron_schedules[0].kwargs == {"startup": True}
 
     finally:
-        await _drop_and_shutdown(scheduler, postgres_table)
+        await drop_and_shutdown(scheduler, postgres_table)
 
 
 async def test_startup_schedule_no_duplicates(
@@ -333,7 +333,7 @@ async def test_startup_schedule_no_duplicates(
         assert len(schedules) == 1
 
     finally:
-        await _drop_and_shutdown(scheduler, postgres_table)
+        await drop_and_shutdown(scheduler, postgres_table)
 
 
 async def test_startup_without_broker_or_startup_schedule(
@@ -378,23 +378,10 @@ async def test_schedule_serialization(
     assert retrieved.cron_offset == complex_schedule.cron_offset
 
 
-@pytest.mark.parametrize(
-    "reason",
-    ["wrong_password", "closed_port", "invalid_scheme"],
-)
-async def test_connection_failures(
-    reason: str,
-    failure_dsns: FailureDsns,
-) -> None:
+async def test_connection_failures(connection_failure_dsn: str) -> None:
     """Test various connection failure scenarios."""
-    dsn = getattr(failure_dsns, reason)
-    if dsn is None:
-        pytest.skip(
-            "the server under POSTGRESQL_URL does not check passwords; "
-            "testcontainers always does",
-        )
     scheduler = PostgresqlSchedulerSource(
-        dsn=dsn,
+        dsn=connection_failure_dsn,
         table_name="test_table",
         run_migrations=True,
     )
