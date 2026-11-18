@@ -1,6 +1,6 @@
 [project]
 name = "taskiq-postgresql"
-version = "0.4.0"
+version = "0.4.1"
 description = "PostgreSQL integration for taskiq"
 readme = "README.md"
 authors = [
@@ -8,8 +8,8 @@ authors = [
     { name = "Jefferson Venceslau", email = "jeff.venceslau@gmail.com" }
 ]
 dependencies = [
-    "taskiq>=0.11.7,<=0.12.6",
-    "typing-extensions>=4.0.0,<=4.16.0",
+    "taskiq>=0.11.7,<0.13",
+    "typing-extensions>=4.0.0,<5",
 ]
 license = "MIT"
 requires-python = ">=3.10,<3.15"
@@ -51,14 +51,14 @@ packages = [{ include = "taskiq_postgresql" }]
 
 [project.optional-dependencies]
 asyncpg = [
-    "asyncpg>=0.30.0,<=0.32.0",
+    "asyncpg>=0.30.0,<0.33",
 ]
 
 psqlpy = [
-    "psqlpy>=0.11.3,<=0.13.1",
+    "psqlpy>=0.11.3,<0.14",
 ]
 psycopg = [
-    "psycopg[binary,pool]>=3.2.9,<=3.3.8",
+    "psycopg[binary,pool]>=3.2.9,<3.4",
 ]
 
 

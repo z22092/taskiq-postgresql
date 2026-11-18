@@ -2029,7 +2029,7 @@ wheels = [
 
 [[package]]
 name = "taskiq-postgresql"
-version = "0.4.0"
+version = "0.4.1"
 source = { editable = "." }
 dependencies = [
     { name = "taskiq" },
@@ -2065,11 +2065,11 @@ lint = [
 
 [package.metadata]
 requires-dist = [
-    { name = "asyncpg", marker = "extra == 'asyncpg'", specifier = ">=0.30.0,<=0.32.0" },
-    { name = "psqlpy", marker = "extra == 'psqlpy'", specifier = ">=0.11.3,<=0.13.1" },
-    { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'psycopg'", specifier = ">=3.2.9,<=3.3.8" },
-    { name = "taskiq", specifier = ">=0.11.7,<=0.12.6" },
-    { name = "typing-extensions", specifier = ">=4.0.0,<=4.16.0" },
+    { name = "asyncpg", marker = "extra == 'asyncpg'", specifier = ">=0.30.0,<0.33" },
+    { name = "psqlpy", marker = "extra == 'psqlpy'", specifier = ">=0.11.3,<0.14" },
+    { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'psycopg'", specifier = ">=3.2.9,<3.4" },
+    { name = "taskiq", specifier = ">=0.11.7,<0.13" },
+    { name = "typing-extensions", specifier = ">=4.0.0,<5" },
 ]
 provides-extras = ["asyncpg", "psqlpy", "psycopg"]
 
