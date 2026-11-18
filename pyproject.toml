@@ -7,9 +7,12 @@ authors = [
     { name = "jeffersonsilva-mb", email = "jefferson.silva@mb.com.br" },
     { name = "Jefferson Venceslau", email = "jeff.venceslau@gmail.com" }
 ]
-dependencies = ["taskiq>=0.11.7,<=0.12.6"]
+dependencies = [
+    "taskiq>=0.11.7,<0.13",
+    "typing-extensions>=4.0.0,<5",
+]
 license = "MIT"
-requires-python = ">= 3.9"
+requires-python = ">=3.10,<3.16"
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
@@ -19,11 +22,12 @@ classifiers = [
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
-    "Programming Language :: Python :: 3.9",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Python :: Implementation :: CPython",
     "Topic :: Software Development :: Libraries :: Python Modules",
     "Topic :: Software Development :: Libraries",
@@ -32,8 +36,6 @@ classifiers = [
     "Typing :: Typed",
     "Operating System :: OS Independent",
 ]
-homepage = "https://github.com/z22092/taskiq-postgresql"
-repository = "https://github.com/z22092/taskiq-postgresql"
 keywords = [
     "taskiq",
     "tasks",
@@ -44,55 +46,71 @@ keywords = [
     "psqlpy",
     "psycopg3",
 ]
-packages = [{ include = "taskiq_postgresql" }]
+
+[project.urls]
+Homepage = "https://github.com/z22092/taskiq-postgresql"
+Repository = "https://github.com/z22092/taskiq-postgresql"
 
 [project.optional-dependencies]
 asyncpg = [
-    "asyncpg>=0.30.0",
+    "asyncpg>=0.30.0,<0.33",
 ]
 
 psqlpy = [
-    "psqlpy>=0.11.3",
+    "psqlpy>=0.11.3,<0.14",
 ]
 psycopg = [
-    "psycopg[binary,pool]>=3.2.9",
+    "psycopg[binary,pool]>=3.2.9,<3.4",
 ]
 
 
 [build-system]
-requires = ["hatchling"]
+# Pinned with sha256 in build-constraint-dependencies under [tool.uv].
+requires = ["hatchling==1.33.0"]
 build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+    "pytest-xdist==3.8.0",
+    "pytest-timeout==2.4.0",
+    "anyio==4.16.0",
+    "testcontainers==4.15.0",
+]
+# pip-audit pulls filelock through cachecontrol[filecache]; the fixed
+# filelock needs Python 3.11, so the audit tooling stays off 3.10.
+audit = [
+    "pip-audit==2.10.1; python_version >= \"3.11\"",
+]
+lint = [
+    "ruff==0.17.3",
+    "pre-commit==4.7.0; python_version >= \"3.11\"",
+]
 
 [tool.uv]
 managed = true
-dev-dependencies = [
-    "ruff>=0.6.9",
-    "pytest>=8.3.3",
-    "pytest-cov>=5.0.0",
-    "pytest-env>=1.1.5",
-    "asyncpg-stubs>=0.29.1",
-    "pre-commit>=4.0.1",
-    "pytest-xdist>=3.6.1",
-    "flake8>=7.1.1",
-    "autoflake>=2.3.1",
-    "yesqa>=1.5.0",
-    "anyio>=4.6.2.post1",
-    "wemake-python-styleguide>=0.19.2",
-    "black>=24.10.0",
-    "twine>=5.1.1",
-    "pytest-timeout>=2.4.0",
+exclude-newer = "14 days"
+required-version = ">=0.12.16,<=0.13.7"
+build-constraint-dependencies = [
+    { requirement = "editables==0.6", hashes = ["sha256:1163834902381c4613787951c5914800fdf155ae08848a373b8ea5006780977c", "sha256:d70e4698078a1d033e7786d9c64e5be070d058a67c21417024d38a58ac20aa43"] },
+    { requirement = "hatchling==1.33.0", hashes = ["sha256:415290b84f464d2884303fca8974d38e7b85579069fab02a15db0828fbb1446d", "sha256:4c422bd4d554fcff5de5b73e9596f85e41e9f97f7e553d8f7595ecb31a627bef"] },
+    { requirement = "packaging==26.3", hashes = ["sha256:94edc256424af38762eb31306eed28beb9f0efc50a8837492c9d6fd6004aed79", "sha256:d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c"] },
+    { requirement = "pathspec==1.1.1", hashes = ["sha256:17db5ecd524104a120e173814c90367a96a98d07c45b2e10c2f3919fff91bf5a", "sha256:a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189"] },
+    { requirement = "pluggy==1.7.0", hashes = ["sha256:7dd7b0d8832ba3cb632c306926ded123429211b83641b35dc5c41ad2d34f9bec", "sha256:d1eaa46ebb595891b860ab086b4d09c8588af65ebd4361b8e8f4bb8920b90ba8"] },
+    { requirement = "tomli==2.3.2; python_version < \"3.11\"", hashes = ["sha256:00934b9bf38a195fdf124e9821c5f7b3935c56d647db0973ce6815c9fe4bf10b", "sha256:022d49fd765b3aa699354e88556ae5b2ea4b2d5e9d1486a36326cf0bb29e4670", "sha256:04110e6222f08daf8a830b142d32410b158f0dba3371b29a956d1c6e66763684", "sha256:0c02cd80f810c8bd96ac9452049755f3517b157fd307406ef82f135f4ba780cc", "sha256:11ca7e3a5976d1c03c09741f4220d8549244a8054357b2e4dae8134d91c03b10", "sha256:13a81125074dbc4e7eb0ccc2059dd5fde0c158e039c901c03ac2498c8ff65b2d", "sha256:154527f6c8628a0167172ce7d64257da90a11f1d07497831a636d03c92c03d61", "sha256:1810488a291bf58c1a689c39eeee2f51b0e2230129e0e4011c22a1721ca6069b", "sha256:1997dd27acba7f16e7c21ec12fe5a0c5efe2db5b243ca4f23dcd3cbe2afb1f30", "sha256:1d42b244a02227dd71740a18af9ba1e0d64f5821453e5c320ae563b44f11ec34", "sha256:29091508b27751d793683db43ef6d1f9e0c0ddb41b8c556aa489097fdcc86e8f", "sha256:3051a15c1cc4adf3e98fa5fa65c4d4628090e93c144ce85930336bd984a069e9", "sha256:36ea7eb19d27423cf5431cd35e3c364df041d65ca0b231015a14fd0e0c84803d", "sha256:37d7b0a80e315adb00ed76b53b630b5d80630d5904421ad42faca9efa8dd037e", "sha256:3b976f7cca0af38f5832a54126c2e5c52e81f2249987ddbceb0cca9b0c93af51", "sha256:44636fd3601a3667cff152ceded19872d3a82dfe85d55aa5beea95b859e7413d", "sha256:4c7a32c78a78d32df960e2a4ac6a5ff47933d79512a02d7dcbec09205946550a", "sha256:4d3d6f9740472d5424a3f451d61cbdc5631c8a40e11e613c2afc66381280598c", "sha256:55d536b28d11ef6ebfd3a43923aef10897d35d451d32929a5fc7df6954daf8e3", "sha256:57716dddddaa2e45a8d55e3e59a459c21849efcebbdd90f22773986b718b8bc6", "sha256:594252bad2b0608adad29eb2059a55902b2de0167c0a886e6292e64f1fbe179f", "sha256:642fb0540b58dba183d1fabb678db22b71ed3983d924c6be0b83b51c0481ce4d", "sha256:68165ca9f9327c90274e14682250d9df12bf5cdeee16a3692cc08e672647c554", "sha256:6b21dd5304d432649e3493862ae7c48f07075f4eaa26538e2ba1d81a7b4e9b29", "sha256:7584e04fc8bbe66e5d0bca1685862f2c3f9aae8cd0d2329c25875151e2c03593", "sha256:779be28b726697075057acdd245f9fb57a676ad1d2d68a8a404fcb532a6dafc3", "sha256:77e603048e93a3012b66e59574bafac4f4b3189c21fd36ebcbe4acfb0eef7018", "sha256:78663af4a3ec41557f4788d0f98facdd517176bbb81f303ea2a7a4302692fca3", "sha256:78681a9c61d12abcd5165555c5e13669191faa50269c99116520c2fe6d19b77d", "sha256:7ccc15f0a01a70230a8a34b70ffb501eb6acb2f960b8e32c571f123a7108fa99", "sha256:810a180ddb4a74aea1931594a95d231dab3ee21c03b5b3ed64d98dc18f0d5257", "sha256:824623b9a20f0a910e5bce5faa4b7d7b78482095718322f39ecd97ac3ff465c9", "sha256:828528c6fc40e65058481046e92fd3fb937e66f38ce6d0c0dcdb769293f88281", "sha256:8862c97f2d8e661b6874a52f9f422da333dca2bafb6eeed35c0c57815794a362", "sha256:8c00c334e7b466ab2b473695e036b019539d4d1d23ad02ed6bbed3aea6e6d83e", "sha256:96ba5fdeb34cc1c5b2f7dca3abf73b3d8ac2d63a1607637069acff15d304b6ae", "sha256:9ce2e33b8bd42089d17eaf5a5c5ee3a1b7b2e1520b6d0eb0edcedbcd31c13fb0", "sha256:a6e41b0be1cf0f0ed3336d713fc49d6f5c8c35e8888e05c4e411cdad84b1a0b7", "sha256:a8a19b1975377b729da0b14446841c0294389ecb257d4abf7293c59257aac04f", "sha256:aa2bb9cc51899be93ea91cf8e8a7127c9f14f04121390eaeecf92337c67e8073", "sha256:ae321c7024edebb961624bef04c8bae4f102f34f3422daa2ce532c421debd9f6", "sha256:aed74303562ae41efb315ed89a857a7a70745bacebc1b4b80176a17d0354e01f", "sha256:b71ca6eb21fb83fff931149986c6dc28095debb45def93ef962735dc445f6272", "sha256:b747921be3cc710f2911583b7d6a96bd2ca9af7367bde4c4df5488aa81908e83", "sha256:b7e606b8b172cc9c0d1f81b7ecfe2651f2484343346dac005711e433ed854691", "sha256:ba201706a5bc2b0d54641d70657ec9fc8f3ed0a12438dfc5ee5a496564b672c5", "sha256:ba6f699836c403252ae4a41ddaae9a30333bdac3fbb57b6ea28a50fffbb14d77", "sha256:c3ab537f8539822d19e4e213283dca70cde882a67126a15ace89320e47891859", "sha256:c7196785466e842f61568cd26eff11638367113382ba43204e6522b96a015516", "sha256:cc404b5310ea2a5f6b3d00dd9b6b18a9ed8d959d9f144e23920d408525eecfd3", "sha256:ccf298808bf71e7cf2a6cb922c7c3b1425a624a0ce5ba5cc516c3dd0ab273574", "sha256:d29fba4bd126060fc106865d5703e8380d62b23e43d6318633637c99b413f76c", "sha256:e1d3c60cd605adca9e1c9e5c86dc3d48119946e05fcce959f06d877e6e80132f", "sha256:e44b178aa7f553143f3da8b51cd93946cf0ff56c25a694bdef9994a06aff7c5b", "sha256:e4cc58653ffd107dbc83d1681d31ff072f84269881407285ffb42b39d4cc9b56", "sha256:e70bc4717494107394b5eecdef17a01c72a50f47686d85bd560a0076a8037f57", "sha256:ee6d7bf2aa0f789ce5717734b0d77404c41efe2929fea13bceb40426c33201c9", "sha256:f2634f05fbf437e53759c09710ff75c6d0913f8ee6080e6a8d0f1e306512e91a", "sha256:f638077ad5f9ab6508a464e5f34e98826e9aacfdea531206eb5f0c55e894a798", "sha256:f732dea5b255367685bf3b7053d3da1e87f3103ccd4c9a6e66237338d1d638d9", "sha256:f7c0ee29207e06d1891f4422343d160c91ca1618bb7e5a376ff096ee9cf67740", "sha256:f94dee8739644694410905d3326602364106880c535d2f9956a2f1b27382088c", "sha256:f9617402fe7c003487ea431fa5920588d68e56f4ce534f5246bec88c7c73c337", "sha256:fbc3166b05a5435cff71e60e6503cc8b8a640bd2febae36882d6fcc13ea7a301", "sha256:fc04f38bda530bade0f841b0bbfca99cfd9cca60af5e0e89e22537501a674596"] },
+    { requirement = "tomlkit==0.15.2", hashes = ["sha256:05562412163a3037b94497385fb7f9204c637bc605af7a48199e41cf2272f437", "sha256:83e32755ba1d20d9340bd069ee97e9f6232ba2346b63ffcba425de01f7e327a6"] },
+    { requirement = "trove-classifiers==2026.9.21.13", hashes = ["sha256:0a9ebc8d4e2f3e8a22848c5258033035bec17a3012ac3fea16dbaa764489eb71", "sha256:8b1ff4f9c191b1040b71c37f1e445ab99732911e3cd91de52838453a854d7a17"] },
 ]
-no-sources = false
-
-[tool.uv.pip]
-generate-hashes = true
-
-[tool.hatch.metadata]
-allow-direct-references = true
 
 [tool.hatch.build.targets.wheel]
 packages = ["taskiq_postgresql"]
 
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 60
+addopts = ["--strict-markers", "--strict-config"]
 
 [tool.ruff.format]
 exclude = [".venv/"]
@@ -136,6 +154,7 @@ ignore = [
     "PLR0913", # Too many arguments for function call
     "D106",    # Missing docstring in public nested class
     "COM812",  # Use of assert detected
+    "PLR0917", # Too many positional args; fixing breaks public API callers
 ]
 
 [tool.ruff.lint.pydocstyle]
@@ -154,29 +173,5 @@ extend-immutable-calls = ["taskiq_dependencies.Depends", "taskiq.TaskiqDepends"]
     "D101",   # Missing docstring in public class
 ]
 "scripts/*" = [
-    "S101",   # Use of assert detected
-    "S301",   # Use of pickle detected
-    "D103",   # Missing docstring in public function
-    "SLF001", # Private member accessed
-    "S311",   # Standard pseudo-random generators are not suitable for security/cryptographic purposes
-    "D101",   # Missing docstring in public class
-    "T201",   # Use of assert detected
-    "S603",   # Use of subprocess.run detected
+    "T201",   # check_pins reports to stdout/stderr
 ]
-
-[tool.bumpversion]
-current_version = "0.4.1"
-parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
-serialize = ["{major}.{minor}.{patch}"]
-search = "{current_version}"
-replace = "{new_version}"
-regex = false
-ignore_missing_version = false
-tag = false
-sign_tags = false
-tag_name = "{new_version}"
-tag_message = "Bump version: {current_version} → {new_version}"
-allow_dirty = false
-commit = false
-message = "Bump version: {current_version} → {new_version}"
-commit_args = ""

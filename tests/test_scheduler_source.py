@@ -8,6 +8,7 @@ from taskiq import ScheduledTask
 
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
+from tests.helpers import drop_and_shutdown
 
 pytestmark = pytest.mark.anyio
 
@@ -49,12 +50,13 @@ def time_based_scheduled_task() -> ScheduledTask:
     )
 
 
-async def test_failure_connection_database() -> None:
+async def test_failure_connection_database(missing_database_dsn: str) -> None:
     """Test exception raising when connecting to invalid database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         scheduler = PostgresqlSchedulerSource(
-            dsn="postgresql://postgres:postgres@localhost:5432/nonexistent_db",
+            dsn=missing_database_dsn,
             table_name="test_table",
+            run_migrations=True,
         )
         await scheduler.startup()
 
@@ -63,24 +65,22 @@ async def test_scheduler_initialization() -> None:
     """Test scheduler source initialization with various parameters."""
     # Test with string DSN
     scheduler = PostgresqlSchedulerSource(
-        dsn="postgresql://postgres:postgres@localhost:5432/test",
+        dsn="postgresql://postgres@localhost:5432/test",
         table_name="custom_table",
         driver="asyncpg",
     )
     assert scheduler.table_name == "custom_table"
-    assert scheduler.dsn == "postgresql://postgres:postgres@localhost:5432/test"
+    assert scheduler.dsn == "postgresql://postgres@localhost:5432/test"
 
     # Test with callable DSN
     def get_dsn() -> str:
-        return "postgresql://postgres:postgres@localhost:5432/test"
+        return "postgresql://postgres@localhost:5432/test"
 
     scheduler_callable = PostgresqlSchedulerSource(
         dsn=get_dsn,
         table_name="custom_table",
     )
-    assert (
-        scheduler_callable.dsn == "postgresql://postgres:postgres@localhost:5432/test"
-    )
+    assert scheduler_callable.dsn == "postgresql://postgres@localhost:5432/test"
 
 
 async def test_startup_creates_table(
@@ -260,6 +260,7 @@ async def test_startup_schedule_processing(
         table_name=postgres_table,
         startup_schedule=startup_schedule,
         broker=mock_broker,
+        run_migrations=True,
     )
 
     await scheduler.startup()
@@ -290,11 +291,7 @@ async def test_startup_schedule_processing(
         assert cron_schedules[0].kwargs == {"startup": True}
 
     finally:
-        # Cleanup
-        async with scheduler.driver, scheduler.driver.connection() as connection:
-            await connection.execute(f"DROP TABLE {postgres_table}")
-
-        await scheduler.shutdown()
+        await drop_and_shutdown(scheduler, postgres_table)
 
 
 async def test_startup_schedule_no_duplicates(
@@ -318,6 +315,7 @@ async def test_startup_schedule_no_duplicates(
         table_name=postgres_table,
         startup_schedule=startup_schedule,
         broker=mock_broker,
+        run_migrations=True,
     )
 
     # First startup
@@ -335,11 +333,7 @@ async def test_startup_schedule_no_duplicates(
         assert len(schedules) == 1
 
     finally:
-        # Cleanup
-        # Cleanup
-        async with scheduler.driver, scheduler.driver.connection() as connection:
-            await connection.execute(f"DROP TABLE {postgres_table}")
-        await scheduler.shutdown()
+        await drop_and_shutdown(scheduler, postgres_table)
 
 
 async def test_startup_without_broker_or_startup_schedule(
@@ -384,19 +378,12 @@ async def test_schedule_serialization(
     assert retrieved.cron_offset == complex_schedule.cron_offset
 
 
-@pytest.mark.parametrize(
-    "invalid_dsn",
-    [
-        "postgresql://postgres:wrong@localhost:5432/postgres",
-        "postgresql://postgres:postgres@nonexistent:5432/postgres",
-        "invalid://connection/string",
-    ],
-)
-async def test_connection_failures(invalid_dsn: str) -> None:
+async def test_connection_failures(connection_failure_dsn: str) -> None:
     """Test various connection failure scenarios."""
     scheduler = PostgresqlSchedulerSource(
-        dsn=invalid_dsn,
+        dsn=connection_failure_dsn,
         table_name="test_table",
+        run_migrations=True,
     )
 
     with pytest.raises(DatabaseConnectionError):

@@ -1,0 +1,9 @@
+# Default gitleaks rules plus one path allowlist. The detect-secrets baseline
+# stores hashed_secret digests that look like generic API keys; it holds no
+# secrets of its own.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "detect-secrets baseline (hashed digests only)"
+paths = ['''^\.secrets\.baseline$''']

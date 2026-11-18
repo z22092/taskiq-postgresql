@@ -1,15 +1,26 @@
 import os
 import random
 import string
-from typing import AsyncGenerator, TypeVar
+from typing import AsyncGenerator, Generator, TypeVar
+from urllib.parse import urlsplit
 
 import pytest
+from testcontainers.community.postgres import PostgresContainer
 
 from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
+from tests.helpers import (
+    address_of,
+    closed_local_port,
+    drop_and_shutdown,
+    with_netloc,
+)
 
 _ReturnType = TypeVar("_ReturnType")
+
+# Kept on one line: scripts/check_pins.py matches it with a regex.
+POSTGRES_IMAGE = "postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317"  # noqa: E501
 
 
 @pytest.fixture(scope="session")
@@ -38,41 +49,103 @@ def postgres_table() -> str:
     )
 
 
-@pytest.fixture
-def postgresql_dsn() -> str:
+@pytest.fixture(scope="session")
+def postgresql_dsn() -> Generator[str, None, None]:
     """
     DSN to PostgreSQL.
 
-    :return: dsn to PostgreSQL.
+    Uses the ``POSTGRESQL_URL`` environment variable when it is set, otherwise
+    starts a throwaway PostgreSQL container for the whole test session.
+
+    :yield: dsn to PostgreSQL.
     """
-    return os.environ.get("POSTGRESQL_URL") or "postgresql://root:secret@localhost:5432"
+    external_dsn = os.environ.get("POSTGRESQL_URL")
+    if external_dsn:
+        yield external_dsn
+        return
+
+    # The DSN is built from the credentials the container itself holds.
+    with PostgresContainer(POSTGRES_IMAGE) as container:
+        yield container.get_connection_url(driver=None)
+
+
+@pytest.fixture
+def missing_database_dsn(postgresql_dsn: str) -> str:
+    """
+    DSN of a database that does not exist on the working server.
+
+    :return: the session DSN with ``_missing`` appended to the database name.
+    """
+    parts = urlsplit(postgresql_dsn)
+    return parts._replace(path=f"/{parts.path.lstrip('/')}_missing").geturl()
+
+
+@pytest.fixture(params=["wrong_password", "closed_port", "invalid_scheme"])
+def connection_failure_dsn(request: pytest.FixtureRequest, postgresql_dsn: str) -> str:
+    """
+    DSN that cannot connect, once per failure reason.
+
+    ``wrong_password`` and ``closed_port`` are the session DSN with only the
+    password or only the address replaced; ``invalid_scheme`` is a constant-shape
+    DSN. Derived at run time so each test fails for the reason its id says.
+
+    :return: a DSN that must raise a connection error.
+    """
+    parts = urlsplit(postgresql_dsn)
+    if request.param == "wrong_password":
+        if parts.password is None:
+            pytest.skip(
+                "the server under POSTGRESQL_URL does not check passwords; "
+                "testcontainers always does",
+            )
+        # Derived from the real password so it can never match it.
+        return with_netloc(
+            parts,
+            password=f"{parts.password}-wrong",
+            address=address_of(parts),
+        ).geturl()
+    if request.param == "closed_port":
+        return with_netloc(
+            parts,
+            password=parts.password,
+            address=f"127.0.0.1:{closed_local_port()}",
+        ).geturl()
+    return "invalid://connection/string"
 
 
 @pytest.fixture(params=["asyncpg", "psqlpy", "psycopg"])
+def driver(request: pytest.FixtureRequest) -> str:
+    """
+    Name of the driver under test.
+
+    Skips the test when the driver package is not installed.
+    """
+    pytest.importorskip(request.param)
+    return request.param
+
+
+@pytest.fixture
 async def result_backend(
     postgresql_dsn: str,
     postgres_table: str,
-    request: pytest.FixtureRequest,
+    driver: str,
 ) -> AsyncGenerator[PostgresqlResultBackend[_ReturnType], None]:
     backend: PostgresqlResultBackend[_ReturnType] = PostgresqlResultBackend(
         dsn=postgresql_dsn,
         table_name=postgres_table,
-        driver=request.param,
+        driver=driver,
+        run_migrations=True,
     )
     await backend.startup()
     yield backend
-
-    async with backend.driver, backend.driver.connection() as connection:
-        await connection.execute(f"DROP TABLE {postgres_table}")
-
-    await backend.shutdown()
+    await drop_and_shutdown(backend, postgres_table)
 
 
-@pytest.fixture(params=["asyncpg", "psqlpy", "psycopg"])
+@pytest.fixture
 async def broker(
     postgresql_dsn: str,
     postgres_table: str,
-    request: pytest.FixtureRequest,
+    driver: str,
 ) -> AsyncGenerator[PostgresqlBroker, None]:
     """
     Fixture to set up and tear down the broker.
@@ -83,34 +156,27 @@ async def broker(
         dsn=postgresql_dsn,
         channel_name=f"{postgres_table}_channel",
         table_name=postgres_table,
-        driver=request.param,
+        driver=driver,
+        run_migrations=True,
     )
     await broker.startup()
     yield broker
-
-    async with broker.driver, broker.driver.connection() as connection:
-        await connection.execute(f"DROP TABLE {postgres_table}")
-
-    await broker.shutdown()
+    await drop_and_shutdown(broker, postgres_table)
 
 
-@pytest.fixture(params=["asyncpg", "psqlpy", "psycopg"])
+@pytest.fixture
 async def scheduler_source(
     postgresql_dsn: str,
     postgres_table: str,
-    request: pytest.FixtureRequest,
+    driver: str,
 ) -> AsyncGenerator[PostgresqlSchedulerSource, None]:
     """Fixture to set up and tear down the scheduler source."""
     scheduler = PostgresqlSchedulerSource(
         dsn=postgresql_dsn,
         table_name=postgres_table,
-        driver=request.param,
+        driver=driver,
+        run_migrations=True,
     )
     await scheduler.startup()
     yield scheduler
-
-    # Clean up: drop the table
-    async with scheduler.driver, scheduler.driver.connection() as connection:
-        await connection.execute(f"DROP TABLE {postgres_table}")
-
-    await scheduler.shutdown()
+    await drop_and_shutdown(scheduler, postgres_table)

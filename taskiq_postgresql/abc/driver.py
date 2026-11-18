@@ -58,7 +58,7 @@ class QueryDriver(ABC):
         )
         self.insert_or_update_query = InsertOrUpdateQuery(self.table_name)
         self.run_migrations = run_migrations
-        
+
     @abstractmethod
     async def __aenter__(self) -> Self:
         """Enter the context manager."""

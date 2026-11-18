@@ -76,7 +76,7 @@ class AsyncpgDriver(QueryDriver):
 
         new_values = [*values]
 
-        for index, (column, value) in enumerate(zip(columns, values)):
+        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
             if column.type.upper() == "JSONB" and isinstance(value, dict):
                 new_values[index] = dumps(value)
 
@@ -256,14 +256,17 @@ class AsyncpgListenDriver(ListenDriver):
 
     async def on_startup(self) -> None:
         """On startup."""
-        self.connection = await connect(
-            self.connection_string,
-            **self.connection_kwargs,
-        )
-        await self.connection.add_listener(
-            self.channel_name,
-            self._notification_handler,
-        )
+        try:
+            self.connection = await connect(
+                self.connection_string,
+                **self.connection_kwargs,
+            )
+            await self.connection.add_listener(
+                self.channel_name,
+                self._notification_handler,
+            )
+        except Exception as error:
+            raise DatabaseConnectionError(str(error)) from error
 
     async def on_shutdown(self) -> None:
         """On shutdown."""

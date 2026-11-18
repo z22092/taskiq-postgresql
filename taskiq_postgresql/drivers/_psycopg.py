@@ -81,7 +81,7 @@ class PsycopgDriver(QueryDriver):
 
         new_values = [*values]
 
-        for index, (column, value) in enumerate(zip(columns, values)):
+        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
             if column.type.upper() == "JSONB" and isinstance(value, dict):
                 new_values[index] = dumps(value)
 
@@ -311,14 +311,17 @@ class PsycopgListenDriver(ListenDriver):
 
     async def on_startup(self) -> None:
         """On startup."""
-        self.connection: AsyncConnection[DictRow] = await AsyncConnection.connect(
-            self.connection_string,
-            **self.connection_kwargs,
-            autocommit=True,
-            cursor_factory=AsyncRawCursor,
-        )
-        async with self.connection.cursor() as cursor:
-            await cursor.execute(f"LISTEN {self.channel_name}")
+        try:
+            self.connection: AsyncConnection[DictRow] = await AsyncConnection.connect(
+                self.connection_string,
+                **self.connection_kwargs,
+                autocommit=True,
+                cursor_factory=AsyncRawCursor,
+            )
+            async with self.connection.cursor() as cursor:
+                await cursor.execute(f"LISTEN {self.channel_name}")
+        except Exception as error:
+            raise DatabaseConnectionError(str(error)) from error
 
         self.connection.add_notify_handler(self._notification_handler)
 

@@ -92,6 +92,8 @@ class PostgresqlBroker(AsyncBroker):
                 Additional arguments for asyncpg connection.
             pool_kwargs (dict[str, Any] | None, optional): \
                 Additional arguments for asyncpg pool creation.
+            run_migrations (bool, optional): \
+                Create the tables and indexes on startup. Defaults to False.
         """
         super().__init__(
             result_backend=result_backend,
@@ -225,7 +227,8 @@ class PostgresqlBroker(AsyncBroker):
         while True:
             try:
                 async for message_id in self.listen_driver:
-                    # Normalize payload to integer ID (psycopg may yield string payloads).
+                    # Normalize payload to integer ID
+                    # (psycopg may yield string payloads).
                     try:
                         normalized_id = int(message_id)  # type: ignore[arg-type]
                     except (TypeError, ValueError):
@@ -257,7 +260,7 @@ class PostgresqlBroker(AsyncBroker):
                         )
                         continue
 
-                    async def ack(*, _message_id: int = message_id) -> None:  # noqa: ARG001
+                    async def ack(*, _message_id: int = message_id) -> None:
                         # No-op: the row was already deleted when claimed.
                         return None
 

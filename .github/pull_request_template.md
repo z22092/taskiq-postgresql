@@ -24,10 +24,10 @@ Brief description of the changes in this PR.
 
 ### Test Configuration
 
-- **Python version(s)**: 
-- **PostgreSQL version**: 
-- **Driver(s) tested**: 
-- **Operating System**: 
+- **Python version(s)**:
+- **PostgreSQL version**:
+- **Driver(s) tested**:
+- **Operating System**:
 
 ## Performance Impact
 

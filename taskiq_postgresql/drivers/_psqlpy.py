@@ -53,7 +53,7 @@ class PsqlpyDriver(QueryDriver):
 
         new_values = [*values]
 
-        for index, (column, value) in enumerate(zip(columns, values)):
+        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
             if column.type.upper() == "JSONB":
                 if isinstance(value, str):
                     value = json.loads(value)  # noqa: PLW2901
@@ -262,18 +262,21 @@ class PsqlpyListenDriver(ListenDriver):
 
     async def on_startup(self) -> None:
         """On startup."""
-        self.connection = ConnectionPool(
-            self.connection_string,
-            **self.connection_kwargs,
-        )
-        self.listener = self.connection.listener()
+        try:
+            self.connection = ConnectionPool(
+                self.connection_string,
+                **self.connection_kwargs,
+            )
+            self.listener = self.connection.listener()
 
-        await self.listener.add_callback(
-            self.channel_name,
-            self._notification_handler,
-        )
+            await self.listener.add_callback(
+                self.channel_name,
+                self._notification_handler,
+            )
 
-        await self.listener.startup()
+            await self.listener.startup()
+        except Exception as error:
+            raise DatabaseConnectionError(str(error)) from error
 
         self.listener.listen()
 

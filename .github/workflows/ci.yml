@@ -2,131 +2,156 @@ name: CI
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # Python comes from .python-version wherever no version is given.
   lint:
-    runs-on: ubuntu-latest
+    name: lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # gitleaks scans the whole history
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "latest"
+          version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
 
-      - name: Set up Python
-        run: uv python install 3.12
+      # The ruff and check_pins hooks run from this environment.
+      - name: Install the lint group
+        run: uv sync --locked --group lint
 
-      - name: Install dependencies
-        run: uv sync --dev
-
-      - name: Run ruff check
-        run: uv run ruff check --output-format=github .
-
-      - name: Run ruff format
-        run: uv run ruff format --check .
-
+      - name: Run pre-commit on every file
+        run: uv run --no-sync pre-commit run --all-files --show-diff-on-failure
 
   test:
-    runs-on: ubuntu-latest
+    name: test (py${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      # Ryuk, the testcontainers reaper, pulls an extra image from Docker Hub.
+      # The runner VM is thrown away after the job, so nothing needs reaping.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
-        driver: ["asyncpg", "psycopg", "psqlpy"]
-        include:
-          - driver: asyncpg
-            extra: asyncpg
-          - driver: psycopg
-            extra: psycopg
-          - driver: psqlpy
-            extra: psqlpy
-
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: postgres
-          POSTGRES_USER: postgres
-          POSTGRES_DB: taskiq_test
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
-        ports:
-          - 5432:5432
-
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install uv
-        uses: astral-sh/setup-uv@v6
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
         with:
-          version: "latest"
+          version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
+          python-version: ${{ matrix.python-version }}
 
-      - name: Set up Python ${{ matrix.python-version }}
-        run: uv python install ${{ matrix.python-version }}
-
+      # The suite parametrizes every test over the three drivers, so all
+      # extras are installed. A single-driver install fails on the others.
       - name: Install dependencies
-        run: |
-          uv sync --dev --group ${{ matrix.extra }}
+        run: uv sync --locked --all-extras --group dev
 
-      - name: Run tests with pytest
+      # No POSTGRESQL_URL: the suite starts PostgreSQL with testcontainers on
+      # the runner's Docker.
+      - name: Run the test suite
+        run: uv run --no-sync pytest --cov=taskiq_postgresql --cov-report=xml --cov-report=term-missing
+
+      - name: Keep the coverage report for the upload job
+        if: matrix.python-version == '3.13'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          if-no-files-found: error
+          retention-days: 1
+
+  test-lowest:
+    name: test (py3.10, lowest-direct)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TESTCONTAINERS_RYUK_DISABLED: "true" # see the test job
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.13.7"
+          checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
+          python-version: "3.10"
+
+      # The lock holds the highest resolution, so --locked cannot apply here.
+      # uv re-resolves with the lowest version of every direct dependency and
+      # rewrites uv.lock on the runner; that copy is discarded with the VM.
+      # Transitive dependencies still resolve to their highest versions.
+      - name: Run the test suite on the lowest direct dependencies
+        run: uv run --resolution lowest-direct --all-extras --group dev pytest
+
+  # The only job that gets an OIDC token. Fork PRs get none, so it is skipped
+  # for them.
+  coverage:
+    name: coverage
+    needs: test
+    if: github.event_name == 'push' || github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write # Codecov OIDC upload
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the coverage report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage-xml
+
+      # The action's own CLI check fetches a GPG key at run time and, with
+      # fail_ci_if_error: false, runs the binary even when the check fails.
+      # This job is the only one with an OIDC token, so the CLI is fetched
+      # here and must match a pinned sha256 (same value on cli.codecov.io
+      # and on the GitHub release of codecov-cli v11.3.2).
+      - name: Download and verify the Codecov CLI
         env:
-          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/taskiq_test
-          TEST_DRIVER: ${{ matrix.driver }}
+          checksum: "8e1bfb71661378530f6ea21e82b414095899e565cbb4cf555c613064be17b973"
         run: |
-          uv run pytest tests/ -v --cov=taskiq_postgresql --cov-report=xml --cov-report=term-missing
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/codecov" https://cli.codecov.io/v11.3.2/linux/codecov
+          echo "$checksum  $RUNNER_TEMP/codecov" | sha256sum --check --strict -
+          chmod +x "$RUNNER_TEMP/codecov"
 
       - name: Upload coverage to Codecov
-        uses: codecov/codecov-action@v5
-        if: matrix.python-version == '3.12' && matrix.driver == 'asyncpg' && secrets.CODECOV_TOKEN != ''
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
-          file: ./coverage.xml
+          use_oidc: true
+          binary: ${{ runner.temp }}/codecov
+          files: ./coverage.xml
+          disable_search: true
+          plugins: noop
+          # Flip to true once the first upload shows up on codecov.io.
           fail_ci_if_error: false
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-  integration-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install uv
-        uses: astral-sh/setup-uv@v6
-        with:
-          version: "latest"
-
-      - name: Set up Python
-        run: uv python install 3.12
-
-      - name: Start services
-        run: docker-compose up -d
-
-      - name: Wait for PostgreSQL
-        run: |
-          for i in {1..30}; do
-            if docker-compose exec -T postgres pg_isready -U postgres; then
-              echo "PostgreSQL is ready"
-              break
-            fi
-            echo "Waiting for PostgreSQL... ($i/30)"
-            sleep 2
-          done
-
-      - name: Install all driver dependencies
-        run: |
-          uv sync --dev --group asyncpg --group psycopg --group psqlpy
-
-      - name: Run integration tests
-        env:
-          TEST_DATABASE_URL: postgresql://postgres:postgres@localhost:5432/postgres
-        run: |
-          uv run pytest tests/ -v -m "integration" --tb=short
-
-      - name: Stop services
-        if: always()
-        run: docker-compose down
