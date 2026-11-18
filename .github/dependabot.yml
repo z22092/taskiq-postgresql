@@ -1,55 +1,48 @@
 version: 2
 updates:
-  # Enable version updates for Python dependencies
-  - package-ecosystem: "pip"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-      day: "monday"
-    open-pull-requests-limit: 10
-    reviewers:
-      - "z22092"
-    assignees:
-      - "z22092"
-    commit-message:
-      prefix: "deps"
-      include: "scope"
-    labels:
-      - "dependencies"
-      - "python"
-
-  # Enable version updates for GitHub Actions
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
-    reviewers:
-      - "z22092"
-    assignees:
-      - "z22092"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
     commit-message:
-      prefix: "ci"
-      include: "scope"
-    labels:
-      - "dependencies"
-      - "github-actions"
+      prefix: "ci(deps)"
 
-  # Enable version updates for Docker
-  - package-ecosystem: "docker"
+  - package-ecosystem: "uv"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
+    cooldown:
+      default-days: 7
     open-pull-requests-limit: 5
-    reviewers:
-      - "z22092"
-    assignees:
-      - "z22092"
+    groups:
+      python-dependencies:
+        patterns:
+          - "*"
     commit-message:
-      prefix: "docker"
-      include: "scope"
-    labels:
-      - "dependencies"
-      - "docker"
+      prefix: "build(deps)"
+
+  # The only container image is the PostgreSQL one in docker-compose.yml;
+  # the "docker" ecosystem reads Dockerfiles, not compose files.
+  - package-ecosystem: "docker-compose"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    cooldown:
+      default-days: 7
+    open-pull-requests-limit: 5
+    groups:
+      docker-images:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "build(deps)"
