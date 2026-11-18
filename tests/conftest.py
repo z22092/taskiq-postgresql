@@ -2,8 +2,8 @@ import os
 import random
 import socket
 import string
-from typing import Any, AsyncGenerator, Generator, Literal, TypeVar
-from urllib.parse import urlsplit, urlunsplit
+from typing import AsyncGenerator, Generator, NamedTuple, Optional, TypeVar, Union
+from urllib.parse import SplitResult, urlsplit
 
 import pytest
 from testcontainers.community.postgres import PostgresContainer
@@ -71,104 +71,116 @@ def _closed_local_port() -> int:
         return probe.getsockname()[1]
 
 
+def _with_netloc(
+    parts: SplitResult,
+    *,
+    password: Optional[str],
+    host: str,
+    port: Optional[int],
+) -> SplitResult:
+    """Rebuild ``parts`` with the given password and address, keeping the user."""
+    userinfo = parts.username or ""
+    if password is not None:
+        userinfo = f"{userinfo}:{password}"
+    address = host if port is None else f"{host}:{port}"
+    return parts._replace(netloc=f"{userinfo}@{address}" if userinfo else address)
+
+
+class FailureDsns(NamedTuple):
+    """Reason -> DSN map for the connection failure-path tests."""
+
+    # None when the session DSN carries no password: that server does not check
+    # passwords, so no wrong one can be rejected and the test has to skip.
+    wrong_password: Optional[str]
+    missing_database: str
+    closed_port: str
+    invalid_scheme: str
+
+
 @pytest.fixture
-def failure_dsns(postgresql_dsn: str) -> dict[str, str]:
+def failure_dsns(postgresql_dsn: str) -> FailureDsns:
     """
     DSNs that each differ from the working one in exactly one component.
 
     Derived at run time so every failure-path test fails for the reason its name
-    says, whatever server and credentials the session uses.
+    says.
 
-    :return: reason -> dsn, for ``wrong_password``, ``missing_database`` and
-        ``closed_port``.
+    :return: one DSN per failure reason.
     """
     parts = urlsplit(postgresql_dsn)
-    userinfo, _, hostport = parts.netloc.rpartition("@")
-    user, sep, password = userinfo.partition(":")
-
-    def rebuild(*, netloc: str, path: str) -> str:
-        return urlunsplit((parts.scheme, netloc, path, parts.query, parts.fragment))
-
-    return {
+    wrong_password = (
+        None
+        if parts.password is None
         # Derived from the real password so it can never match it.
-        "wrong_password": rebuild(
-            netloc=f"{user}:{password}-wrong@{hostport}"
-            if sep
-            else f"{user}:wrong@{hostport}",
-            path=parts.path,
-        ),
-        "missing_database": rebuild(
-            netloc=parts.netloc,
+        else _with_netloc(
+            parts,
+            password=f"{parts.password}-wrong",
+            host=parts.hostname or "",
+            port=parts.port,
+        ).geturl()
+    )
+    return FailureDsns(
+        wrong_password=wrong_password,
+        missing_database=parts._replace(
             path=f"/{parts.path.lstrip('/')}_missing",
-        ),
-        "closed_port": rebuild(
-            netloc=f"{userinfo}@127.0.0.1:{_closed_local_port()}"
-            if userinfo
-            else f"127.0.0.1:{_closed_local_port()}",
-            path=parts.path,
-        ),
-    }
-
-
-class DriverHarness:
-    """
-    Driver under test plus the teardown every component fixture shares.
-
-    Components register themselves after startup; on teardown each table is
-    dropped and then its component is shut down, in that order.
-    """
-
-    def __init__(self, name: Literal["asyncpg", "psqlpy", "psycopg"]) -> None:
-        self.name = name
-        self._components: list[tuple[Any, str]] = []
-
-    def track(self, component: Any, table_name: str) -> None:
-        """Remember a started component so teardown can clean it up."""
-        self._components.append((component, table_name))
-
-    async def teardown(self) -> None:
-        """Drop the tables and shut the components down."""
-        for component, table_name in reversed(self._components):
-            async with component.driver, component.driver.connection() as connection:
-                await connection.execute(f"DROP TABLE {table_name}")
-            await component.shutdown()
+        ).geturl(),
+        closed_port=_with_netloc(
+            parts,
+            password=parts.password,
+            host="127.0.0.1",
+            port=_closed_local_port(),
+        ).geturl(),
+        invalid_scheme="invalid://connection/string",
+    )
 
 
 @pytest.fixture(params=["asyncpg", "psqlpy", "psycopg"])
-async def driver(request: pytest.FixtureRequest) -> AsyncGenerator[DriverHarness, None]:
+def driver(request: pytest.FixtureRequest) -> str:
     """
-    Driver under test.
+    Name of the driver under test.
 
     Skips the test when the driver package is not installed.
     """
     pytest.importorskip(request.param)
-    harness = DriverHarness(request.param)
-    yield harness
-    await harness.teardown()
+    return request.param
+
+
+async def _drop_and_shutdown(
+    component: Union[
+        PostgresqlResultBackend[_ReturnType],
+        PostgresqlBroker,
+        PostgresqlSchedulerSource,
+    ],
+    table: str,
+) -> None:
+    """Drop the component's table, then shut the component down."""
+    async with component.driver, component.driver.connection() as connection:
+        await connection.execute(f"DROP TABLE {table}")
+    await component.shutdown()
 
 
 @pytest.fixture
 async def result_backend(
     postgresql_dsn: str,
     postgres_table: str,
-    driver: DriverHarness,
+    driver: str,
 ) -> AsyncGenerator[PostgresqlResultBackend[_ReturnType], None]:
     backend: PostgresqlResultBackend[_ReturnType] = PostgresqlResultBackend(
         dsn=postgresql_dsn,
         table_name=postgres_table,
-        driver=driver.name,
+        driver=driver,
         run_migrations=True,
     )
     await backend.startup()
-    driver.track(backend, postgres_table)
     yield backend
+    await _drop_and_shutdown(backend, postgres_table)
 
 
 @pytest.fixture
 async def broker(
     postgresql_dsn: str,
     postgres_table: str,
-    driver: DriverHarness,
+    driver: str,
 ) -> AsyncGenerator[PostgresqlBroker, None]:
     """
     Fixture to set up and tear down the broker.
@@ -179,27 +191,27 @@ async def broker(
         dsn=postgresql_dsn,
         channel_name=f"{postgres_table}_channel",
         table_name=postgres_table,
-        driver=driver.name,
+        driver=driver,
         run_migrations=True,
     )
     await broker.startup()
-    driver.track(broker, postgres_table)
     yield broker
+    await _drop_and_shutdown(broker, postgres_table)
 
 
 @pytest.fixture
 async def scheduler_source(
     postgresql_dsn: str,
     postgres_table: str,
-    driver: DriverHarness,
+    driver: str,
 ) -> AsyncGenerator[PostgresqlSchedulerSource, None]:
     """Fixture to set up and tear down the scheduler source."""
     scheduler = PostgresqlSchedulerSource(
         dsn=postgresql_dsn,
         table_name=postgres_table,
-        driver=driver.name,
+        driver=driver,
         run_migrations=True,
     )
     await scheduler.startup()
-    driver.track(scheduler, postgres_table)
     yield scheduler
+    await _drop_and_shutdown(scheduler, postgres_table)

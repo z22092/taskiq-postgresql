@@ -1,7 +1,7 @@
 import asyncio
 import json
 import uuid
-from typing import Literal, Union
+from typing import Union
 
 import pytest
 from taskiq import AckableMessage, BrokerMessage
@@ -9,6 +9,7 @@ from taskiq.utils import maybe_awaitable
 
 from taskiq_postgresql import PostgresqlBroker
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+from tests.conftest import FailureDsns
 
 pytestmark = pytest.mark.anyio
 
@@ -27,17 +28,16 @@ async def get_first_task(
     return b""
 
 
-@pytest.mark.parametrize("driver_name", ["asyncpg", "psqlpy", "psycopg"])
 async def test_failure_connection_database(
-    driver_name: Literal["asyncpg", "psqlpy", "psycopg"],
-    failure_dsns: dict[str, str],
+    driver: str,
+    failure_dsns: FailureDsns,
 ) -> None:
     """Test exception raising in connection database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         await PostgresqlBroker(
-            dsn=failure_dsns["missing_database"],
+            dsn=failure_dsns.missing_database,
             table_name="postgres_table",
-            driver=driver_name,
+            driver=driver,
         ).startup()
 
 
