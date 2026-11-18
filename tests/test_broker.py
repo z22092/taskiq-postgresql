@@ -27,16 +27,17 @@ async def get_first_task(
     return b""
 
 
-@pytest.mark.parametrize("driver", ["asyncpg", "psqlpy", "psycopg"])
+@pytest.mark.parametrize("driver_name", ["asyncpg", "psqlpy", "psycopg"])
 async def test_failure_connection_database(
-    driver: Literal["asyncpg", "psqlpy", "psycopg"],
+    driver_name: Literal["asyncpg", "psqlpy", "psycopg"],
+    failure_dsns: dict[str, str],
 ) -> None:
     """Test exception raising in connection database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         await PostgresqlBroker(
-            dsn="postgresql://postgres@localhost:5432/aaaaaaaaa",
+            dsn=failure_dsns["missing_database"],
             table_name="postgres_table",
-            driver=driver,
+            driver=driver_name,
         ).startup()
 
 

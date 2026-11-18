@@ -49,11 +49,11 @@ def time_based_scheduled_task() -> ScheduledTask:
     )
 
 
-async def test_failure_connection_database() -> None:
+async def test_failure_connection_database(failure_dsns: dict[str, str]) -> None:
     """Test exception raising when connecting to invalid database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         scheduler = PostgresqlSchedulerSource(
-            dsn="postgresql://postgres@localhost:5432/nonexistent_db",
+            dsn=failure_dsns["missing_database"],
             table_name="test_table",
             run_migrations=True,
         )
@@ -386,17 +386,17 @@ async def test_schedule_serialization(
 
 
 @pytest.mark.parametrize(
-    "invalid_dsn",
-    [
-        "postgresql://postgres:wrong@localhost:5432/postgres",  # pragma: allowlist secret (wrong password on purpose) # noqa: E501
-        "postgresql://postgres@nonexistent:5432/postgres",
-        "invalid://connection/string",
-    ],
+    "reason",
+    ["wrong_password", "closed_port", "invalid_scheme"],
 )
-async def test_connection_failures(invalid_dsn: str) -> None:
+async def test_connection_failures(
+    reason: str,
+    failure_dsns: dict[str, str],
+) -> None:
     """Test various connection failure scenarios."""
+    invalid_dsns = {**failure_dsns, "invalid_scheme": "invalid://connection/string"}
     scheduler = PostgresqlSchedulerSource(
-        dsn=invalid_dsn,
+        dsn=invalid_dsns[reason],
         table_name="test_table",
         run_migrations=True,
     )

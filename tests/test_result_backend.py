@@ -60,11 +60,11 @@ def custom_taskiq_result() -> TaskiqResult[Any]:
     )
 
 
-async def test_failure_connection_database() -> None:
+async def test_failure_connection_database(failure_dsns: dict[str, str]) -> None:
     """Test exception raising in connection database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         await PostgresqlResultBackend(
-            dsn="postgresql://postgres@localhost:5432/aaaaaaaaa",
+            dsn=failure_dsns["missing_database"],
             table_name="postgres_table",
             run_migrations=True,
         ).startup()
