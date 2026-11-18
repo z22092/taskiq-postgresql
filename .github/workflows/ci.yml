@@ -131,15 +131,27 @@ jobs:
         with:
           name: coverage-xml
 
+      # The action's own CLI check fetches a GPG key at run time and, with
+      # fail_ci_if_error: false, runs the binary even when the check fails.
+      # This job is the only one with an OIDC token, so the CLI is fetched
+      # here and must match a pinned sha256 (same value on cli.codecov.io
+      # and on the GitHub release of codecov-cli v11.3.2).
+      - name: Download and verify the Codecov CLI
+        env:
+          checksum: "8e1bfb71661378530f6ea21e82b414095899e565cbb4cf555c613064be17b973"
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            --output "$RUNNER_TEMP/codecov" https://cli.codecov.io/v11.3.2/linux/codecov
+          echo "$checksum  $RUNNER_TEMP/codecov" | sha256sum --check --strict -
+          chmod +x "$RUNNER_TEMP/codecov"
+
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           use_oidc: true
+          binary: ${{ runner.temp }}/codecov
           files: ./coverage.xml
           disable_search: true
           plugins: noop
-          # The action downloads the Codecov CLI at run time; pin the release
-          # so this job, the only one with an OIDC token, runs known code.
-          version: "v11.3.2"
           # Flip to true once the first upload shows up on codecov.io.
           fail_ci_if_error: false
