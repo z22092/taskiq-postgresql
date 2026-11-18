@@ -66,6 +66,7 @@ async def test_failure_connection_database() -> None:
         await PostgresqlResultBackend(
             dsn="postgresql://postgres:postgres@localhost:5432/aaaaaaaaa",
             table_name="postgres_table",
+            run_migrations=True,
         ).startup()
 
 
@@ -88,6 +89,7 @@ async def test_success_backend_default_result_delete_res(
         dsn=postgresql_dsn,
         table_name=postgres_table,
         keep_results=False,
+        run_migrations=True,
     )
     await backend.startup()
 

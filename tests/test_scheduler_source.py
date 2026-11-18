@@ -55,6 +55,7 @@ async def test_failure_connection_database() -> None:
         scheduler = PostgresqlSchedulerSource(
             dsn="postgresql://postgres:postgres@localhost:5432/nonexistent_db",
             table_name="test_table",
+            run_migrations=True,
         )
         await scheduler.startup()
 
@@ -260,6 +261,7 @@ async def test_startup_schedule_processing(
         table_name=postgres_table,
         startup_schedule=startup_schedule,
         broker=mock_broker,
+        run_migrations=True,
     )
 
     await scheduler.startup()
@@ -318,6 +320,7 @@ async def test_startup_schedule_no_duplicates(
         table_name=postgres_table,
         startup_schedule=startup_schedule,
         broker=mock_broker,
+        run_migrations=True,
     )
 
     # First startup
@@ -397,6 +400,7 @@ async def test_connection_failures(invalid_dsn: str) -> None:
     scheduler = PostgresqlSchedulerSource(
         dsn=invalid_dsn,
         table_name="test_table",
+        run_migrations=True,
     )
 
     with pytest.raises(DatabaseConnectionError):

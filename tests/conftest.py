@@ -1,15 +1,18 @@
 import os
 import random
 import string
-from typing import AsyncGenerator, TypeVar
+from typing import AsyncGenerator, Generator, TypeVar
 
 import pytest
+from testcontainers.community.postgres import PostgresContainer
 
 from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 
 _ReturnType = TypeVar("_ReturnType")
+
+POSTGRES_IMAGE = "postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317"
 
 
 @pytest.fixture(scope="session")
@@ -38,14 +41,28 @@ def postgres_table() -> str:
     )
 
 
-@pytest.fixture
-def postgresql_dsn() -> str:
+@pytest.fixture(scope="session")
+def postgresql_dsn() -> Generator[str, None, None]:
     """
     DSN to PostgreSQL.
 
-    :return: dsn to PostgreSQL.
+    Uses the ``POSTGRESQL_URL`` environment variable when it is set, otherwise
+    starts a throwaway PostgreSQL container for the whole test session.
+
+    :yield: dsn to PostgreSQL.
     """
-    return os.environ.get("POSTGRESQL_URL") or "postgresql://root:secret@localhost:5432"
+    external_dsn = os.environ.get("POSTGRESQL_URL")
+    if external_dsn:
+        yield external_dsn
+        return
+
+    with PostgresContainer(
+        POSTGRES_IMAGE,
+        username="postgres",
+        password="postgres",  # noqa: S106
+        dbname="postgres",
+    ) as container:
+        yield container.get_connection_url(driver=None)
 
 
 @pytest.fixture(params=["asyncpg", "psqlpy", "psycopg"])
@@ -58,6 +75,7 @@ async def result_backend(
         dsn=postgresql_dsn,
         table_name=postgres_table,
         driver=request.param,
+        run_migrations=True,
     )
     await backend.startup()
     yield backend
@@ -84,6 +102,7 @@ async def broker(
         channel_name=f"{postgres_table}_channel",
         table_name=postgres_table,
         driver=request.param,
+        run_migrations=True,
     )
     await broker.startup()
     yield broker
@@ -105,6 +124,7 @@ async def scheduler_source(
         dsn=postgresql_dsn,
         table_name=postgres_table,
         driver=request.param,
+        run_migrations=True,
     )
     await scheduler.startup()
     yield scheduler
