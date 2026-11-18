@@ -29,9 +29,9 @@ This project follows the [Contributor Covenant Code of Conduct](https://www.cont
 
 ### Prerequisites
 
-- Python 3.9 or higher
-- PostgreSQL 10 or higher
-- [UV](https://github.com/astral-sh/uv) (recommended) or pip
+- Python 3.10 to 3.14
+- [UV](https://github.com/astral-sh/uv) 0.12.16 to 0.13.7
+- Docker or Podman (the tests start PostgreSQL through testcontainers)
 - Git
 
 ### Setup Instructions
@@ -45,7 +45,7 @@ cd taskiq-postgresql
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # Install dependencies
-uv sync --dev --all-extras
+uv sync --locked --all-extras --all-groups
 
 # Set up pre-commit hooks (optional but recommended)
 uv run pre-commit install
@@ -53,65 +53,48 @@ uv run pre-commit install
 
 ### Database Setup
 
-You can use Docker Compose for easy PostgreSQL setup:
+The test suite starts a throwaway PostgreSQL container by itself
+(testcontainers, image pinned by digest), so no setup is needed.
+
+To run the tests against a database you already have, set `POSTGRESQL_URL`:
 
 ```bash
-docker-compose up -d
+export POSTGRESQL_URL=postgresql://postgres:postgres@localhost:5432/postgres
 ```
 
-Or set up PostgreSQL manually and create a test database:
+`docker-compose.yml` starts a local PostgreSQL whose credentials match the URL above:
 
-```sql
-CREATE DATABASE taskiq_test;
+```bash
+docker compose up -d --wait
+```
+
+#### Podman
+
+With rootless Podman, point testcontainers at the Podman socket and disable Ryuk
+(these values are machine specific, do not commit them):
+
+```bash
+export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+export TESTCONTAINERS_RYUK_DISABLED=true
 ```
 
 ## Running Tests
 
-### All Tests
-
 ```bash
-# Run all tests
+# Run all tests (all three drivers)
 uv run pytest
 
 # Run tests with coverage
 uv run pytest --cov=taskiq_postgresql --cov-report=html
 
-# Run tests for specific driver
-TEST_DRIVER=asyncpg uv run pytest
-```
-
-### Specific Test Categories
-
-```bash
-# Unit tests only
-uv run pytest tests/ -m "not integration"
-
-# Integration tests only
-uv run pytest tests/ -m "integration"
-
-# Performance tests
-uv run pytest tests/ -m "performance"
-
-# Tests for specific component
+# Run one test file
 uv run pytest tests/test_broker.py
-```
 
-### Testing with Different Drivers
+# Run a single driver (the driver is part of the test id)
+uv run pytest -k asyncpg
 
-```bash
-# Test with asyncpg
-uv sync --group asyncpg
-TEST_DRIVER=asyncpg uv run pytest
-
-# Test with psycopg3
-uv sync --group psycopg
-TEST_DRIVER=psycopg uv run pytest
-
-# Test with psqlpy
-uv sync --group psqlpy
-TEST_DRIVER=psqlpy uv run pytest
-
-
+# Check the lowest supported dependency versions
+uv run --resolution lowest-direct --all-extras pytest
 ```
 
 ## Code Style

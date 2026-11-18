@@ -337,17 +337,17 @@ pip install taskiq-postgresql[asyncpg]
 
 ## Requirements
 
-- **Python**: 3.9+
-- **TaskIQ**: 0.11.7+
+- **Python**: 3.10 to 3.14
+- **TaskIQ**: 0.11.7 to 0.12.6
 - **PostgreSQL**: 10+
 
 ### Driver Dependencies
 
 | Driver | Version | Extra |
 |--------|---------|-------|
-| AsyncPG | 0.30.0+ | `[asyncpg]` |
-| Psycopg3 | 3.2.9+ | `[psycopg]` |
-| PSQLPy | 0.11.3+ | `[psqlpy]` |
+| AsyncPG | 0.30.0 to 0.32.0 | `[asyncpg]` |
+| Psycopg3 | 3.2.9 to 3.3.8 | `[psycopg]` |
+| PSQLPy | 0.11.3 to 0.13.1 | `[psqlpy]` |
 
 ## Development
 
@@ -364,19 +364,30 @@ This project uses modern Python development tools:
 git clone https://github.com/z22092/taskiq-postgresql.git
 cd taskiq-postgresql
 
-# Install dependencies with UV
-uv sync
+# Install everything (all driver extras and all dependency groups)
+uv sync --locked --all-extras --all-groups
 
-# Install with all driver extras
-uv sync --extra asyncpg --extra psycopg --extra psqlpy
-
-# Run tests
+# Run tests (starts a throwaway PostgreSQL through testcontainers)
 uv run pytest
+
+# Run tests against an existing database instead
+POSTGRESQL_URL=postgresql://postgres:postgres@localhost:5432/postgres uv run pytest
 
 # Format and lint
 uv run ruff format
 uv run ruff check
 ```
+
+The test suite needs a container engine (Docker or Podman). With rootless
+Podman, point testcontainers at the Podman socket and disable Ryuk:
+
+```bash
+export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
+export TESTCONTAINERS_RYUK_DISABLED=true
+```
+
+`docker-compose.yml` starts a local PostgreSQL for manual work. Its
+credentials match `POSTGRESQL_URL=postgresql://postgres:postgres@localhost:5432/postgres`.
 
 ## Contributing
 
