@@ -72,7 +72,10 @@ Start a local PostgreSQL with the repository's `docker-compose.yml` (bound to
 docker compose up -d --wait
 ```
 
-The DSN below connects to it without a password.
+The DSN below connects to it without a password. If you ran an earlier compose
+file (password authentication), run `docker compose down -v` once first:
+`POSTGRES_HOST_AUTH_METHOD` only applies when the data volume is initialized,
+and otherwise the DSN fails with `fe_sendauth: no password supplied`.
 
 ```python
 import asyncio
@@ -358,8 +361,9 @@ pip install taskiq-postgresql[asyncpg]
 ## Requirements
 
 - **Python, TaskIQ and driver versions**: supported ranges are declared in
-  [`pyproject.toml`](pyproject.toml) (`requires-python`, `dependencies` and the
-  driver extras) and shown on [PyPI](https://pypi.org/project/taskiq-postgresql/).
+  [`pyproject.toml`](https://github.com/z22092/taskiq-postgresql/blob/main/pyproject.toml)
+  (`requires-python`, `dependencies` and the driver extras). PyPI shows the
+  Python requirement and the extras, but not the dependency ranges.
 - **PostgreSQL**: 10+
 
 Each driver is an optional extra: `[asyncpg]`, `[psycopg]` or `[psqlpy]`.
@@ -367,7 +371,7 @@ Each driver is an optional extra: `[asyncpg]`, `[psycopg]` or `[psqlpy]`.
 ## Development
 
 Setup, tests, linting, the dependency policy and the release process are in
-[CONTRIBUTING.md](.github/CONTRIBUTING.md).
+[CONTRIBUTING.md](https://github.com/z22092/taskiq-postgresql/blob/main/.github/CONTRIBUTING.md).
 
 ## Contributing
 

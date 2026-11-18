@@ -74,6 +74,11 @@ docker compose up -d --wait
 export POSTGRESQL_URL="postgresql://postgres@localhost:5432/postgres"
 ```
 
+`POSTGRES_HOST_AUTH_METHOD` only applies when the data volume is initialized. If
+you ran an earlier compose file (password authentication), run
+`docker compose down -v` once, or the passwordless DSN fails with
+`fe_sendauth: no password supplied`.
+
 Port 5432 must be free on the host. The tests do not need the compose
 database; the `postgresql_dsn` fixture uses `POSTGRESQL_URL` when it is set and
 starts a container otherwise.
@@ -110,7 +115,7 @@ CI runs `test (py3.10, lowest-direct)` against the floor of every direct
 dependency:
 
 ```bash
-uv run --resolution lowest-direct --all-extras --group dev pytest
+uv run --python 3.10 --resolution lowest-direct --all-extras --group dev pytest
 ```
 
 This command rewrites `uv.lock` on disk. Restore it afterwards so the lock
@@ -141,7 +146,7 @@ the `lint` group). The ruff hooks are `repo: local` and call
 `uv run --no-sync ruff ...`, so the version is the one pinned in `pyproject.toml`
 and not a second copy in `.pre-commit-config.yaml`. `scripts/check_pins.py` is
 also a local pre-commit hook: it fails when a pinned version is declared
-differently in two places.
+differently in two places or a dependency range has the wrong shape.
 
 ### Code Style Guidelines
 
@@ -189,8 +194,13 @@ async def process_task(
   suite green on the new version.
 - Tooling, GitHub Actions (full commit SHA), container images (digest) and the
   lock are exact.
-- Supply-chain scanning has its own `audit` dependency group (pip-audit), so it
-  does not leak into the dev environment.
+- Supply-chain scanning has its own `audit` dependency group (pip-audit).
+  pip-audit pulls `filelock` through `cachecontrol[filecache]`, and the fixed
+  `filelock` needs Python >= 3.11. So the group is limited to 3.11+ and kept out
+  of `dev`, which keeps a vulnerable `filelock` out of the 3.10 test
+  environment. Known limit: CI runs pip-audit on 3.13 and it skips pins whose
+  markers exclude that interpreter, so pins used only on 3.10 are not audited
+  there.
 - Dependabot waits 14 days before proposing a release, matching
   `exclude-newer = "14 days"` in `[tool.uv]`.
 - The Postgres image is declared in both `tests/conftest.py` and
@@ -358,42 +368,51 @@ All tests run against a real PostgreSQL, through testcontainers or
 
 ### Test Example
 
+The `driver` fixture is parametrized over `asyncpg`, `psqlpy` and `psycopg`
+(it skips a driver whose package is not installed) and feeds `broker`,
+`result_backend` and `scheduler_source`, so a test that takes one of them runs
+once per driver. Tests are async and use the anyio mark.
+
 ```python
+import asyncio
+import uuid
+
 import pytest
+from taskiq import BrokerMessage
+
 from taskiq_postgresql import PostgresqlBroker
 
+pytestmark = pytest.mark.anyio
 
-class TestPostgresqlBroker:
-    """Test PostgreSQL broker functionality."""
 
-    async def test_broker_startup_and_shutdown(
-        self,
-        postgresql_dsn: str,
-    ) -> None:
-        """Test broker can start up and shut down properly."""
-        broker = PostgresqlBroker(dsn=postgresql_dsn)
+async def test_when_message_is_kicked__then_listener_receives_it(
+    broker: PostgresqlBroker,
+) -> None:
+    """The `broker` fixture runs this test once per installed driver."""
+    message = BrokerMessage(
+        task_id=uuid.uuid4().hex,
+        task_name=uuid.uuid4().hex,
+        message=b"my_msg",
+        labels={},
+    )
 
-        await broker.startup()
-        assert broker.is_ready
+    async def first_message() -> object:
+        async for received in broker.listen():
+            return received
+        return None
 
-        await broker.shutdown()
-        assert not broker.is_ready
+    listener = asyncio.create_task(first_message())
+    await asyncio.sleep(0.2)  # let the listener subscribe before kicking
+    await broker.kick(message)
 
-    @pytest.mark.parametrize("driver", ["asyncpg", "psycopg", "psqlpy"])
-    async def test_broker_with_different_drivers(
-        self,
-        postgresql_dsn: str,
-        driver: str,
-    ) -> None:
-        """Test broker works with different drivers."""
-        broker = PostgresqlBroker(dsn=postgresql_dsn, driver=driver)
-        # Test implementation
+    received = await asyncio.wait_for(listener, timeout=5)
+    assert received.data == message.message
 ```
 
 ## Release Process
 
 Releases are cut by publishing a GitHub Release. There is no version bump
-commit and no bumpversion: the version comes from the tag.
+commit: the version comes from the tag.
 
 1. **Update CHANGELOG** (if present) and merge the change to `main` through a PR.
 2. **Publish a GitHub Release** with tag `vX.Y.Z` on `main`. The `pypi`
