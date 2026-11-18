@@ -36,7 +36,10 @@ jobs:
         with:
           version: "0.13.7"
           enable-cache: false
-      - name: Export locked runtime dependencies with hashes
-        run: uv export --locked --all-extras --no-emit-project --output-file "$RUNNER_TEMP/audit-requirements.txt"
+      - name: Export the locked runtime, extras and every dependency group with hashes
+        run: uv export --locked --all-extras --all-groups --no-emit-project --output-file "$RUNNER_TEMP/audit-requirements.txt"
+      # Only the audit group is installed; pip-audit never imports what it
+      # audits. It skips pins whose markers exclude this interpreter, so pins
+      # used only on Python 3.10 are not covered here.
       - name: Audit them against the PyPI/OSV advisory databases
-        run: uv run --locked --only-group dev pip-audit --strict --disable-pip --require-hashes --requirement "$RUNNER_TEMP/audit-requirements.txt"
+        run: uv run --locked --only-group audit pip-audit --strict --disable-pip --require-hashes --requirement "$RUNNER_TEMP/audit-requirements.txt"
