@@ -64,7 +64,7 @@ async def test_failure_connection_database() -> None:
     """Test exception raising in connection database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         await PostgresqlResultBackend(
-            dsn="postgresql://postgres:postgres@localhost:5432/aaaaaaaaa",
+            dsn="postgresql://postgres@localhost:5432/aaaaaaaaa",
             table_name="postgres_table",
             run_migrations=True,
         ).startup()

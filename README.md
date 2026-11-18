@@ -71,12 +71,12 @@ from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
 
 # Configure the result backend
 result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/taskiq_db",
 )
 
 # Configure the broker with result backend
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/taskiq_db",
 ).with_result_backend(result_backend)
 
 
@@ -113,11 +113,11 @@ from taskiq_postgresql import PostgresqlBroker, PostgresqlSchedulerSource
 from taskiq import TaskiqScheduler
 
 # Initialize broker
-broker = PostgresqlBroker(dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db")
+broker = PostgresqlBroker(dsn="postgresql://postgres@localhost:5432/taskiq_db")
 
 # Initialize scheduler source
 scheduler_source = PostgresqlSchedulerSource(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/taskiq_db",
     table_name="taskiq_schedules",
     driver="asyncpg",
 )
@@ -206,7 +206,7 @@ async def setup_schedule():
 from taskiq.serializers import JSONSerializer
 
 result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/taskiq_db",
     serializer=JSONSerializer(),
 )
 ```
@@ -215,13 +215,13 @@ result_backend = PostgresqlResultBackend(
 
 ```python
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/taskiq_db",
     queue_name="my_custom_queue",
     field_for_task_id="Text",  # Use TEXT instead of UUID
 )
 
 result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/taskiq_db",
     table_name="my_custom_results",
     field_for_task_id="VarChar",  # Use VARCHAR instead of UUID
 )
@@ -232,7 +232,7 @@ result_backend = PostgresqlResultBackend(
 ```python
 # AsyncPG
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/taskiq_db",
     driver="asyncpg",
     min_size=5,
     max_size=20,
@@ -241,7 +241,7 @@ broker = PostgresqlBroker(
 
 # Psycopg3
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres:postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/taskiq_db",
     driver="psycopg",
     min_size=5,
     max_size=20,
@@ -255,10 +255,10 @@ broker = PostgresqlBroker(
 import os
 
 # From environment
-dsn = os.getenv("DATABASE_URL", "postgresql://localhost/taskiq")
+dsn = os.environ["POSTGRESQL_URL"]
 
-# With SSL
-dsn = "postgresql://user:pass@localhost:5432/db?sslmode=require"
+# With SSL (the URL must not already carry a query string)
+dsn = os.environ["POSTGRESQL_URL"] + "?sslmode=require"
 
 broker = PostgresqlBroker(dsn=dsn)
 ```
@@ -315,7 +315,7 @@ CREATE TABLE taskiq_schedules (
 **Connection Errors**
 ```python
 # Ensure your connection string is correct
-dsn = "postgresql://username:password@host:port/database"
+dsn = os.environ["POSTGRESQL_URL"]  # postgresql://user@host:port/database
 
 # Check PostgreSQL is running and accessible
 import asyncpg
@@ -372,7 +372,7 @@ uv sync --locked --all-extras --all-groups
 uv run pytest
 
 # Run tests against an existing database instead
-POSTGRESQL_URL=postgresql://postgres:postgres@localhost:5432/postgres uv run pytest
+POSTGRESQL_URL="$YOUR_DATABASE_URL" uv run pytest
 
 # Format and lint
 uv run ruff format
@@ -388,7 +388,8 @@ export TESTCONTAINERS_RYUK_DISABLED=true
 ```
 
 `docker-compose.yml` starts a local PostgreSQL for manual work. Its
-credentials match `POSTGRESQL_URL=postgresql://postgres:postgres@localhost:5432/postgres`.
+credentials are the ones set in that file (user, database and
+password); build `POSTGRESQL_URL` from them.
 
 ## Contributing
 

@@ -34,7 +34,7 @@ async def test_failure_connection_database(
     """Test exception raising in connection database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         await PostgresqlBroker(
-            dsn="postgresql://postgres:postgres@localhost:5432/aaaaaaaaa",
+            dsn="postgresql://postgres@localhost:5432/aaaaaaaaa",
             table_name="postgres_table",
             driver=driver,
         ).startup()

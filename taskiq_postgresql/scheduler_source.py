@@ -65,7 +65,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
 
         Args:
             dsn: PostgreSQL connection string. Defaults to a local PostgreSQL instance.
-                Format: "postgres://user:password@host:port/database"
+                Format: "postgres://user@host:port/database"
             table_name: Name of the table to store scheduled tasks. Will be created
                 automatically if it doesn't exist. Defaults to "taskiq_schedulers".
             driver: Database driver to use for connections. Currently only "asyncpg"
@@ -84,7 +84,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
         Example:
             ```python
             scheduler = AsyncPgSchedulerSource(
-                dsn="postgres://user:pass@localhost:5432/mydb",
+                dsn="postgres://user@localhost:5432/mydb",
                 table_name="my_schedules",
                 startup_schedule={
                     "my_task": [

@@ -53,7 +53,7 @@ async def test_failure_connection_database() -> None:
     """Test exception raising when connecting to invalid database."""
     with pytest.raises(expected_exception=DatabaseConnectionError):
         scheduler = PostgresqlSchedulerSource(
-            dsn="postgresql://postgres:postgres@localhost:5432/nonexistent_db",
+            dsn="postgresql://postgres@localhost:5432/nonexistent_db",
             table_name="test_table",
             run_migrations=True,
         )
@@ -64,24 +64,22 @@ async def test_scheduler_initialization() -> None:
     """Test scheduler source initialization with various parameters."""
     # Test with string DSN
     scheduler = PostgresqlSchedulerSource(
-        dsn="postgresql://postgres:postgres@localhost:5432/test",
+        dsn="postgresql://postgres@localhost:5432/test",
         table_name="custom_table",
         driver="asyncpg",
     )
     assert scheduler.table_name == "custom_table"
-    assert scheduler.dsn == "postgresql://postgres:postgres@localhost:5432/test"
+    assert scheduler.dsn == "postgresql://postgres@localhost:5432/test"
 
     # Test with callable DSN
     def get_dsn() -> str:
-        return "postgresql://postgres:postgres@localhost:5432/test"
+        return "postgresql://postgres@localhost:5432/test"
 
     scheduler_callable = PostgresqlSchedulerSource(
         dsn=get_dsn,
         table_name="custom_table",
     )
-    assert (
-        scheduler_callable.dsn == "postgresql://postgres:postgres@localhost:5432/test"
-    )
+    assert scheduler_callable.dsn == "postgresql://postgres@localhost:5432/test"
 
 
 async def test_startup_creates_table(
@@ -390,8 +388,8 @@ async def test_schedule_serialization(
 @pytest.mark.parametrize(
     "invalid_dsn",
     [
-        "postgresql://postgres:wrong@localhost:5432/postgres",
-        "postgresql://postgres:postgres@nonexistent:5432/postgres",
+        "postgresql://postgres:wrong@localhost:5432/postgres",  # pragma: allowlist secret (wrong password on purpose) # noqa: E501
+        "postgresql://postgres@nonexistent:5432/postgres",
         "invalid://connection/string",
     ],
 )

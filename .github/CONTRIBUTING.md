@@ -59,10 +59,11 @@ The test suite starts a throwaway PostgreSQL container by itself
 To run the tests against a database you already have, set `POSTGRESQL_URL`:
 
 ```bash
-export POSTGRESQL_URL=postgresql://postgres:postgres@localhost:5432/postgres
+export POSTGRESQL_URL="postgresql://<user>@<host>:5432/<database>"
 ```
 
-`docker-compose.yml` starts a local PostgreSQL whose credentials match the URL above:
+`docker-compose.yml` starts a local PostgreSQL whose credentials are set in that file (user, database and password); build
+`POSTGRESQL_URL` from them:
 
 ```bash
 docker compose up -d --wait
