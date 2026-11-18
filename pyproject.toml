@@ -1,13 +1,13 @@
 [project]
 name = "taskiq-postgresql"
-version = "0.4.0"
+version = "0.4.1"
 description = "PostgreSQL integration for taskiq"
 readme = "README.md"
 authors = [
     { name = "jeffersonsilva-mb", email = "jefferson.silva@mb.com.br" },
     { name = "Jefferson Venceslau", email = "jeff.venceslau@gmail.com" }
 ]
-dependencies = ["taskiq>=0.11.7"]
+dependencies = ["taskiq>=0.11.7,<=0.12.6"]
 license = "MIT"
 requires-python = ">= 3.9"
 classifiers = [
@@ -165,7 +165,7 @@ extend-immutable-calls = ["taskiq_dependencies.Depends", "taskiq.TaskiqDepends"]
 ]
 
 [tool.bumpversion]
-current_version = "0.4.0"
+current_version = "0.4.1"
 parse = "(?P<major>\\d+)\\.(?P<minor>\\d+)\\.(?P<patch>\\d+)"
 serialize = ["{major}.{minor}.{patch}"]
 search = "{current_version}"
