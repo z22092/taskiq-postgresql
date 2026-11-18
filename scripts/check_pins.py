@@ -166,29 +166,31 @@ def minor_of(version: str) -> int:
     return int(version.split(".")[1])
 
 
-def check_python(
-    pyproject: dict,
-    workflows: list[Workflow],
-    errors: list[str],
-) -> set[str]:
-    """Compare classifiers, the CI matrix and requires-python.
-
-    Returns:
-        The classified Python versions, for the literal check.
-    """
-    classifiers = {
+def classified_pythons(pyproject: dict) -> set[str]:
+    """Return the ``3.X`` versions named by the trove classifiers."""
+    return {
         match.group(1)
         for item in pyproject["project"]["classifiers"]
         if (match := re.fullmatch(r"Programming Language :: Python :: (3\.\d+)", item))
     }
-    if not classifiers:
-        errors.append(f"{rel(PYPROJECT)}: no 'Python :: 3.X' classifier found")
-        return classifiers
 
-    ci_text = "\n".join(
-        next((w.lines for w in workflows if w.path.name == "ci.yml"), [])
+
+def check_python(
+    pyproject: dict,
+    classifiers: set[str],
+    workflows: list[Workflow],
+    errors: list[str],
+) -> None:
+    """Compare the classifiers with the CI matrix and requires-python."""
+    ci = next((w for w in workflows if w.path.name == "ci.yml"), None)
+    matrix = next(
+        (
+            match
+            for line in (ci.lines if ci else [])
+            if (match := re.search(r"python-version:\s*\[([^\]]+)\]", line))
+        ),
+        None,
     )
-    matrix = re.search(r"python-version:\s*\[([^\]]+)\]", ci_text)
     if not matrix:
         errors.append(
             ".github/workflows/ci.yml: no 'python-version: [...]' matrix found"
@@ -206,7 +208,7 @@ def check_python(
     upper = re.search(r"<\s*(3)\.(\d+)", requires)
     if not lower or not upper:
         errors.append(f"python: cannot read requires-python {requires!r}")
-        return classifiers
+        return
     if lower.group(1) != min(classifiers, key=minor_of):
         errors.append(
             f"python: requires-python floor {lower.group(1)} != lowest classifier"
@@ -215,7 +217,6 @@ def check_python(
         errors.append(
             f"python: requires-python ceiling {requires!r} != highest classifier"
         )
-    return classifiers
 
 
 def check_python_literals(
@@ -322,9 +323,12 @@ def main() -> int:
     errors: list[str] = []
     check_uv(pyproject, workflows, errors)
     check_postgres(workflows, errors)
-    classifiers = check_python(pyproject, workflows, errors)
+    classifiers = classified_pythons(pyproject)
     if classifiers:
+        check_python(pyproject, classifiers, workflows, errors)
         check_python_literals(classifiers, workflows, errors)
+    else:
+        errors.append(f"{rel(PYPROJECT)}: no 'Python :: 3.X' classifier found")
     check_ranges(pyproject, errors)
     for error in errors:
         print(f"MISMATCH: {error}", file=sys.stderr)

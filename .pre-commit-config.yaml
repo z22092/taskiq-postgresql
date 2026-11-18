@@ -52,8 +52,15 @@ repos:
     rev: 01886c8a910c64595c47f186ca1ffc0b77fa5458 # frozen: v1.5.0
     hooks:
       - id: detect-secrets
-        # Hook revisions are commit SHAs, which the hex entropy plugin flags.
-        args: [--baseline, .secrets.baseline, --exclude-lines, "# frozen: v"]
+        # Hook revisions and the setup-uv checksums are hex digests, which the
+        # hex entropy plugin flags; check_pins already pins the checksums.
+        args:
+          - --baseline
+          - .secrets.baseline
+          - --exclude-lines
+          - "# frozen: v"
+          - --exclude-lines
+          - 'checksum: "[0-9a-f]{64}"'
 
   - repo: https://github.com/crate-ci/typos
     rev: 4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # frozen: v1.52.0
