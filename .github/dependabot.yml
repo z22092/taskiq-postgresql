@@ -30,6 +30,22 @@ updates:
     commit-message:
       prefix: "build(deps)"
 
+  # Hook revisions are SHA-pinned with a "# frozen: vX" comment.
+  - package-ecosystem: "pre-commit"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    cooldown:
+      default-days: 14
+    open-pull-requests-limit: 5
+    groups:
+      pre-commit-hooks:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci(deps)"
+
   # The only container image is the PostgreSQL one in docker-compose.yml;
   # the "docker" ecosystem reads Dockerfiles, not compose files.
   - package-ecosystem: "docker-compose"
