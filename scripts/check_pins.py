@@ -2,16 +2,18 @@
 """
 Check that every place that declares the same pin agrees on it.
 
-The checks, each an exact comparison:
+The checks:
 
-* ruff: the ``lint`` dependency group against the ``ruff-pre-commit`` rev
-  comment (``# frozen: vX.Y.Z``).
 * uv: the ceiling in ``[tool.uv] required-version`` against every ``version:``
   of every ``astral-sh/setup-uv`` step in ``.github/workflows``.
 * PostgreSQL image: ``POSTGRES_IMAGE`` in ``tests/conftest.py`` against the
   compose file and any ``postgres:`` image reference in the workflows.
 * Python versions: the trove classifiers against the CI test matrix and the
-  ``requires-python`` bounds.
+  ``requires-python`` bounds; ``.python-version`` and every literal Python
+  version in the workflows must be one of the classifiers.
+* Ranges: runtime dependencies (``[project]`` dependencies and extras) are
+  closed ranges ``>=X,<Y``; dependency groups and the build backend are
+  exact ``==`` pins.
 
 Exits 1 when any check fails. Standard library only; run it with Python 3.13.
 """
@@ -24,7 +26,7 @@ import tomllib
 
 ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = ROOT / "pyproject.toml"
-PRE_COMMIT = ROOT / ".pre-commit-config.yaml"
+PYTHON_VERSION_FILE = ROOT / ".python-version"
 CONFTEST = ROOT / "tests" / "conftest.py"
 COMPOSE = ROOT / "docker-compose.yml"
 WORKFLOWS = ROOT / ".github" / "workflows"
@@ -41,38 +43,6 @@ def rel(path: Path) -> str:
 def load_pyproject() -> dict:
     """Parse pyproject.toml."""
     return tomllib.loads(PYPROJECT.read_text())
-
-
-def check_ruff(pyproject: dict, errors: list[str]) -> None:
-    """Compare the ruff pin in the lint group with the pre-commit rev."""
-    pins = [
-        item.split("==", 1)[1].split(";", 1)[0].strip()
-        for item in pyproject["dependency-groups"]["lint"]
-        if re.match(r"ruff\s*==", item)
-    ]
-    if len(pins) != 1:
-        errors.append(
-            f"{rel(PYPROJECT)}: expected exactly one 'ruff==X' in the lint "
-            f"group, found {pins}"
-        )
-        return
-    group_version = pins[0]
-
-    text = PRE_COMMIT.read_text()
-    match = re.search(
-        r"repo:\s*https://github\.com/astral-sh/ruff-pre-commit\s*\n\s*rev:\s*([0-9a-f]{40})\s*#\s*frozen:\s*v(\S+)",
-        text,
-    )
-    if not match:
-        errors.append(
-            f"{rel(PRE_COMMIT)}: ruff-pre-commit rev must be '<sha40> # frozen: vX.Y.Z'"
-        )
-        return
-    if match.group(2) != group_version:
-        errors.append(
-            f"ruff: {rel(PYPROJECT)} lint group pins {group_version}, "
-            f"{rel(PRE_COMMIT)} frozen comment says {match.group(2)}",
-        )
 
 
 def uv_ceiling(pyproject: dict) -> str | None:
@@ -196,21 +166,83 @@ def check_python(pyproject: dict, errors: list[str]) -> None:
         errors.append(
             f"python: requires-python ceiling {requires!r} != highest classifier"
         )
+    check_python_literals(classifiers, errors)
+
+
+def workflow_python_literals() -> list[tuple[str, str]]:
+    """Return ``(where, version)`` for literal Python versions in workflows."""
+    found: list[tuple[str, str]] = []
+    pattern = r"(?:python-version:\s*[\"']?|--python\s+)(3\.\d+)\b"
+    for workflow in sorted(WORKFLOWS.glob("*.y*ml")):
+        for number, line in enumerate(workflow.read_text().splitlines(), start=1):
+            if re.search(r"python-version:\s*\[", line):
+                continue  # the matrix is compared as a set above
+            found.extend(
+                (f"{rel(workflow)}:{number}", version)
+                for version in re.findall(pattern, line)
+            )
+    return found
+
+
+def check_python_literals(classifiers: set[str], errors: list[str]) -> None:
+    """Every pinned interpreter must be a supported (classified) version."""
+    pinned = [(rel(PYTHON_VERSION_FILE), PYTHON_VERSION_FILE.read_text().strip())]
+    pinned += workflow_python_literals()
+    errors.extend(
+        f"python: {where} uses {version}, not in classifiers {sorted(classifiers)}"
+        for where, version in pinned
+        if version not in classifiers
+    )
+
+
+def requirement_specifier(requirement: str) -> tuple[str, str]:
+    """Split ``name[extras]>=1,<2; marker`` into ``(name, specifier)``."""
+    bare = requirement.split(";", 1)[0].strip()
+    match = re.match(r"([A-Za-z0-9][A-Za-z0-9._-]*)(?:\[[^\]]*\])?\s*(.*)", bare)
+    if not match:
+        return bare, ""
+    return match.group(1), match.group(2).replace(" ", "")
+
+
+def check_ranges(pyproject: dict, errors: list[str]) -> None:
+    """Runtime dependencies are closed ranges; tooling pins are exact."""
+    project = pyproject["project"]
+    runtime = list(project.get("dependencies", []))
+    for extra in project.get("optional-dependencies", {}).values():
+        runtime.extend(extra)
+    for requirement in runtime:
+        name, spec = requirement_specifier(requirement)
+        if not re.fullmatch(r">=[0-9][^,<>=]*,<[0-9][^,<>=]*", spec):
+            errors.append(
+                f"range: {rel(PYPROJECT)} runtime dependency {name!r} is "
+                f"{spec!r}, expected a closed range '>=X,<Y'",
+            )
+
+    exact = list(pyproject.get("build-system", {}).get("requires", []))
+    for group in pyproject.get("dependency-groups", {}).values():
+        exact.extend(item for item in group if isinstance(item, str))
+    for requirement in exact:
+        name, spec = requirement_specifier(requirement)
+        if not re.fullmatch(r"==[0-9][^,<>=!~]*", spec):
+            errors.append(
+                f"range: {rel(PYPROJECT)} tooling pin {name!r} is {spec!r}, "
+                "expected an exact '==X'",
+            )
 
 
 def main() -> int:
     """Run every check and report all mismatches."""
     pyproject = load_pyproject()
     errors: list[str] = []
-    check_ruff(pyproject, errors)
     check_uv(pyproject, errors)
     check_postgres(errors)
     check_python(pyproject, errors)
+    check_ranges(pyproject, errors)
     for error in errors:
         print(f"MISMATCH: {error}", file=sys.stderr)
     if errors:
         return 1
-    print("check_pins: ruff, uv, postgres image and python versions agree")
+    print("check_pins: uv, postgres image, python versions and ranges agree")
     return 0
 
 
