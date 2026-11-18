@@ -65,18 +65,27 @@ rye add taskiq-postgresql[asyncpg]
 
 ### Basic Task Processing
 
+Start a local PostgreSQL with the repository's `docker-compose.yml` (bound to
+`127.0.0.1:5432`, trust authentication, development only):
+
+```bash
+docker compose up -d --wait
+```
+
+The DSN below connects to it without a password.
+
 ```python
 import asyncio
 from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
 
 # Configure the result backend
 result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/postgres",
 )
 
 # Configure the broker with result backend
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/postgres",
 ).with_result_backend(result_backend)
 
 
@@ -113,11 +122,11 @@ from taskiq_postgresql import PostgresqlBroker, PostgresqlSchedulerSource
 from taskiq import TaskiqScheduler
 
 # Initialize broker
-broker = PostgresqlBroker(dsn="postgresql://postgres@localhost:5432/taskiq_db")
+broker = PostgresqlBroker(dsn="postgresql://postgres@localhost:5432/postgres")
 
 # Initialize scheduler source
 scheduler_source = PostgresqlSchedulerSource(
-    dsn="postgresql://postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/postgres",
     table_name="taskiq_schedules",
     driver="asyncpg",
 )
@@ -206,7 +215,7 @@ async def setup_schedule():
 from taskiq.serializers import JSONSerializer
 
 result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/postgres",
     serializer=JSONSerializer(),
 )
 ```
@@ -215,13 +224,13 @@ result_backend = PostgresqlResultBackend(
 
 ```python
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/postgres",
     queue_name="my_custom_queue",
     field_for_task_id="Text",  # Use TEXT instead of UUID
 )
 
 result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/postgres",
     table_name="my_custom_results",
     field_for_task_id="VarChar",  # Use VARCHAR instead of UUID
 )
@@ -232,7 +241,7 @@ result_backend = PostgresqlResultBackend(
 ```python
 # AsyncPG
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/postgres",
     driver="asyncpg",
     min_size=5,
     max_size=20,
@@ -241,7 +250,7 @@ broker = PostgresqlBroker(
 
 # Psycopg3
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres@localhost:5432/taskiq_db",
+    dsn="postgresql://postgres@localhost:5432/postgres",
     driver="psycopg",
     min_size=5,
     max_size=20,
@@ -257,10 +266,20 @@ import os
 # From environment
 dsn = os.environ["POSTGRESQL_URL"]
 
-# With SSL (the URL must not already carry a query string)
-dsn = os.environ["POSTGRESQL_URL"] + "?sslmode=require"
-
 broker = PostgresqlBroker(dsn=dsn)
+```
+
+### TLS
+
+Verify the server certificate and host name with `sslmode=verify-full` and
+point `sslrootcert` at the CA bundle. Keep credentials out of the DSN and supply
+them from the environment or a secret store.
+
+```python
+broker = PostgresqlBroker(
+    dsn="postgresql://<user>@<host>:5432/<database>"
+    "?sslmode=verify-full&sslrootcert=<path-to-ca.pem>",
+)
 ```
 
 ## Database Schema
@@ -338,58 +357,17 @@ pip install taskiq-postgresql[asyncpg]
 
 ## Requirements
 
-- **Python**: 3.10 to 3.14
-- **TaskIQ**: 0.11.7 to 0.12.6
+- **Python, TaskIQ and driver versions**: supported ranges are declared in
+  [`pyproject.toml`](pyproject.toml) (`requires-python`, `dependencies` and the
+  driver extras) and shown on [PyPI](https://pypi.org/project/taskiq-postgresql/).
 - **PostgreSQL**: 10+
 
-### Driver Dependencies
-
-| Driver | Version | Extra |
-|--------|---------|-------|
-| AsyncPG | 0.30.0 to 0.32.0 | `[asyncpg]` |
-| Psycopg3 | 3.2.9 to 3.3.8 | `[psycopg]` |
-| PSQLPy | 0.11.3 to 0.13.1 | `[psqlpy]` |
+Each driver is an optional extra: `[asyncpg]`, `[psycopg]` or `[psqlpy]`.
 
 ## Development
 
-This project uses modern Python development tools:
-
-- **[UV](https://github.com/astral-sh/uv)**: Fast Python package installer and resolver
-- **[Ruff](https://github.com/astral-sh/ruff)**: Extremely fast Python linter and formatter
-- **[Pytest](https://pytest.org/)**: Testing framework
-
-### Setup Development Environment
-
-```bash
-# Clone the repository
-git clone https://github.com/z22092/taskiq-postgresql.git
-cd taskiq-postgresql
-
-# Install everything (all driver extras and all dependency groups)
-uv sync --locked --all-extras --all-groups
-
-# Run tests (starts a throwaway PostgreSQL through testcontainers)
-uv run pytest
-
-# Run tests against an existing database instead
-POSTGRESQL_URL="$YOUR_DATABASE_URL" uv run pytest
-
-# Format and lint
-uv run ruff format
-uv run ruff check
-```
-
-The test suite needs a container engine (Docker or Podman). With rootless
-Podman, point testcontainers at the Podman socket and disable Ryuk:
-
-```bash
-export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
-export TESTCONTAINERS_RYUK_DISABLED=true
-```
-
-`docker-compose.yml` starts a local PostgreSQL for manual work. Its
-credentials are the ones set in that file (user, database and
-password); build `POSTGRESQL_URL` from them.
+Setup, tests, linting, the dependency policy and the release process are in
+[CONTRIBUTING.md](.github/CONTRIBUTING.md).
 
 ## Contributing
 
