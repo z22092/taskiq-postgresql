@@ -115,11 +115,13 @@ CI runs `test (py3.10, lowest-direct)` against the floor of every direct
 dependency:
 
 ```bash
-uv run --python 3.10 --resolution lowest-direct --all-extras --group dev pytest
+UV_PROJECT_ENVIRONMENT="$(mktemp -d)" uv run --python 3.10 --resolution lowest-direct --all-extras --group dev pytest
 ```
 
-This command rewrites `uv.lock` on disk. Restore it afterwards so the lock
-change does not leak into your commit:
+The throwaway `UV_PROJECT_ENVIRONMENT` keeps uv from recreating the project
+`.venv` on Python 3.10, which cannot hold `pre-commit` (it needs Python 3.11
+or newer) and would break the git hook. The command also rewrites `uv.lock` on
+disk. Restore it afterwards so the lock change does not leak into your commit:
 
 ```bash
 git restore uv.lock
@@ -378,7 +380,7 @@ import asyncio
 import uuid
 
 import pytest
-from taskiq import BrokerMessage
+from taskiq import AckableMessage, BrokerMessage
 
 from taskiq_postgresql import PostgresqlBroker
 
@@ -396,7 +398,7 @@ async def test_when_message_is_kicked__then_listener_receives_it(
         labels={},
     )
 
-    async def first_message() -> object:
+    async def first_message() -> AckableMessage | None:
         async for received in broker.listen():
             return received
         return None
@@ -406,8 +408,12 @@ async def test_when_message_is_kicked__then_listener_receives_it(
     await broker.kick(message)
 
     received = await asyncio.wait_for(listener, timeout=5)
+    assert received is not None
     assert received.data == message.message
 ```
+
+This mirrors `test_when_broker_deliver_message__then_worker_receive_message`
+in `tests/test_broker.py`, which is the maintained version.
 
 ## Release Process
 

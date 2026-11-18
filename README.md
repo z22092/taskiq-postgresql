@@ -72,10 +72,7 @@ Start a local PostgreSQL with the repository's `docker-compose.yml` (bound to
 docker compose up -d --wait
 ```
 
-The DSN below connects to it without a password. If you ran an earlier compose
-file (password authentication), run `docker compose down -v` once first:
-`POSTGRES_HOST_AUTH_METHOD` only applies when the data volume is initialized,
-and otherwise the DSN fails with `fe_sendauth: no password supplied`.
+The DSN below connects to it without a password:
 
 ```python
 import asyncio
