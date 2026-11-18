@@ -1,23 +1,28 @@
+# Local PostgreSQL for manual development. The test suite starts its own
+# container through testcontainers and does not need this file.
+#
+#   docker compose up -d --wait
+#   export POSTGRESQL_URL=postgresql://postgres:postgres@localhost:5432/postgres
 services:
   postgres:
-    image: postgres:latest
+    image: postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317
     restart: always
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: taskiqasyncpg
+      POSTGRES_DB: postgres
 
     volumes:
-      - .:/postgres_data:/var/lib/postgresql/data/
+      - postgres_data:/var/lib/postgresql/data
 
     ports:
       - 5432:5432
 
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready", "-d", "taskiqasyncpg"]
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
       interval: 3s
-      timeout: 1s
-      retries: 5
+      timeout: 3s
+      retries: 10
 
     networks:
       - default
