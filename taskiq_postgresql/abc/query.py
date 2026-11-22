@@ -1,19 +1,12 @@
-from abc import ABC, abstractmethod
 from typing import Any, Literal, Optional, Sequence
 
 
-class QueryBase(ABC):
+class QueryBase:
     """Base class for all queries."""
 
     def __init__(self, table_name: str) -> None:
         """Initialize the query."""
         self.table_name = table_name
-
-    # Each builder takes different arguments, so the base declares a gradual
-    # signature that every override is compatible with.
-    @abstractmethod
-    def make_query(self, *args: Any, **kwargs: Any) -> str:
-        """Return the query as a string."""
 
 
 class Column(QueryBase):
@@ -111,16 +104,14 @@ class InsertQuery(QueryBase):
         )
 
 
-class InsertOrUpdateQuery(InsertQuery):
+class InsertOrUpdateQuery(QueryBase):
     """Query to insert or update a row into a table."""
 
     def __init__(self, table_name: str) -> None:
         """Initialize the query."""
         super().__init__(table_name)
 
-    # The upsert needs its conflict target, so it cannot keep InsertQuery's
-    # signature; it stays a subclass so isinstance checks keep passing.
-    def make_query(  # ty: ignore[invalid-method-override]
+    def make_query(
         self,
         columns: Sequence[Column],
         returning: Optional[Sequence[Column]],
@@ -129,7 +120,7 @@ class InsertOrUpdateQuery(InsertQuery):
         on_conflict_update_columns: Optional[Sequence[Column]] = None,
     ) -> str:
         """Return the query as a string."""
-        insert_query = super().make_query(columns)
+        insert_query = InsertQuery(self.table_name).make_query(columns)
         returning_query = (
             f" RETURNING {', '.join(column.name for column in returning)}"
             if returning is not None
