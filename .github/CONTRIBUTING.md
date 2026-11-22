@@ -225,8 +225,10 @@ async def process_task(
 - `tests/conftest.py` pins one Postgres image per supported major
   (`POSTGRES_IMAGES`; the newest key is the default), and `docker-compose.yml`
   declares the same set of images (the 17 one under the `pg17` profile).
-  `scripts/check_pins.py` fails when the sets differ or when a workflow names an
-  image or a literal major conftest does not declare. A Dependabot docker PR
+  `scripts/check_pins.py` fails when the sets differ, when the compose
+  `postgres` service does not run the newest major, or when a workflow names an
+  image or a literal major (quoted or not) conftest does not declare. A
+  Dependabot docker PR
   needs the matching manual bump in `tests/conftest.py`; Dependabot ignores
   Postgres major bumps, which are added by hand in both files.
 

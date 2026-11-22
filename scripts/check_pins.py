@@ -11,11 +11,12 @@ The checks:
 * PostgreSQL images: ``POSTGRES_IMAGES`` in ``tests/conftest.py`` (read with
   ``ast``) maps each supported major to one
   ``postgres:<major>.<minor>@sha256:<digest>`` image; the set of images in the
-  compose file equals that set; every ``postgres:`` image reference in the
-  workflows is one of them; and every literal major in the workflows (scalar
-  or list ``postgres:`` matrix values, ``TEST_POSTGRES_MAJOR`` values) is a key
-  of that map. Empty values and ``${{ }}`` expressions are skipped: CI keeps
-  the default major with an empty axis value.
+  compose file equals that set and its ``postgres`` service runs the newest
+  major; every ``postgres:`` image reference in the workflows is one of them;
+  and every literal major in the workflows (scalar ``postgres:`` matrix values,
+  quoted or not, list values, ``TEST_POSTGRES_MAJOR`` values) is a key of that
+  map. Empty values and ``${{ }}`` expressions are skipped: CI keeps the
+  default major with an empty axis value.
 * Python versions: the trove classifiers against the CI test matrix and the
   ``requires-python`` bounds; ``.python-version`` and every other literal
   Python version in the workflows must be one of the classifiers.
@@ -46,7 +47,12 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 IMAGE_RE = r"postgres:[\w.\-]+@sha256:[0-9a-f]{64}"
 LOOSE_IMAGE_RE = r"postgres:[\w.\-]+(?:@sha256:[0-9a-f]+)?"
 MAJOR_VALUE_RE = r"TEST_POSTGRES_MAJOR\s*[:=]\s*[\"']?([^\"'\s#$][^\"'\s#]*)"
-MAJOR_SCALAR_RE = r"(?<![\w-])postgres:\s*[\"']([^\"'$]+)[\"']\s*(?:#.*)?$"
+MAJOR_SCALAR_RE = (
+    r"(?<![\w-])postgres:\s+[\"']?([^\"'\s#$\[][^\"'\s#]*)[\"']?\s*(?:#.*)?$"
+)
+COMPOSE_DEFAULT_IMAGE_RE = (
+    r"^  postgres:[ \t]*\n(?:(?:    .*)?\n)*?    image:[ \t]*(\S+)"
+)
 MAJOR_MATRIX_RE = r"(?<![\w-])postgres:\s*\[([^\]]*)\]"
 VERSION_RE = r"[0-9][\w.+!-]*"
 PYTHON_LITERAL_RE = (
@@ -192,11 +198,19 @@ def check_postgres(workflows: list[Workflow], errors: list[str]) -> None:
     images = postgres_images(errors)
     pinned = set(images.values())
 
-    composed = set(re.findall(rf"image:\s*({LOOSE_IMAGE_RE})", COMPOSE.read_text()))
+    compose = COMPOSE.read_text()
+    composed = set(re.findall(rf"image:\s*({LOOSE_IMAGE_RE})", compose))
     if composed != pinned:
         errors.append(
             f"postgres image: {rel(COMPOSE)} images {sorted(composed)} != "
             f"{rel(CONFTEST)} images {sorted(pinned)}"
+        )
+    newest = max((major for major in images if major.isdigit()), key=int, default=None)
+    default_service = re.search(COMPOSE_DEFAULT_IMAGE_RE, compose, re.MULTILINE)
+    if newest and (default_service is None or default_service[1] != images[newest]):
+        errors.append(
+            f"postgres image: the 'postgres' service in {rel(COMPOSE)} must run "
+            f"{images[newest]!r}, the newest major in {rel(CONFTEST)}"
         )
 
     for workflow in workflows:
