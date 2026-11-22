@@ -40,17 +40,28 @@ jobs:
         run: uv run --no-sync pre-commit run --all-files --show-diff-on-failure
 
   test:
-    name: test (py${{ matrix.python-version }})
+    # The legs without a postgres value keep the names `test (py3.X)` that the
+    # main branch ruleset requires; renaming them blocks every PR.
+    name: test (py${{ matrix.python-version }}${{ matrix.postgres && format(', pg{0}', matrix.postgres) || '' }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # Ryuk, the testcontainers reaper, pulls an extra image from Docker Hub.
       # The runner VM is thrown away after the job, so nothing needs reaping.
       TESTCONTAINERS_RYUK_DISABLED: "true"
+      # Empty means the suite's default major (the newest one tests/conftest.py pins).
+      TEST_POSTGRES_MAJOR: ${{ matrix.postgres }}
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.10", "3.11", "3.12", "3.13", "3.14", "3.15"]
+        # "" = the newest major. The axis exists so the include below adds a
+        # job instead of extending the existing py3.13 one.
+        postgres: [""]
+        # One leg on the previous Postgres major.
+        include:
+          - python-version: "3.13"
+            postgres: "17"
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -75,7 +86,7 @@ jobs:
         run: uv run --no-sync pytest --cov=taskiq_postgresql --cov-report=xml --cov-report=term-missing
 
       - name: Keep the coverage report for the upload job
-        if: matrix.python-version == '3.13'
+        if: matrix.python-version == '3.13' && !matrix.postgres
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage-xml
@@ -131,8 +142,7 @@ jobs:
         with:
           name: coverage-xml
 
-      # The action's own CLI check fetches a GPG key at run time and, with
-      # fail_ci_if_error: false, runs the binary even when the check fails.
+      # The action's own CLI check trusts a GPG key it fetches at run time.
       # This job is the only one with an OIDC token, so the CLI is fetched
       # here and must match a pinned sha256 (same value on cli.codecov.io
       # and on the GitHub release of codecov-cli v11.3.2).
@@ -153,5 +163,4 @@ jobs:
           files: ./coverage.xml
           disable_search: true
           plugins: noop
-          # Flip to true once the first upload shows up on codecov.io.
-          fail_ci_if_error: false
+          fail_ci_if_error: true
