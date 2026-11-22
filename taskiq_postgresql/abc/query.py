@@ -9,8 +9,10 @@ class QueryBase(ABC):
         """Initialize the query."""
         self.table_name = table_name
 
+    # Each builder takes different arguments, so the base declares a gradual
+    # signature that every override is compatible with.
     @abstractmethod
-    def make_query(self, *values: Any) -> str:
+    def make_query(self, *args: Any, **kwargs: Any) -> str:
         """Return the query as a string."""
 
 
@@ -116,10 +118,12 @@ class InsertOrUpdateQuery(InsertQuery):
         """Initialize the query."""
         super().__init__(table_name)
 
-    def make_query(
+    # The upsert needs its conflict target, so it cannot keep InsertQuery's
+    # signature; it stays a subclass so isinstance checks keep passing.
+    def make_query(  # ty: ignore[invalid-method-override]
         self,
         columns: Sequence[Column],
-        returning: Sequence[Column],
+        returning: Optional[Sequence[Column]],
         on_conflict_columns: Sequence[Column],
         on_conflict_action: Literal["UPDATE", "NOTHING"] = "UPDATE",
         on_conflict_update_columns: Optional[Sequence[Column]] = None,
@@ -131,6 +135,7 @@ class InsertOrUpdateQuery(InsertQuery):
             if returning is not None
             else ""
         )
+        conflict_query = ", ".join(column.name for column in on_conflict_columns)
         if on_conflict_action == "UPDATE":
             if on_conflict_update_columns is None:
                 raise ValueError(
@@ -142,14 +147,11 @@ class InsertOrUpdateQuery(InsertQuery):
                 f"{column.name} = EXCLUDED.{column.name}"
                 for column in on_conflict_update_columns
             )
-            conflict_query = ", ".join(column.name for column in on_conflict_columns)
             update_query = f"ON CONFLICT ({conflict_query}) DO UPDATE SET {set_query}"
             return f"{insert_query} {update_query} {returning_query}"
 
-        return (
-            f"{insert_query} ON CONFLICT ({', '.join(on_conflict_columns)}) DO NOTHING"
-            + returning_query
-        )
+        nothing_query = f"ON CONFLICT ({conflict_query}) DO NOTHING"
+        return f"{insert_query} {nothing_query}{returning_query}"
 
 
 class DeleteQuery(QueryBase):
