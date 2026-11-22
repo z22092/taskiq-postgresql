@@ -33,18 +33,19 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 
 ## Commands
 
-Run `make sync` once, then use the targets. Each wraps the command CI runs.
+Run `make sync` once, then use the targets. Each wraps the command its CI job
+runs; `make help` lists them, and the `Makefile` holds the exact commands.
 
-| Target | Command | CI job |
+| Target | Purpose | CI job |
 |---|---|---|
-| `make sync` | `uv sync --locked --all-extras --all-groups` | - |
-| `make lint` | `uv run --no-sync pre-commit run --all-files --show-diff-on-failure` | `lint` |
-| `make typecheck` | `uv run --no-sync ty check` | part of `lint` |
-| `make test` | `uv run --no-sync pytest --cov=taskiq_postgresql --cov-report=term-missing` | `test` |
-| `make test-lowest` | Python 3.10, `--resolution lowest-direct`, throwaway env, `uv.lock` put back | `test-lowest` |
-| `make build` | `uv build` | CD `build` |
-| `make audit` | `uv export` with hashes, then `pip-audit --strict --require-hashes` (network) | `pip-audit` |
-| `make pins` | `uv run --no-sync python scripts/check_pins.py` | part of `lint` |
+| `make sync` | Install the project, the three driver extras and every dependency group from `uv.lock` | - |
+| `make lint` | Run every pre-commit hook on every file | `lint` |
+| `make typecheck` | Type-check `taskiq_postgresql/` with `ty` | part of `lint` |
+| `make test` | Run the full suite with the coverage gate | `test` |
+| `make test-lowest` | Run the suite on Python 3.10 with the lowest version of every direct dependency, in a throwaway environment; `uv.lock` is put back however the run ends | `test-lowest` |
+| `make build` | Build the sdist and wheel into `dist/` | CD `build` |
+| `make audit` | Audit every locked dependency with `pip-audit`, hashes required (needs network) | `pip-audit` |
+| `make pins` | Check that pins declared in more than one place agree | part of `lint` |
 
 Narrower runs while iterating:
 
@@ -65,9 +66,11 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   digest. Nothing else is needed but a container engine.
 - `POSTGRESQL_URL` points the suite at a server you already have instead. The
   DSN comes from your environment, never from the repository.
-- `TEST_POSTGRES_MAJOR` picks the PostgreSQL major the container runs (the
+- `TEST_POSTGRES_MAJOR` picks the PostgreSQL major the container runs. The
   supported majors are the keys of the image map in `tests/conftest.py`;
-  unset or empty means the newest). `POSTGRESQL_URL` wins over it.
+  unset or empty means the newest of them, and any other value stops pytest
+  before the first test with one usage error that lists them (exit code 4).
+  `POSTGRESQL_URL` wins over it.
 - Docker works as is. With rootless Podman, export these in your shell (they
   are machine specific; never commit them):
 
@@ -108,8 +111,10 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
 - **Pins outside Python.** GitHub Actions are pinned by full commit SHA with a
   version comment; container images by digest; pre-commit hooks by SHA with a
   `# frozen: vX` comment.
-- **Commits** follow Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`,
-  `chore:`, `ci:`, `build:`), subject under 72 characters, body says why.
+- **Commits** follow Conventional Commits: `feat`, `fix`, `docs`, `test`,
+  `refactor`, `style`, `build`, `ci` or `chore`, an optional scope
+  (`fix(psycopg): ...`) and `!` for a breaking change (`feat!: ...`); subject
+  under 72 characters, body says why.
 - **CHANGELOG.md** (Keep a Changelog) gets an entry for every user-visible
   change.
 - **Tests prove changes.** A behaviour change comes with a test that fails
@@ -135,13 +140,13 @@ reproduce these locally.
 ## Releases
 
 A release is a GitHub Release with tag `vX.Y.Z` on `main`, created by the
-maintainer:
+maintainer. The version comes from the tag: there is no version bump commit,
+and neither `version` in `pyproject.toml` nor `uv.lock` changes for a release.
 
-1. A pull request moves the CHANGELOG entries under the new version. Keep
-   `version` in `pyproject.toml` in step with it; the build overwrites it
-   from the tag either way.
-2. Publishing the release runs `cd.yml`: the version is taken from the tag, the
-   sdist and wheel are built, attested and smoke-tested.
+1. A pull request moves the `[Unreleased]` entries of `CHANGELOG.md` under
+   the new version and updates the compare links at the bottom of the file.
+2. Publishing the release runs `cd.yml`: it sets the version from the tag,
+   builds and attests the sdist and wheel, and smoke-tests the wheel.
 3. The `publish-pypi` job waits for approval on the `pypi` environment, then
    publishes through PyPI trusted publishing (no stored token).
 

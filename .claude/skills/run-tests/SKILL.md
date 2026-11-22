@@ -5,52 +5,32 @@ description: Run the taskiq-postgresql test suite with Docker or Podman, pick th
 
 # Run the tests
 
-The integration tests need a real PostgreSQL; the fixture in
-`tests/conftest.py` starts one with testcontainers. Unit tests in
-`tests/unit/` need nothing.
+The commands, the test layout and the PostgreSQL options are described once,
+in `AGENTS.md`; this skill is the order to apply them in.
 
 ## 1. Environment
 
-```bash
-make sync    # once: project, all three driver extras, all dependency groups
-```
-
-Container engine:
-
-- Docker: nothing to set.
-- Rootless Podman: export these in the shell, never in a committed file.
-
-  ```bash
-  export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock
-  export TESTCONTAINERS_RYUK_DISABLED=true
-  ```
-
-If a test fails with a connection error before any assertion, check the
-engine first (`docker info` or `podman info`).
+1. `make sync`, once.
+2. Container engine: Docker needs nothing. For rootless Podman, export the
+   two variables listed under "PostgreSQL for the tests" in `AGENTS.md`, in
+   the shell only.
+3. If a test fails with a connection error before any assertion, check the
+   engine first (`docker info` or `podman info`).
 
 ## 2. Pick what to run
 
-| Goal | Command |
-|---|---|
-| Everything, with the coverage gate, as CI | `make test` |
-| Fast loop, no database | `uv run --no-sync pytest tests/unit` |
-| One file | `uv run --no-sync pytest tests/test_broker.py` |
-| One driver (the name is in the test id) | `uv run --no-sync pytest -k asyncpg` |
-| Lowest direct dependencies on Python 3.10, as CI | `make test-lowest` |
-
-The coverage gate (`fail_under` in `pyproject.toml`) applies to any run with
-`--cov`, so add `--cov` only to the full suite.
+- As CI does: a target from `make help` (`make test`, `make test-lowest`).
+- While iterating: a narrower pytest run from the "Commands" section of
+  `AGENTS.md` (unit tests only, one file, one driver). Leave `--cov` off
+  those runs: the coverage gate applies to any run with `--cov`.
 
 ## 3. Pick the PostgreSQL
 
-- Default: the newest major in the image map of `tests/conftest.py`.
-- Another supported major: `TEST_POSTGRES_MAJOR=<major> make test`. An
-  unsupported value stops pytest with a usage error listing the supported
-  majors.
-- A server you already run: `POSTGRESQL_URL=<dsn> make test`. It wins over
-  `TEST_POSTGRES_MAJOR`. Take the DSN from your environment; never write one
-  with a password into a file. With a DSN that carries no password, the
-  `wrong_password` case of the connection-failure tests skips itself.
+Follow "PostgreSQL for the tests" in `AGENTS.md`: the default container, a
+major chosen with `TEST_POSTGRES_MAJOR=<major>`, or your own server through
+`POSTGRESQL_URL` (taken from your environment, never written into a file).
+With a DSN that carries no password, the `wrong_password` case of the
+connection-failure tests skips itself.
 
 ## 4. Read the result
 

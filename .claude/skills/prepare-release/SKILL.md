@@ -20,19 +20,19 @@ it publish. This skill prepares everything before that and stops.
    Keep a Changelog sections (Added, Changed, Deprecated, Removed, Fixed,
    Security), mark breaking changes with **BREAKING:**, and update the
    compare links at the bottom of the file.
-4. **Version.** Set `version` in `pyproject.toml` to `X.Y.Z`, then run
-   `uv lock` so the project entry in `uv.lock` matches. CD sets the version
-   from the tag anyway; this keeps a source checkout honest.
+4. **Version.** Leave `version` in `pyproject.toml` and `uv.lock` alone. The
+   version comes from the tag: `cd.yml` writes it into the build, and there
+   is no version bump commit (see "Releases" in `AGENTS.md`).
 5. **Verify locally.**
 
    ```bash
    make lint
    make test
-   make build      # dist/taskiq_postgresql-X.Y.Z-*.whl must appear
+   make build      # builds with the version in pyproject.toml, not X.Y.Z
    ```
 
-6. **Open the release pull request** (`chore: release X.Y.Z`) with the
-   CHANGELOG section as its description.
+6. **Open the release pull request** (`chore: release X.Y.Z`), which
+   changes only `CHANGELOG.md`, with the new section as its description.
 7. **Hand over.** Give the maintainer:
    - the tag to create, `vX.Y.Z`, on the merge commit on `main`;
    - the release notes (the CHANGELOG section);
