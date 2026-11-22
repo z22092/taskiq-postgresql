@@ -17,9 +17,36 @@ from taskiq_postgresql.abc.query import (
     InsertQuery,
     SelectQuery,
 )
+from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 
-class QueryDriver(ABC):
+class _ConnectionStringHolder:
+    """Holds the connection string and never hands out an empty one."""
+
+    _connection_string: str = ""
+
+    @property
+    def connection_string(self) -> str:
+        """
+        Return the connection string.
+
+        Raises:
+            DatabaseConnectionError: if there is none yet. An empty string
+                would make the driver connect to the local defaults instead.
+        """
+        if not self._connection_string:
+            raise DatabaseConnectionError(
+                "No connection string yet: a callable DSN is resolved by "
+                "startup(), so call startup() before using the component.",
+            )
+        return self._connection_string
+
+    @connection_string.setter
+    def connection_string(self, value: str) -> None:
+        self._connection_string = value
+
+
+class QueryDriver(_ConnectionStringHolder, ABC):
     """Base class for all PostgreSQL backends."""
 
     def __init__(
@@ -155,7 +182,7 @@ class QueryDriver(ABC):
         """Execute a query."""
 
 
-class ListenDriver(ABC):
+class ListenDriver(_ConnectionStringHolder, ABC):
     """Base class for all PostgreSQL broker drivers."""
 
     def __init__(

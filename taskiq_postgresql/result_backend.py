@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Any, Callable, Final, Literal, Optional, TypeVar, Union
+from typing import Any, Final, Literal, Optional, TypeVar, Union
 
 from taskiq import AsyncResultBackend, TaskiqResult
 from taskiq.abc.serializer import TaskiqSerializer
@@ -9,7 +9,13 @@ from taskiq.serializers.pickle import PickleSerializer
 from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.abc.query import Column, PrimaryKeyColumn
 from taskiq_postgresql.exceptions import ResultIsMissingError
-from taskiq_postgresql.utils import get_db_driver
+from taskiq_postgresql.utils import (
+    Dsn,
+    dsn_before_startup,
+    get_db_driver,
+    require_dsn,
+    resolve_dsn,
+)
 
 _ReturnType = TypeVar("_ReturnType")
 
@@ -32,13 +38,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
 
     def __init__(
         self,
-        dsn: Union[
-            str,
-            Callable[
-                [],
-                str,
-            ],
-        ] = "postgresql://postgres:postgres@localhost:5432/postgres",
+        dsn: Dsn,
         keep_results: bool = True,
         table_name: str = "taskiq_results",
         field_for_task_id: Literal["VarChar", "Text", "Uuid"] = "Uuid",
@@ -50,11 +50,14 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         """
         Construct new result backend.
 
-        :param dsn: connection string to PostgreSQL.
+        :param dsn: connection string to PostgreSQL, or callable returning one.
+            A callable is resolved once, by startup().
         :param keep_results: flag to not remove results from Redis after reading.
         :param connect_kwargs: additional arguments for nats `ConnectionPool` class.
+        :raises TypeError: if ``dsn`` is ``None``, empty or blank.
         """
-        self._dsn: Final = dsn
+        dsn = require_dsn(dsn, type(self).__name__)
+        self._dsn: Final[Dsn] = dsn
         self.keep_results: Final = keep_results
         self.table_name: Final = table_name
         self.field_for_task_id: Final = field_for_task_id
@@ -69,7 +72,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         )
 
         self.driver = get_db_driver(driver)(
-            dsn,
+            dsn_before_startup(dsn),
             table_name,
             columns=[
                 self.columns.result,
@@ -83,13 +86,12 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
     @property
     def dsn(self) -> str:
         """
-        Get the DSN string.
+        Get the DSN string, calling the DSN callable if one was given.
 
-        Returns the DSN string or None if not set.
+        :raises TypeError: if the DSN callable returns ``None`` or an empty
+            string.
         """
-        if callable(self._dsn):
-            return self._dsn()
-        return self._dsn
+        return resolve_dsn(self._dsn, type(self).__name__)
 
     async def startup(self) -> None:
         """
@@ -97,7 +99,11 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
 
         Construct new connection pool
         and create new table for results if not exists.
+
+        :raises TypeError: if the DSN callable returns ``None`` or an empty
+            string.
         """
+        self.driver.connection_string = self.dsn
         await self.driver.on_startup()
 
     async def shutdown(self) -> None:

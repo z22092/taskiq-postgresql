@@ -4,13 +4,20 @@ from asyncio import Queue as AsyncQueue
 from asyncio import Task, get_running_loop
 from dataclasses import dataclass
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, TypeVar, Union
+from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, TypeVar
 
 from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessage
 
 from taskiq_postgresql.abc.driver import ListenDriver
 from taskiq_postgresql.abc.query import Column, CreatedAtColumn, PrimaryKeyColumn
-from taskiq_postgresql.utils import get_db_driver, get_db_listen_driver
+from taskiq_postgresql.utils import (
+    Dsn,
+    dsn_before_startup,
+    get_db_driver,
+    get_db_listen_driver,
+    require_dsn,
+    resolve_dsn,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -50,13 +57,7 @@ class PostgresqlBroker(AsyncBroker):
 
     def __init__(
         self,
-        dsn: Union[
-            str,
-            Callable[
-                [],
-                str,
-            ],
-        ] = "postgresql://postgres:postgres@localhost:5432/postgres",
+        dsn: Dsn,
         result_backend: AsyncResultBackend[_T] | None = None,
         task_id_generator: Callable[[], str] | None = None,
         field_for_task_id: Literal["VarChar", "Text", "Uuid"] = "Uuid",
@@ -72,8 +73,9 @@ class PostgresqlBroker(AsyncBroker):
         Construct a new broker.
 
         Args:
-            dsn (Union[str, Callable[[], str]], optional): \
-                connection string to PostgreSQL, or callable returning one.
+            dsn (Dsn): \
+                connection string to PostgreSQL, or callable returning one. \
+                A callable is resolved once, by startup().
             result_backend (AsyncResultBackend[_T] | None, optional): \
                 Custom result backend.
             task_id_generator (Callable[[], str] | None, optional): \
@@ -94,12 +96,16 @@ class PostgresqlBroker(AsyncBroker):
                 Additional arguments for asyncpg pool creation.
             run_migrations (bool, optional): \
                 Create the tables and indexes on startup. Defaults to False.
+
+        Raises:
+            TypeError: if ``dsn`` is ``None``, empty or blank.
         """
+        dsn = require_dsn(dsn, type(self).__name__)
         super().__init__(
             result_backend=result_backend,
             task_id_generator=task_id_generator,
         )
-        self._dsn: str | Callable[[], str] = dsn
+        self._dsn: Dsn = dsn
         self.channel_name: str = channel_name
         self.table_name: str = table_name
         self.connection_kwargs: dict[str, Any] = (
@@ -112,7 +118,7 @@ class PostgresqlBroker(AsyncBroker):
         self.columns = Table(task_id=Column(name="task_id", type_=field_for_task_id))
 
         self.driver = get_db_driver(driver)(
-            connection_string=self.dsn,
+            connection_string=dsn_before_startup(dsn),
             table_name=self.table_name,
             columns=[
                 self.columns.task_id,
@@ -127,7 +133,7 @@ class PostgresqlBroker(AsyncBroker):
             **self.connection_kwargs,
         )
         self.listen_driver: ListenDriver = get_db_listen_driver(driver)(
-            connection_string=self.dsn,
+            connection_string=dsn_before_startup(dsn),
             channel_name=self.channel_name,
             **self.connection_kwargs,
         )
@@ -135,16 +141,24 @@ class PostgresqlBroker(AsyncBroker):
     @property
     def dsn(self) -> str:
         """
-        Get the DSN string.
+        Get the DSN string, calling the DSN callable if one was given.
 
-        Returns the DSN string or None if not set.
+        Raises:
+            TypeError: if the DSN callable returns ``None`` or an empty string.
         """
-        if callable(self._dsn):
-            return self._dsn()
-        return self._dsn
+        return resolve_dsn(self._dsn, type(self).__name__)
 
     async def startup(self) -> None:
-        """Initialize the broker."""
+        """
+        Initialize the broker.
+
+        Raises:
+            TypeError: if the DSN callable returns ``None`` or an empty string.
+        """
+        # Resolved once, so both drivers connect to the same server.
+        dsn = self.dsn
+        self.driver.connection_string = dsn
+        self.listen_driver.connection_string = dsn
         await super().startup()
 
         await self.driver.on_startup()

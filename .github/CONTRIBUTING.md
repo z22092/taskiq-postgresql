@@ -209,8 +209,12 @@ async def process_task(
 
 - Runtime dependencies use closed ranges, `>=floor,<next-minor`, so a consumer's
   resolver is never blocked by an exact pin and a new upstream minor is never
-  picked up untested. Raising a ceiling is a deliberate change that needs the
-  suite green on the new version.
+  picked up untested. The exception is `typing-extensions` and `pydantic`,
+  whose projects promise no breaking changes within a major version: their
+  ceiling is the next major (`<5`, `<3`), because a next-minor cap would block
+  consumers from every compatible release. `NEXT_MAJOR` in
+  `scripts/check_pins.py` lists them. Raising a ceiling is a deliberate change
+  that needs the suite green on the new version.
 - Tooling, GitHub Actions (full commit SHA), container images (digest) and the
   lock are exact.
 - Supply-chain scanning has its own `audit` dependency group (pip-audit).
