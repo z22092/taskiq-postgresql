@@ -45,8 +45,9 @@ PYTHON_LITERAL_RE = (
 )
 
 # typing-extensions removes APIs only in major releases, so the next major is
-# the first release that can break it.
-NEXT_MAJOR = frozenset({"typing-extensions"})
+# the first release that can break it. pydantic follows semantic versioning
+# too: v2 minors keep the v2 API, and v3 is the breaking line.
+NEXT_MAJOR = frozenset({"pydantic", "typing-extensions"})
 
 
 def rel(path: Path) -> str:

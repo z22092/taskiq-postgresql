@@ -4,7 +4,6 @@ from uuid import uuid4
 
 from taskiq import ScheduledTask, ScheduleSource
 from taskiq.abc.broker import AsyncBroker
-from taskiq.compat import model_dump_json, model_validate_json
 
 from taskiq_postgresql.abc.query import (
     Column,
@@ -12,7 +11,7 @@ from taskiq_postgresql.abc.query import (
     PrimaryKeyColumn,
     UpdatedAtColumn,
 )
-from taskiq_postgresql.utils import get_db_driver
+from taskiq_postgresql.utils import get_db_driver, require_dsn
 
 __all__ = ["PostgresqlSchedulerSource"]
 
@@ -42,13 +41,16 @@ class PostgresqlSchedulerSource(ScheduleSource):
 
     def __init__(
         self,
+        # Defaults to None only so a missing DSN fails with an example of the
+        # expected value; it stays first so positional callers keep working.
         dsn: Union[
             str,
             Callable[
                 [],
                 str,
             ],
-        ] = "postgresql://postgres:postgres@localhost:5432/postgres",
+            None,
+        ] = None,
         table_name: str = "taskiq_schedulers",
         driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
         startup_schedule: Optional[dict[str, list[dict[str, Any]]]] = None,
@@ -64,8 +66,8 @@ class PostgresqlSchedulerSource(ScheduleSource):
         retrieval of scheduled tasks across application restarts.
 
         Args:
-            dsn: PostgreSQL connection string. Defaults to a local PostgreSQL instance.
-                Format: "postgres://user@host:port/database"
+            dsn: PostgreSQL connection string, or a callable returning one.
+                Required. Format: "postgres://user@host:port/database"
             table_name: Name of the table to store scheduled tasks. Will be created
                 automatically if it doesn't exist. Defaults to "taskiq_schedulers".
             driver: Database driver to use for connections. Currently only "asyncpg"
@@ -99,7 +101,11 @@ class PostgresqlSchedulerSource(ScheduleSource):
         Note:
             The database table and required indexes will be created automatically
             during the startup() method call.
+
+        Raises:
+            TypeError: if ``dsn`` is missing or ``None``.
         """
+        dsn = require_dsn(dsn, type(self).__name__)
         self._dsn: Final = dsn
         self.table_name: Final = table_name
         self.connect_kwargs: Final = connect_kwargs
@@ -183,7 +189,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
         )
 
         return [
-            model_validate_json(ScheduledTask, schedule_row["schedule"])
+            ScheduledTask.model_validate_json(schedule_row["schedule"])
             if isinstance(schedule_row["schedule"], str)
             else ScheduledTask(**schedule_row["schedule"])
             for schedule_row in schedule_rows
@@ -196,9 +202,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
             [
                 schedule.schedule_id,
                 schedule.task_name,
-                model_dump_json(
-                    schedule,
-                ),
+                schedule.model_dump_json(),
             ],
         )
 

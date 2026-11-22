@@ -10,7 +10,7 @@ from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessag
 
 from taskiq_postgresql.abc.driver import ListenDriver
 from taskiq_postgresql.abc.query import Column, CreatedAtColumn, PrimaryKeyColumn
-from taskiq_postgresql.utils import get_db_driver, get_db_listen_driver
+from taskiq_postgresql.utils import get_db_driver, get_db_listen_driver, require_dsn
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -50,13 +50,16 @@ class PostgresqlBroker(AsyncBroker):
 
     def __init__(
         self,
+        # Defaults to None only so a missing DSN fails with an example of the
+        # expected value; it stays first so positional callers keep working.
         dsn: Union[
             str,
             Callable[
                 [],
                 str,
             ],
-        ] = "postgresql://postgres:postgres@localhost:5432/postgres",
+            None,
+        ] = None,
         result_backend: AsyncResultBackend[_T] | None = None,
         task_id_generator: Callable[[], str] | None = None,
         field_for_task_id: Literal["VarChar", "Text", "Uuid"] = "Uuid",
@@ -72,8 +75,9 @@ class PostgresqlBroker(AsyncBroker):
         Construct a new broker.
 
         Args:
-            dsn (Union[str, Callable[[], str]], optional): \
-                connection string to PostgreSQL, or callable returning one.
+            dsn (Union[str, Callable[[], str]]): \
+                connection string to PostgreSQL, or callable returning one. \
+                Required.
             result_backend (AsyncResultBackend[_T] | None, optional): \
                 Custom result backend.
             task_id_generator (Callable[[], str] | None, optional): \
@@ -94,7 +98,11 @@ class PostgresqlBroker(AsyncBroker):
                 Additional arguments for asyncpg pool creation.
             run_migrations (bool, optional): \
                 Create the tables and indexes on startup. Defaults to False.
+
+        Raises:
+            TypeError: if ``dsn`` is missing or ``None``.
         """
+        dsn = require_dsn(dsn, type(self).__name__)
         super().__init__(
             result_backend=result_backend,
             task_id_generator=task_id_generator,

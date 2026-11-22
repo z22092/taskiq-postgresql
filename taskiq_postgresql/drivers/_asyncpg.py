@@ -7,22 +7,15 @@ from uuid import UUID
 
 from asyncpg import Connection, Pool, connect, create_pool
 from asyncpg.transaction import Transaction
-from taskiq.compat import IS_PYDANTIC2
+from pydantic_core import to_json
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
-if IS_PYDANTIC2:
-    from pydantic_core import to_json
 
-    def dumps(value: dict) -> str:
-        return to_json(value).decode()
-else:
-    from json import dumps as to_json
-
-    def dumps(value: dict) -> str:
-        return to_json(value)
+def dumps(value: dict) -> str:
+    return to_json(value).decode()
 
 
 class AsyncpgDriver(QueryDriver):

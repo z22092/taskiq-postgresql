@@ -9,23 +9,16 @@ from uuid import UUID
 from psycopg import AsyncConnection, AsyncCursor, AsyncRawCursor, Notify
 from psycopg.rows import DictRow, TupleRow, dict_row
 from psycopg_pool import AsyncConnectionPool
-from taskiq.compat import IS_PYDANTIC2
+from pydantic_core import to_json
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
-if IS_PYDANTIC2:
-    from pydantic_core import to_json
 
-    def dumps(value: dict) -> str:
-        return to_json(value).decode()
-else:
-    from json import dumps as to_json
-
-    def dumps(value: dict) -> str:
-        return to_json(value)
+def dumps(value: dict) -> str:
+    return to_json(value).decode()
 
 
 logger = logging.getLogger(__name__)
