@@ -241,23 +241,11 @@ class PostgresqlBroker(AsyncBroker):
         while True:
             try:
                 async for message_id in self.listen_driver:
-                    # Normalize payload to integer ID
-                    # (psycopg may yield string payloads).
-                    try:
-                        normalized_id = int(message_id)
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            "Invalid NOTIFY payload %r on channel %s",
-                            message_id,
-                            self.channel_name,
-                        )
-                        continue
-
                     # Atomically claim the message row. If None is returned, another
                     # worker has already claimed it.
                     row = await self.driver.delete_returning(
                         self.columns.primary_key,
-                        normalized_id,
+                        message_id,
                         [self.columns.message],
                     )
 
@@ -274,7 +262,7 @@ class PostgresqlBroker(AsyncBroker):
                         )
                         continue
 
-                    async def ack(*, _message_id: int = normalized_id) -> None:
+                    async def ack(*, _message_id: int = message_id) -> None:
                         # No-op: the row was already deleted when claimed.
                         return None
 

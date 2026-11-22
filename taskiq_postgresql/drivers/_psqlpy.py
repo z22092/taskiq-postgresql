@@ -15,6 +15,37 @@ from taskiq_postgresql.abc.query import Column
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 
+def encode_psqlpy_params(
+    columns: Sequence[Column],
+    values: Optional[Sequence[Any]],
+) -> list[Any]:
+    """
+    Shape bind parameters for psqlpy.
+
+    A value bound to a ``JSONB`` column is wrapped in psqlpy's ``JSONB`` (JSON
+    text is parsed first) and a value bound to a ``UUID`` column becomes a
+    ``uuid.UUID``; every other value is passed through unchanged.
+
+    Raises:
+        ValueError: if ``columns`` and ``values`` differ in length.
+    """
+    if values is None:
+        return []
+
+    new_values = [*values]
+
+    for index, (column, value) in enumerate(zip(columns, values, strict=True)):
+        if column.type.upper() == "JSONB":
+            if isinstance(value, str):
+                value = json.loads(value)  # noqa: PLW2901
+            new_values[index] = JSONB(value)
+
+        if column.type.upper() == "UUID":
+            new_values[index] = UUID(value)
+
+    return new_values
+
+
 class PsqlpyDriver(QueryDriver):
     """Asyncpg backend."""
 
@@ -42,28 +73,6 @@ class PsqlpyDriver(QueryDriver):
             run_migrations,
             **connection_kwargs,
         )
-
-    def __parser_query(
-        self,
-        columns: Sequence[Column],
-        values: Optional[Sequence[Any]],
-    ) -> list[Any]:
-        """Parser query."""
-        if values is None:
-            return []
-
-        new_values = [*values]
-
-        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
-            if column.type.upper() == "JSONB":
-                if isinstance(value, str):
-                    value = json.loads(value)  # noqa: PLW2901
-                new_values[index] = JSONB(value)
-
-            if column.type.upper() == "UUID":
-                new_values[index] = UUID(value)
-
-        return new_values
 
     @asynccontextmanager
     async def connection(self) -> AsyncGenerator[Connection, None]:
@@ -121,12 +130,12 @@ class PsqlpyDriver(QueryDriver):
             if returning:
                 return await connection.fetch_val(
                     self.insert_query.make_query(columns, returning),
-                    self.__parser_query(columns, values),
+                    encode_psqlpy_params(columns, values),
                 )
 
             await connection.execute(
                 self.insert_query.make_query(columns, returning),
-                self.__parser_query(columns, values),
+                encode_psqlpy_params(columns, values),
             )
 
             return None
@@ -149,7 +158,7 @@ class PsqlpyDriver(QueryDriver):
                         on_conflict_columns,
                         on_conflict_update_columns=on_conflict_update_columns,
                     ),
-                    self.__parser_query(columns, values),
+                    encode_psqlpy_params(columns, values),
                 )
 
             await connection.execute(
@@ -159,7 +168,7 @@ class PsqlpyDriver(QueryDriver):
                     on_conflict_columns,
                     on_conflict_update_columns=on_conflict_update_columns,
                 ),
-                self.__parser_query(columns, values),
+                encode_psqlpy_params(columns, values),
             )
 
             return None
@@ -169,7 +178,7 @@ class PsqlpyDriver(QueryDriver):
         async with self, self.connection() as connection:
             results = await connection.execute(
                 self.delete_query.make_query(column),
-                self.__parser_query([column], [value]),
+                encode_psqlpy_params([column], [value]),
             )
             return results.result(as_tuple=True)
 
@@ -183,7 +192,7 @@ class PsqlpyDriver(QueryDriver):
         async with self, self.connection() as connection:
             results = await connection.fetch(
                 self.delete_returning_query.make_query(where_column, returning),
-                self.__parser_query([where_column], [value]),
+                encode_psqlpy_params([where_column], [value]),
             )
             rows = results.result()
             if not rows:
@@ -198,7 +207,7 @@ class PsqlpyDriver(QueryDriver):
         where_values: Optional[Sequence[Any]] = None,
     ) -> list[dict[str, Any]]:
         """Select a row from a table."""
-        parameters = self.__parser_query(where_columns or (), where_values)
+        parameters = encode_psqlpy_params(where_columns or (), where_values)
         async with self, self.connection() as connection:
             rows = await connection.execute(
                 querystring=self.select_query.make_query(columns, where_columns),
@@ -212,7 +221,7 @@ class PsqlpyDriver(QueryDriver):
         async with self, self.connection() as connection:
             results = await connection.fetch(
                 self.select_query.make_query([Column("1", "")], [self.primary_key]),
-                self.__parser_query([self.primary_key], [id]),
+                encode_psqlpy_params([self.primary_key], [id]),
             )
             v = results.result()
             return len(v) == 1

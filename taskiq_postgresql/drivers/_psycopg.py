@@ -1,19 +1,17 @@
 import logging
-from asyncio import Queue as AsyncQueue
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
 from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union, cast
-from uuid import UUID
 
-from psycopg import AsyncConnection, AsyncCursor, AsyncRawCursor, Notify
+from psycopg import AsyncConnection, AsyncCursor, AsyncRawCursor
 from psycopg.rows import DictRow, TupleRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString, Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
-from taskiq_postgresql.drivers._json import dumps
+from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 
@@ -59,37 +57,6 @@ class PsycopgDriver(QueryDriver):
             run_migrations,
             **connection_kwargs,
         )
-
-    def __parser_params(
-        self,
-        columns: Optional[Sequence[Column]],
-        values: Optional[Sequence[Any]],
-    ) -> Sequence[Any]:
-        """Parser query.
-
-        Args:
-            columns (Sequence[Column] | None): Columns to parse.
-            values (Sequence[Any] | None): Values to parse.
-
-        Returns:
-            Sequence[Any]: Parsed values.
-        """
-        if not values:
-            return []
-
-        if not columns:
-            return values
-
-        new_values = [*values]
-
-        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
-            if column.type.upper() == "JSONB" and isinstance(value, dict):
-                new_values[index] = dumps(value)
-
-            if column.type.upper() == "UUID" and isinstance(value, UUID):
-                new_values[index] = value.hex
-
-        return new_values
 
     @asynccontextmanager
     async def connection(self) -> AsyncGenerator[AsyncConnection[TupleRow], None]:
@@ -153,7 +120,7 @@ class PsycopgDriver(QueryDriver):
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
                 sql(self.insert_query.make_query(columns, returning)),
-                params=self.__parser_params(columns, values),
+                params=encode_params(columns, values),
             )
 
             if cursor.rownumber is not None:
@@ -181,7 +148,7 @@ class PsycopgDriver(QueryDriver):
                         on_conflict_update_columns=on_conflict_update_columns,
                     ),
                 ),
-                params=self.__parser_params(columns, values),
+                params=encode_params(columns, values),
             )
 
             if cursor.rownumber is not None:
@@ -195,7 +162,7 @@ class PsycopgDriver(QueryDriver):
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
                 sql(self.delete_query.make_query(column)),
-                params=self.__parser_params([column], [value]),
+                params=encode_params([column], [value]),
             )
 
             if cursor.rownumber is not None:
@@ -215,7 +182,7 @@ class PsycopgDriver(QueryDriver):
             cursor = connection.cursor(row_factory=dict_row)
             cursor = await cursor.execute(
                 sql(self.delete_returning_query.make_query(where_column, returning)),
-                params=self.__parser_params([where_column], [value]),
+                params=encode_params([where_column], [value]),
             )
             if cursor.rownumber is not None:
                 row = await cursor.fetchone()
@@ -235,7 +202,7 @@ class PsycopgDriver(QueryDriver):
             cursor = connection.cursor(row_factory=dict_row)
             cursor: AsyncCursor[DictRow] = await cursor.execute(
                 sql(self.select_query.make_query(columns, where_columns)),
-                params=self.__parser_params(where_columns, where_values),
+                params=encode_params(where_columns, where_values),
             )
 
             if cursor.rownumber is not None:
@@ -252,7 +219,7 @@ class PsycopgDriver(QueryDriver):
                         [self.primary_key],
                     ),
                 ),
-                params=self.__parser_params([self.primary_key], [id]),
+                params=encode_params([self.primary_key], [id]),
             )
 
             if cursor.rownumber is not None:
@@ -270,7 +237,7 @@ class PsycopgDriver(QueryDriver):
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
                 sql(self.delete_by_date_query.make_query(self.created_at)),
-                params=self.__parser_params(
+                params=encode_params(
                     [self.created_at, self.created_at],
                     [from_date, to_date],
                 ),
@@ -315,16 +282,6 @@ class PsycopgDriver(QueryDriver):
 class PsycopgListenDriver(ListenDriver):
     """Asyncpg listen driver."""
 
-    def __init__(
-        self,
-        connection_string: str,
-        channel_name: str,
-        **connection_kwargs: Any,
-    ) -> None:
-        """Initialize the listen driver."""
-        super().__init__(connection_string, channel_name, **connection_kwargs)
-        self._queue: AsyncQueue[int] = AsyncQueue()
-
     async def on_startup(self) -> None:
         """On startup."""
         try:
@@ -339,34 +296,26 @@ class PsycopgListenDriver(ListenDriver):
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
 
-        self.connection.add_notify_handler(self._notification_handler)
-
     async def on_shutdown(self) -> None:
         """On shutdown."""
         await self.connection.close()
 
-    def _notification_handler(
-        self,
-        notify: Notify,
-    ) -> None:
+    async def __aiter__(self) -> AsyncIterator[int]:
         """
-        Handle NOTIFY messages.
+        Iterate over the ids of the notified messages.
 
-        From asyncpg.connection.add_listener docstring:
-            A callable or a coroutine function receiving the following arguments:
-            **con_ref**: a Connection the callback is registered with;
-            **pid**: PID of the Postgres server that sent the notification;
-            **channel**: name of the channel the notification was sent to;
-            **payload**: the payload.
+        A payload that is not an integer is logged and skipped.
         """
-        if self._queue is not None:
-            self._queue.put_nowait(int(notify.payload))
-
-    async def __aiter__(self) -> AsyncIterator[Union[int, str]]:
-        """Iterate over the queue."""
+        # notifies() alone: psycopg runs a registered notify handler on the
+        # same notifications, and a handler that raised would stop this loop.
         async for notify in self.connection.notifies():
-            yield notify.payload
-
-        while not self.connection.closed:
-            message_id = await self._queue.get()
+            try:
+                message_id = int(notify.payload)
+            except ValueError:
+                logger.warning(
+                    "Invalid NOTIFY payload %r on channel %s",
+                    notify.payload,
+                    self.channel_name,
+                )
+                continue
             yield message_id

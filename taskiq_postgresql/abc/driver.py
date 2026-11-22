@@ -207,5 +207,5 @@ class ListenDriver(_ConnectionStringHolder, ABC):
     # A plain def: the drivers implement it as an async generator, which
     # returns the iterator directly instead of a coroutine.
     @abstractmethod
-    def __aiter__(self) -> AsyncIterator[Union[int, str]]:
+    def __aiter__(self) -> AsyncIterator[int]:
         """Iterate over the ids of the notified messages."""

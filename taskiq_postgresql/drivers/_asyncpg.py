@@ -3,15 +3,13 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
 from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
-from uuid import UUID
 
 from asyncpg import Connection, Pool, connect, create_pool
-from asyncpg.transaction import Transaction
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
-from taskiq_postgresql.drivers._json import dumps
+from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 
@@ -19,7 +17,6 @@ class AsyncpgDriver(QueryDriver):
     """Asyncpg backend."""
 
     pool: Optional[Pool] = None
-    transaction: Optional[Transaction] = None
 
     def __init__(
         self,
@@ -43,37 +40,6 @@ class AsyncpgDriver(QueryDriver):
             run_migrations,
             **connection_kwargs,
         )
-
-    def __parser_query(
-        self,
-        columns: Optional[Sequence[Column]],
-        values: Optional[Sequence[Any]],
-    ) -> Sequence[Any]:
-        """Parser query.
-
-        Args:
-            columns (Sequence[Column] | None): Columns to parse.
-            values (Sequence[Any] | None): Values to parse.
-
-        Returns:
-            Sequence[Any]: Parsed values.
-        """
-        if not values:
-            return []
-
-        if not columns:
-            return values
-
-        new_values = [*values]
-
-        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
-            if column.type.upper() == "JSONB" and isinstance(value, dict):
-                new_values[index] = dumps(value)
-
-            if column.type.upper() == "UUID" and isinstance(value, UUID):
-                new_values[index] = value.hex
-
-        return new_values
 
     @asynccontextmanager
     async def connection(self) -> AsyncGenerator[Connection, None]:
@@ -127,7 +93,7 @@ class AsyncpgDriver(QueryDriver):
         async with self, self.connection() as connection:
             return await connection.fetchval(
                 self.insert_query.make_query(columns, returning),
-                *self.__parser_query(columns, values),
+                *encode_params(columns, values),
             )
 
     async def insert_or_update(
@@ -148,7 +114,7 @@ class AsyncpgDriver(QueryDriver):
                         on_conflict_columns,
                         on_conflict_update_columns=on_conflict_update_columns,
                     ),
-                    *self.__parser_query(columns, values),
+                    *encode_params(columns, values),
                 ),
             )
 
@@ -186,7 +152,7 @@ class AsyncpgDriver(QueryDriver):
         async with self, self.connection() as connection:
             rows = await connection.fetch(
                 self.select_query.make_query(columns, where_columns),
-                *self.__parser_query(where_columns, where_values or ()),
+                *encode_params(where_columns, where_values or ()),
             )
 
             return [
