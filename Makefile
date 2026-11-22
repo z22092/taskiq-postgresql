@@ -22,15 +22,22 @@ typecheck: ## Type-check the package with ty (also a pre-commit hook)
 test: ## Run the full suite with the coverage gate (CI job: test)
 	$(UV) run --no-sync pytest --cov=taskiq_postgresql --cov-report=term-missing
 
+# Recipes that make temporary files clean up in an EXIT trap. dash, the usual
+# /bin/sh, skips that trap when a signal kills it, so INT and TERM are turned
+# into a plain exit first. Ctrl-C reaches pytest too, which stops on its own.
+EXIT_ON_SIGNAL = trap 'exit 130' INT; trap 'exit 143' TERM
+
 # uv re-resolves the lowest direct versions and rewrites uv.lock on disk, so
-# the lock is copied aside and put back whatever the outcome. The environment
-# lives in a fresh temporary directory, so the project .venv keeps its Python.
+# the lock is copied aside and put back however the recipe ends. The
+# environment lives in the same temporary directory, so the project .venv
+# keeps its Python. The copy is renamed into place only once complete, so the
+# trap never puts back a partial lock.
 test-lowest: ## Run the suite on Python 3.10, lowest direct deps (CI job: test-lowest)
-	@tmp="$$(mktemp -d)" && cp uv.lock "$$tmp/uv.lock" || exit 1; \
-	UV_PROJECT_ENVIRONMENT="$$tmp/venv" $(UV) run --python 3.10 --resolution lowest-direct --all-extras --group dev pytest; \
-	status=$$?; \
-	cp "$$tmp/uv.lock" uv.lock; \
-	exit $$status
+	@tmp="$$(mktemp -d)" || exit 1; \
+	trap '[ ! -f "$$tmp/uv.lock" ] || cp "$$tmp/uv.lock" uv.lock; rm -rf "$$tmp"' EXIT; \
+	$(EXIT_ON_SIGNAL); \
+	cp uv.lock "$$tmp/uv.lock.part" && mv "$$tmp/uv.lock.part" "$$tmp/uv.lock" || exit 1; \
+	UV_PROJECT_ENVIRONMENT="$$tmp/venv" $(UV) run --python 3.10 --resolution lowest-direct --all-extras --group dev pytest
 
 build: ## Build the sdist and wheel into dist/ (CI job: CD build)
 	$(UV) build
@@ -38,6 +45,8 @@ build: ## Build the sdist and wheel into dist/ (CI job: CD build)
 # Needs network: pip-audit queries the PyPI and OSV advisory databases.
 audit: ## Audit every locked dependency, hashes required (CI job: pip-audit)
 	@req="$$(mktemp)" || exit 1; \
+	trap 'rm -f "$$req"' EXIT; \
+	$(EXIT_ON_SIGNAL); \
 	$(UV) export --quiet --locked --all-extras --all-groups --no-emit-project --output-file "$$req" \
 		&& $(UV) run --locked --only-group audit pip-audit --strict --disable-pip --require-hashes --requirement "$$req"
 
