@@ -32,9 +32,10 @@ jobs:
           version: "0.13.7"
           checksum: "c5221ff41b7892bfc223543883600125f6a47fe845093e0f5bdff4f359196d83" # uv linux x86_64 archive; setup-uv ships no checksum for 0.13.7
 
-      # The ruff and check_pins hooks run from this environment.
-      - name: Install the lint group
-        run: uv sync --locked --group lint
+      # The ruff, check_pins and ty hooks run from this environment; ty
+      # resolves the driver packages, so the extras are installed too.
+      - name: Install the lint group and the driver extras
+        run: uv sync --locked --all-extras --group lint
 
       - name: Run pre-commit on every file
         run: uv run --no-sync pre-commit run --all-files --show-diff-on-failure
