@@ -112,20 +112,9 @@ uv run pytest -k asyncpg
 ### Lowest supported dependency versions
 
 CI runs `test (py3.10, lowest-direct)` against the floor of every direct
-dependency:
-
-```bash
-UV_PROJECT_ENVIRONMENT="$(mktemp -d)" uv run --python 3.10 --resolution lowest-direct --all-extras --group dev pytest
-```
-
-The throwaway `UV_PROJECT_ENVIRONMENT` keeps uv from recreating the project
-`.venv` on Python 3.10, which cannot hold `pre-commit` (it needs Python 3.11
-or newer) and would break the git hook. The command also rewrites `uv.lock` on
-disk. Restore it afterwards so the lock change does not leak into your commit:
-
-```bash
-git restore uv.lock
-```
+dependency. Run it locally with `make test-lowest`, which uses a throwaway
+environment and puts `uv.lock` back however the run ends; see "Commands" in
+[`AGENTS.md`](../AGENTS.md).
 
 ## Code Style
 
@@ -266,11 +255,10 @@ with this exact command, with an empty diff for all eight entries, including
    git commit -m "fix: resolve memory leak in broker cleanup"
    ```
 
-3. **Write good commit messages**:
-   - Use conventional commit format: `type(scope): description`
-   - Types: feat, fix, docs, style, refactor, test, chore
-   - Keep the first line under 72 characters
-   - Add more details in the body if needed
+3. **Write good commit messages**: Conventional Commits, with the types,
+   scope and breaking-change mark listed under "Conventions" in
+   [`AGENTS.md`](../AGENTS.md); keep the first line under 72 characters and
+   say why in the body.
 
 4. **Update CHANGELOG**: Add entry for your changes (if applicable)
 
@@ -353,16 +341,10 @@ Use the feature request template and include:
 
 ### Test Structure
 
-```
-tests/
-├── conftest.py                 # Fixtures: postgresql_dsn, drivers, teardown
-├── test_broker.py              # Broker functionality tests
-├── test_result_backend.py      # Result backend tests
-└── test_scheduler_source.py    # Scheduler tests
-```
-
-All tests run against a real PostgreSQL, through testcontainers or
-`POSTGRESQL_URL`.
+[`AGENTS.md`](../AGENTS.md) describes the layout under "Layout": `tests/`
+holds the integration tests, which run against a real PostgreSQL through
+testcontainers or `POSTGRESQL_URL`, and `tests/unit/` the tests that need no
+database.
 
 ### Writing Tests
 
@@ -421,24 +403,9 @@ in `tests/test_broker.py`, which is the maintained version.
 
 ## Release Process
 
-Releases are cut by publishing a GitHub Release. There is no version bump
-commit: the version comes from the tag.
-
-1. **Update CHANGELOG** (if present) and merge the change to `main` through a PR.
-2. **Publish a GitHub Release** with tag `vX.Y.Z` on `main`. The `pypi`
-   environment only accepts deployments from `v*` tags.
-3. `cd.yml` sets the package version from the tag (normalized with
-   `uv version --short`), builds the sdist and wheel, uploads them as a
-   workflow artifact and attests build provenance.
-4. A separate job smoke-tests the wheel, installed from locked requirements
-   with hashes (`--require-hashes`).
-5. The publish job waits for the owner's approval on the `pypi` environment,
-   then publishes through PyPI trusted publishing (OIDC, no stored token).
-6. **Verify the release**: check the new version on PyPI and its provenance
-   attestation.
-
-`workflow_dispatch` on `cd.yml` publishes to TestPyPI only (the `testpypi`
-environment), which is the way to rehearse the pipeline without a release.
+Releases are the maintainer's. The steps, and the rule that the version
+comes from the tag with no version bump commit, are under "Releases" in
+[`AGENTS.md`](../AGENTS.md).
 
 ## Getting Help
 
