@@ -41,7 +41,7 @@ services:
   # holds the same image and scripts/check_pins.py keeps them equal.
   postgres17:
     profiles: ["pg17"]
-    image: postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317
+    image: postgres:17.11@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f
     restart: always
     environment:
       POSTGRES_USER: postgres
