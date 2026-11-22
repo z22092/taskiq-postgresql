@@ -48,12 +48,12 @@ Upgrading from 0.4.x:
 
 ### Fixed
 
-- A callable `dsn` works with `PostgresqlResultBackend` and
-  `PostgresqlSchedulerSource`; it used to reach the driver uncalled.
 - A schedule stored with a `timedelta` `cron_offset` loads back as a
   `timedelta` on taskiq older than 0.13 too. It used to come back as its ISO
   8601 string (`"PT1H"`), which the scheduler took for a time zone name and
   failed on.
+- A callable `dsn` works with `PostgresqlResultBackend` and
+  `PostgresqlSchedulerSource`; it used to reach the driver uncalled.
 
 ### Removed
 
