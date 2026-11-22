@@ -39,6 +39,13 @@ updates:
     cooldown:
       default-days: 14
     open-pull-requests-limit: 5
+    # Dependabot picked the commit tagged "varcon-core-v5.0.7", a sibling crate
+    # of the same repository, as a typos release. Real typos releases are 1.x,
+    # so nothing >=2 can be a typos release. The dependency name is the
+    # repository URL.
+    ignore:
+      - dependency-name: "https://github.com/crate-ci/typos"
+        versions: [">=2"]
     groups:
       pre-commit-hooks:
         patterns:
