@@ -23,8 +23,8 @@ _ReturnType = TypeVar("_ReturnType")
 # newest major, so adding a key moves the default with it.
 POSTGRES_IMAGES = {
     "17": (
-        "postgres:17.10"
-        "@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317"
+        "postgres:17.11"
+        "@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f"
     ),
     "18": (
         "postgres:18.4"
