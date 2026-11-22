@@ -75,6 +75,13 @@ NOT EXISTS`). It is off by default, so a deployment where the application user
 may not create tables can leave it off and create the tables itself, using the
 layout in [Database schema](#database-schema).
 
+Processes that start at the same time can race on that first `CREATE TABLE`:
+PostgreSQL may reject one of them with `duplicate key value violates unique
+constraint "pg_type_typname_nsp_index"`, and `taskiq worker` starts two
+processes by default. Create the tables before the first start, or let one
+process (for example `taskiq worker --workers 1 app:broker`) start once before
+the others.
+
 Start a worker. Start it before anything sends tasks: the worker claims a
 message when it receives its `NOTIFY`, and a notification sent while no worker
 is listening is not replayed.
@@ -205,8 +212,8 @@ The source implements taskiq's `ScheduleSource` (`get_schedules`,
 deleted after it is sent. `schedule_id` is stored in a `UUID` column, so keep
 the generated value or pass a UUID string.
 
-Table names are placed in SQL as written. Use identifiers you control, never
-user input.
+Table names, in all three components, and the broker's `channel_name` are
+placed in SQL as written. Use identifiers you control, never user input.
 
 ### Driver options
 
@@ -364,7 +371,7 @@ gets each message.
   pydantic and the drivers.
 - **PostgreSQL**: the test suite runs on PostgreSQL 17 and 18.
 - **Drivers**: asyncpg, psycopg 3 and psqlpy, selected with the `driver`
-  argument. The tests that need a database run once per installed driver.
+  argument. The test suite runs against all three.
 
 ## Upgrading
 
