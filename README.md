@@ -398,6 +398,10 @@ It is the only upgrade guide.
   done, which turns the exit code into an abort. It happens with psqlpy alone,
   and it was seen with psqlpy 0.13.1 on Python 3.10, not on 3.13. Where the exit
   code matters on 3.10, use another driver.
+- No `Listening started.` line from `taskiq worker` on Python 3.14 or newer:
+  taskiq 0.13.0 sets up logging in its worker processes only when they start
+  with `spawn`, and Python 3.14 starts them with `forkserver` on Linux. The
+  worker runs; only its log lines are missing.
 
 ## Contributing and security
 

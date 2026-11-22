@@ -15,6 +15,7 @@ must never run in tables the test did not create.
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import os
 import queue
@@ -33,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import asyncpg
 import pytest
 from taskiq import TaskiqResult
 from taskiq.abc.serializer import TaskiqSerializer
@@ -45,7 +47,6 @@ from tests.helpers import create_database, drop_database, in_database
 README = Path(__file__).resolve().parent.parent / "README.md"
 SCRIPTS = ("app.py", "kick.py", "schedule.py")
 CA_PLACEHOLDER = "/path/to/ca.pem"
-WORKER_READY = "Listening started"
 SCHEDULER_READY = "Starting scheduler"
 STARTUP_TIMEOUT = 30
 SCRIPT_TIMEOUT = 60
@@ -454,12 +455,56 @@ def test_when_dsn_is_missing__then_the_troubleshooting_messages_are_real(
 
 
 def _stop(process: "subprocess.Popen[str]") -> None:
-    """Stop a taskiq process gracefully; SIGTERM leaves it hanging."""
+    """
+    Stop a taskiq process and everything it started.
+
+    SIGINT asks for a graceful stop. Whatever is still running afterwards is
+    killed with its whole process group, so a worker child that does not stop
+    never outlives the test.
+    """
     process.send_signal(signal.SIGINT)
-    try:
+    with contextlib.suppress(subprocess.TimeoutExpired):
         process.wait(timeout=SHUTDOWN_TIMEOUT)
-    except subprocess.TimeoutExpired:
-        process.kill()
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(process.pid, signal.SIGKILL)
+    process.wait()
+
+
+async def _listen_sessions(dsn: str) -> int:
+    connection = await asyncpg.connect(dsn)
+    try:
+        return await connection.fetchval(
+            "SELECT count(*) FROM pg_stat_activity "
+            "WHERE datname = current_database() AND query ILIKE 'LISTEN %'",
+        )
+    finally:
+        await connection.close()
+
+
+def _wait_for_listener(
+    dsn: str,
+    worker: "subprocess.Popen[str]",
+    lines: "queue.Queue[str]",
+    seen: list[str],
+) -> None:
+    """
+    Wait until a worker process LISTENs on the database.
+
+    The worker's own "Listening started." line is not used: on Python 3.14 and
+    newer, taskiq 0.13.0 sets up logging in its worker processes only when
+    they start with ``spawn``, and Linux starts them with ``forkserver``.
+    """
+    deadline = time.monotonic() + STARTUP_TIMEOUT
+    while time.monotonic() < deadline:
+        with contextlib.suppress(queue.Empty):
+            while True:
+                seen.append(lines.get_nowait())
+        if worker.poll() is not None:
+            pytest.fail(f"the worker exited; output so far:\n{''.join(seen)}")
+        if asyncio.run(_listen_sessions(dsn)):
+            return
+        time.sleep(0.5)
+    pytest.fail(f"no worker LISTENs; output so far:\n{''.join(seen)}")
 
 
 def _start(
@@ -475,6 +520,7 @@ def _start(
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
+        start_new_session=True,
     )
     lines: queue.Queue[str] = queue.Queue()
     assert process.stdout is not None
@@ -528,7 +574,7 @@ def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_sto
     worker, lines = _start(worker_command, tmp_path, env)
     seen: list[str] = []
     try:
-        _wait_for(lines, WORKER_READY, seen)
+        _wait_for_listener(scratch_dsn, worker, lines, seen)
 
         kick = subprocess.run(
             [sys.executable, "kick.py"],
