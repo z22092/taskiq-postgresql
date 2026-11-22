@@ -2344,6 +2344,7 @@ audit = [
 ]
 dev = [
     { name = "anyio" },
+    { name = "msgpack" },
     { name = "pytest" },
     { name = "pytest-cov" },
     { name = "pytest-timeout" },
@@ -2370,6 +2371,7 @@ provides-extras = ["asyncpg", "psqlpy", "psycopg"]
 audit = [{ name = "pip-audit", marker = "python_full_version >= '3.11'", specifier = "==2.10.1" }]
 dev = [
     { name = "anyio", specifier = "==4.16.0" },
+    { name = "msgpack", specifier = "==1.2.4" },
     { name = "pytest", specifier = "==9.2.0" },
     { name = "pytest-cov", specifier = "==7.1.0" },
     { name = "pytest-timeout", specifier = "==2.4.0" },
