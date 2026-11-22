@@ -4,7 +4,6 @@ version = "0.4.1"
 description = "PostgreSQL integration for taskiq"
 readme = "README.md"
 authors = [
-    { name = "jeffersonsilva-mb", email = "jefferson.silva@mb.com.br" },
     { name = "Jefferson Venceslau", email = "jeff.venceslau@gmail.com" }
 ]
 dependencies = [
