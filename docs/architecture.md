@@ -15,10 +15,13 @@ at construction, so creating one never opens a connection.
 | `PostgresqlSchedulerSource` | `taskiq_postgresql/scheduler_source.py` | `ScheduleSource` | `taskiq_schedulers` |
 
 Every component takes a `dsn` (a string, or a callable returning one) and a
-`driver` name. `utils/require_dsn.py` rejects a missing DSN with `TypeError`
-(`require_dsn`); the drivers receive the string a callable returns at
-construction (`resolve_dsn`). The broker also builds a listen driver for
-`LISTEN`.
+`driver` name. The DSN helpers live in `utils/dsn.py`: `require_dsn` rejects
+`None`, an empty or blank string, or a value that is neither a string nor a
+callable with `TypeError` at construction. A callable is resolved once, by
+`startup()` (`resolve_dsn`), which hands the string to every driver of the
+component; until then the drivers hold an empty connection string
+(`dsn_before_startup`) and refuse to connect. The broker also builds a listen
+driver for `LISTEN`.
 
 ## Driver abstraction
 
@@ -49,10 +52,13 @@ name to a class. `drivers/__init__.py` imports a driver module only when
 | Pool | `asyncpg.create_pool` | `psqlpy.ConnectionPool` | `psycopg_pool.AsyncConnectionPool` with `AsyncRawCursor`, so `$n` placeholders work |
 | JSONB values | dict -> JSON text (`pydantic_core.to_json`) | wrapped in `psqlpy.extra_types.JSONB` (JSON text is parsed first) | dict -> JSON text (`pydantic_core.to_json`) |
 | UUID values | `UUID` -> hex text | text -> `uuid.UUID` | `UUID` -> hex text |
-| Listen | `asyncpg.connect` + `add_listener` callback into a queue | pool `listener()` with a callback into a queue | autocommit connection, `LISTEN <channel>`, a notify handler into a queue plus `notifies()` |
+| Listen | `asyncpg.connect` + `add_listener` callback into a queue | pool `listener()` with a callback into a queue | autocommit connection, `LISTEN <channel>`, then `notifies()`; a payload that is not an integer is logged and skipped |
 
-Each driver pairs columns and values with `zip(..., strict=True)`, so a count
-mismatch raises `ValueError` before anything reaches the server.
+asyncpg and psycopg shape their bind parameters with the shared
+`encode_params` in `drivers/_params.py`; psqlpy has its own
+`encode_psqlpy_params`. Both pair columns and values with
+`zip(..., strict=True)`, so a count mismatch raises `ValueError` before
+anything reaches the server.
 
 ## SQL
 
@@ -114,8 +120,8 @@ sequenceDiagram
 1. `kick` inserts the message and sends `NOTIFY` with the new row id. With a
    `delay` label, the `NOTIFY` is scheduled on the producer's event loop
    (`loop.call_at`), so it is only sent if that process is still running.
-2. Every listening worker receives the id. `listen` turns it into an `int`;
-   an invalid payload is logged and skipped.
+2. Every listening worker receives the id; its listen driver yields it as an
+   `int`.
 3. Each worker runs `DELETE ... RETURNING`; PostgreSQL gives the row to one of
    them, and the others get no row and move on. The message is yielded as an
    `AckableMessage` whose `ack` is a no-op, because the row is already gone.
@@ -133,9 +139,12 @@ sequenceDiagram
     held, query errors included, because their `connection()` context wraps
     the whole block;
   - every driver raises it from `connection()` when called outside
-    `async with driver`, before any pool exists.
+    `async with driver`, before any pool exists;
+  - a component built with a callable DSN raises it when used before
+    `startup()`, since its drivers have no connection string yet.
 - `ResultIsMissingError`: `get_result` finds no row for the task id.
-- `TypeError`: a component is built without a DSN.
+- `TypeError`: a component is built without a usable DSN, or its DSN
+  callable returns no usable DSN at `startup()`.
 - `ValueError`: an unknown driver name, a column/value count mismatch, or an
   upsert without update columns.
 - `PostgresqlBroker.listen` logs any other exception and keeps listening.
