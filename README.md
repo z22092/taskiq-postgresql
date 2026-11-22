@@ -396,6 +396,11 @@ It is the only upgrade guide.
   settings are wrong; the message carries the driver's own error.
 - A task is sent but no worker runs it: start the worker before the sender, and
   use the same `channel_name` on both sides.
+- `Fatal Python error: PyGILState_Release` when a process that used psqlpy
+  exits: psqlpy occasionally aborts the interpreter at exit, after the work is
+  done, which turns the exit code into an abort. It happens with psqlpy alone,
+  and it was seen with psqlpy 0.13.1 on Python 3.10, not on 3.13. Where the exit
+  code matters on 3.10, use another driver.
 
 ## Contributing and security
 

@@ -482,6 +482,30 @@ def _start(
     return process, lines
 
 
+def _assert_exited_cleanly(
+    script: subprocess.CompletedProcess[str],
+    driver: str,
+) -> None:
+    """
+    Assert that a README script exited with code 0.
+
+    psqlpy 0.13.1 on Python 3.10 occasionally aborts the interpreter at exit,
+    after the script's work is done, with ``PyGILState_Release`` while the
+    runtime is finalizing; psqlpy alone, without this package, does it too
+    (about 1 run in 80). Only that abort is tolerated, and the caller still
+    checks the script's output.
+    """
+    if (
+        script.returncode == -signal.SIGABRT
+        and driver == "psqlpy"
+        and sys.version_info < (3, 11)
+        and "Fatal Python error: PyGILState_Release" in script.stderr
+        and "finalizing" in script.stderr
+    ):
+        return
+    assert script.returncode == 0, script.stderr
+
+
 @pytest.mark.timeout(180)
 def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_stored(
     driver: str,
@@ -515,7 +539,7 @@ def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_sto
             timeout=SCRIPT_TIMEOUT,
             check=False,
         )
-        assert kick.returncode == 0, kick.stderr
+        _assert_exited_cleanly(kick, driver)
         assert kick.stdout.strip() == "3"
 
         schedule = subprocess.run(
@@ -527,7 +551,7 @@ def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_sto
             timeout=SCRIPT_TIMEOUT,
             check=False,
         )
-        assert schedule.returncode == 0, schedule.stderr
+        _assert_exited_cleanly(schedule, driver)
 
         scheduler, scheduler_lines = _start(scheduler_command, tmp_path, env)
         scheduler_seen: list[str] = []
