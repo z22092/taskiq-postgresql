@@ -20,6 +20,14 @@ def _is_blank(value: object) -> bool:
     return not isinstance(value, str) or not value.strip()
 
 
+def _describe(value: object) -> str:
+    # Only None and a blank string are echoed. Anything else, such as a DSN
+    # object or bytes, can carry the password in its repr().
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return repr(value)
+    return f"a {type(value).__name__}"
+
+
 def require_dsn(dsn: Dsn, component: str) -> Dsn:
     """
     Return ``dsn`` when it can be used, at construction time.
@@ -36,10 +44,11 @@ def require_dsn(dsn: Dsn, component: str) -> Dsn:
         The DSN, unchanged.
 
     Raises:
-        TypeError: if ``dsn`` is ``None``, empty or blank.
+        TypeError: if ``dsn`` is ``None``, empty, blank, or neither a string
+            nor a callable.
     """
     if not callable(dsn) and _is_blank(dsn):
-        raise _invalid_dsn(component, f"got {dsn!r}")
+        raise _invalid_dsn(component, f"got {_describe(dsn)}")
     return dsn
 
 
@@ -62,7 +71,10 @@ def resolve_dsn(dsn: Dsn, component: str) -> str:
         return dsn
     value = dsn()
     if _is_blank(value):
-        raise _invalid_dsn(component, f"the 'dsn' callable returned {value!r}")
+        raise _invalid_dsn(
+            component,
+            f"the 'dsn' callable returned {_describe(value)}",
+        )
     return value
 
 

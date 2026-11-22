@@ -1,8 +1,9 @@
 import json
+import math
 from dataclasses import dataclass
 from datetime import timedelta
 from logging import getLogger
-from typing import Any, Final, Literal, Optional, Union
+from typing import Any, Final, Literal, Optional
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -27,22 +28,52 @@ __all__ = ["PostgresqlSchedulerSource"]
 
 logger = getLogger(__name__)
 
+# The largest whole-day span a timedelta holds, in seconds.
+_MAX_OFFSET_SECONDS = timedelta.max.days * 24 * 60 * 60
 
-def _load_schedule(stored: Union[str, bytes, dict[str, Any]]) -> ScheduledTask:
+
+def _load_schedule(stored: Any) -> ScheduledTask:
     """
     Validate a stored schedule, accepting the 0.4.x pydantic v1 form.
 
     Raises:
-        ValidationError: if the row is not a valid ``ScheduledTask``.
+        ValueError: if the schedule is not JSON, or not a valid
+            ``ScheduledTask`` (pydantic's ``ValidationError``).
+        TypeError: if the schedule is JSON but not an object.
     """
-    data = json.loads(stored) if isinstance(stored, (str, bytes)) else dict(stored)
+    data = json.loads(stored) if isinstance(stored, (str, bytes)) else stored
+    if not isinstance(data, dict):
+        msg = f"expected a JSON object, got {type(data).__name__}"
+        raise TypeError(msg)
+    data = dict(data)
     offset = data.get("cron_offset")
     # pydantic v1 wrote a timedelta as its total seconds. taskiq 0.13 reads a
     # number as a time zone name and rejects it, and a number can only have
-    # come from a timedelta, so it is read back as one.
-    if isinstance(offset, (int, float)) and not isinstance(offset, bool):
+    # come from a timedelta, so it is read back as one. An offset timedelta
+    # cannot hold stays a number and fails validation like any other bad row.
+    if (
+        isinstance(offset, (int, float))
+        and not isinstance(offset, bool)
+        and math.isfinite(offset)
+        and abs(offset) <= _MAX_OFFSET_SECONDS
+    ):
         data["cron_offset"] = timedelta(seconds=offset)
     return ScheduledTask.model_validate(data)
+
+
+def _describe_error(error: Exception) -> str:
+    # The error type and, for a validation error, the ScheduledTask fields it
+    # names; never the stored values, which can hold user data.
+    if isinstance(error, ValidationError):
+        fields = sorted(
+            {
+                str(item["loc"][0])
+                for item in error.errors(include_url=False, include_input=False)
+                if item["loc"]
+            },
+        )
+        return f"ValidationError in {', '.join(fields) or 'the schedule'}"
+    return type(error).__name__
 
 
 @dataclass
@@ -221,13 +252,13 @@ class PostgresqlSchedulerSource(ScheduleSource):
                 schedules.append(
                     _load_schedule(schedule_row[self.columns.schedule.name]),
                 )
-            except ValidationError as error:
-                # Without the input: schedule arguments can hold user data.
+            except (ValidationError, ValueError, TypeError, OverflowError) as error:
                 logger.warning(
-                    "Skipping schedule %s in table %s: not a valid ScheduledTask: %s",
+                    "Skipping schedule %s in table %s: it cannot be read as a "
+                    "ScheduledTask (%s)",
                     schedule_row[self.columns.primary_key.name],
                     self.table_name,
-                    error.errors(include_url=False, include_input=False),
+                    _describe_error(error),
                 )
         return schedules
 

@@ -114,6 +114,63 @@ async def test_when_dsn_callable_returns_nothing__then_startup_fails(
     assert_names_dsn_with_safe_example(str(error.value), component)
 
 
+class DsnObject:
+    """Stands in for a DSN type whose repr() prints the password."""
+
+    def __init__(self, url: str) -> None:
+        self.url = url
+
+    def __repr__(self) -> str:
+        return f"DsnObject({self.url!r})"
+
+
+@pytest.fixture
+def secret() -> str:
+    """A password-like marker, unique per test, that must never be echoed."""
+    return uuid.uuid4().hex
+
+
+def url_with_password(secret: str) -> str:
+    # Assembled at run time so no credential-shaped literal is in the source.
+    return "postgresql://" + "user" + ":" + secret + "@" + "db.invalid/app"
+
+
+@pytest.mark.parametrize("component", COMPONENTS)
+def test_when_dsn_is_an_object__then_the_error_does_not_echo_it(
+    component: Component,
+    secret: str,
+) -> None:
+    with pytest.raises(TypeError) as error:
+        component(dsn=DsnObject(url_with_password(secret)))  # type: ignore[arg-type]
+
+    message = str(error.value)
+    assert secret not in message
+    assert "DsnObject" in message
+    assert_names_dsn_with_safe_example(message, component)
+
+
+@pytest.mark.anyio
+@pytest.mark.usefixtures("no_local_fallback")
+@pytest.mark.parametrize("component", COMPONENTS)
+@pytest.mark.parametrize("kind", ["bytes", "object"])
+async def test_when_dsn_callable_returns_a_non_str__then_the_error_does_not_echo_it(
+    component: Component,
+    kind: str,
+    secret: str,
+) -> None:
+    url = url_with_password(secret)
+    value: Any = url.encode() if kind == "bytes" else DsnObject(url)
+    instance = component(dsn=lambda: value)
+
+    with pytest.raises(TypeError) as error:
+        await instance.startup()
+
+    message = str(error.value)
+    assert secret not in message
+    assert type(value).__name__ in message
+    assert_names_dsn_with_safe_example(message, component)
+
+
 async def _use_broker(broker: PostgresqlBroker) -> None:
     rows = await broker.driver.execute(
         f"SELECT * FROM {broker.table_name}",  # noqa: S608

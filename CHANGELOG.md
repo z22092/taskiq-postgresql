@@ -15,8 +15,8 @@ Upgrading from 0.4.x:
   one.
 - Schedules stored under pydantic v1 with a `timedelta` `cron_offset` hold it as
   a number of seconds; they load unchanged. `get_schedules()` now skips, with a
-  warning in the log, any stored schedule that still does not validate: check
-  the log after upgrading and fix or delete the rows it names.
+  warning in the log, any stored schedule it cannot read: check the log after
+  upgrading and fix or delete the rows it names.
 
 ### Added
 
@@ -36,8 +36,11 @@ Upgrading from 0.4.x:
   installs an older release of this package instead of this one.
 - A callable `dsn` is resolved once, by `startup()`, and every driver of the
   component gets that string. The broker used to call it at construction.
-- `PostgresqlSchedulerSource.get_schedules()` logs and skips a stored schedule
-  that is not a valid `ScheduledTask` instead of failing for the whole table.
+- `PostgresqlSchedulerSource.get_schedules()` skips a stored schedule it cannot
+  read as a `ScheduledTask` (not JSON, not a JSON object, or not valid) instead
+  of failing for the whole table, so `startup()` with a `startup_schedule` keeps
+  going too. The warning names the row id and the error type, never the stored
+  value.
 - `PostgresqlBroker.startup()` raises `DatabaseConnectionError` when the LISTEN
   connection cannot start, for every driver (asyncpg, psqlpy and psycopg).
 - The drivers pair query columns and values with `zip(..., strict=True)`, so a

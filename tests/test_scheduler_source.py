@@ -459,3 +459,101 @@ async def test_when_a_row_does_not_validate__then_only_that_row_is_skipped(
         if record.levelno == logging.WARNING
     ]
     assert any(str(uuid.UUID(broken_id)) in message for message in warnings), warnings
+
+
+async def insert_raw_json_row(
+    scheduler: PostgresqlSchedulerSource,
+    schedule_id: str,
+    document: Any,
+) -> None:
+    """Store any JSON document, object or not, as the row's schedule."""
+    text = json.dumps(document).replace("'", "''")
+    await scheduler.driver.execute(
+        f"INSERT INTO {scheduler.table_name} (id, task_name, schedule) "  # noqa: S608
+        f"VALUES ('{schedule_id}', 'broken_task', '{text}'::jsonb)",
+    )
+
+
+ERROR_TYPES = ("TypeError", "ValueError", "OverflowError", "ValidationError")
+
+
+@pytest.mark.parametrize("kind", ["empty_list", "number", "huge_cron_offset"])
+async def test_when_a_row_cannot_become_a_schedule__then_only_that_row_is_skipped(
+    scheduler_source: PostgresqlSchedulerSource,
+    sample_scheduled_task: ScheduledTask,
+    caplog: pytest.LogCaptureFixture,
+    kind: str,
+) -> None:
+    """Rows that are not objects, or overflow timedelta, are skipped too."""
+    broken_id = uuid.uuid4().hex
+    marker = uuid.uuid4().hex
+    documents: dict[str, Any] = {
+        "empty_list": [],
+        "number": 42,
+        "huge_cron_offset": {
+            **sample_scheduled_task.model_dump(mode="json"),
+            "schedule_id": broken_id,
+            "cron_offset": 1e20,
+            "kwargs": {"marker": marker},
+        },
+    }
+    await insert_raw_json_row(scheduler_source, broken_id, documents[kind])
+    valid = sample_scheduled_task.model_copy(update={"schedule_id": uuid.uuid4().hex})
+    await scheduler_source.add_schedule(valid)
+
+    with caplog.at_level(logging.DEBUG):
+        schedules = await scheduler_source.get_schedules()
+
+    assert [schedule.schedule_id for schedule in schedules] == [valid.schedule_id]
+    messages = [record.getMessage() for record in caplog.records]
+    skipped = [message for message in messages if str(uuid.UUID(broken_id)) in message]
+    assert skipped, messages
+    assert any(name in message for message in skipped for name in ERROR_TYPES)
+    assert not any(marker in message for message in messages), messages
+
+
+async def test_when_a_row_is_not_json__then_it_is_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A schedule that does not decode as JSON is skipped like any other."""
+    scheduler = PostgresqlSchedulerSource("postgresql://postgres@localhost:5432/x")
+    row_id = uuid.uuid4()
+
+    async def select(*args: Any, **kwargs: Any) -> list[dict[str, Any]]:
+        return [{"id": row_id, "schedule": "{not json"}]
+
+    monkeypatch.setattr(scheduler.driver, "select", select)
+
+    with caplog.at_level(logging.WARNING):
+        assert await scheduler.get_schedules() == []
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any(
+        str(row_id) in message and "JSONDecodeError" in message for message in messages
+    ), messages
+
+
+async def test_when_a_row_cannot_become_a_schedule__then_startup_schedule_runs(
+    scheduler_source: PostgresqlSchedulerSource,
+    postgresql_dsn: str,
+    driver: str,
+    mock_broker: Mock,
+) -> None:
+    """startup() reads the stored schedules first; a bad row must not stop it."""
+    await insert_raw_json_row(scheduler_source, uuid.uuid4().hex, 42)
+    scheduler = PostgresqlSchedulerSource(
+        dsn=postgresql_dsn,
+        table_name=scheduler_source.table_name,
+        driver=driver,
+        startup_schedule={"test_task": [{"cron": "0 */6 * * *"}]},
+        broker=mock_broker,
+    )
+
+    await scheduler.startup()
+    try:
+        schedules = await scheduler.get_schedules()
+    finally:
+        await scheduler.shutdown()
+
+    assert [schedule.task_name for schedule in schedules] == ["test_task"]
