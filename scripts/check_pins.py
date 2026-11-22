@@ -8,8 +8,14 @@ The checks:
   ``version:`` to the ceiling of ``[tool.uv] required-version`` and carries
   the same ``checksum:`` (the sha256 of that uv release's linux x86_64
   archive).
-* PostgreSQL image: ``POSTGRES_IMAGE`` in ``tests/conftest.py`` against the
-  compose file and any ``postgres:`` image reference in the workflows.
+* PostgreSQL images: ``POSTGRES_IMAGES`` in ``tests/conftest.py`` declares
+  exactly one ``postgres:<major>.<minor>@sha256:<digest>`` image per major
+  (the key is the major and the default major must be one of them); the
+  compose image equals conftest's image for its major; every ``postgres:``
+  image reference and every non-empty ``TEST_POSTGRES_MAJOR`` value (or
+  ``postgres:`` matrix list item) in the workflows matches a conftest entry.
+  CI sets ``TEST_POSTGRES_MAJOR`` to an empty string on the default legs, so
+  empty values are ignored.
 * Python versions: the trove classifiers against the CI test matrix and the
   ``requires-python`` bounds; ``.python-version`` and every other literal
   Python version in the workflows must be one of the classifiers.
@@ -38,6 +44,8 @@ WORKFLOWS = ROOT / ".github" / "workflows"
 
 IMAGE_RE = r"postgres:[\w.\-]+@sha256:[0-9a-f]{64}"
 LOOSE_IMAGE_RE = r"postgres:[\w.\-]+(?:@sha256:[0-9a-f]+)?"
+MAJOR_VALUE_RE = r"TEST_POSTGRES_MAJOR(?:\s*[:=]\s*)[\"']?([^\"'\s#]*)"
+MAJOR_MATRIX_RE = r"(?<![\w-])postgres:\s*\[([^\]]*)\]"
 VERSION_RE = r"[0-9][\w.+!-]*"
 PYTHON_LITERAL_RE = (
     r"(?:python-version:\s*[\"']?|--python\s+|python-version\s*==\s*[\"'])"
@@ -133,32 +141,71 @@ def check_uv(pyproject: dict, workflows: list[Workflow], errors: list[str]) -> N
         )
 
 
-def check_postgres(workflows: list[Workflow], errors: list[str]) -> None:
-    """Compare the PostgreSQL image across conftest, compose and workflows."""
-    refs: dict[str, str] = {}
-
-    conftest = re.search(rf'POSTGRES_IMAGE\s*=\s*"({IMAGE_RE})"', CONFTEST.read_text())
-    if conftest:
-        refs[f"{rel(CONFTEST)} POSTGRES_IMAGE"] = conftest.group(1)
-    else:
+def postgres_images(errors: list[str]) -> dict[str, str]:
+    """Return conftest's pinned images by major, reporting a malformed block."""
+    text = CONFTEST.read_text()
+    block = re.search(r"POSTGRES_IMAGES\s*=\s*\{(.*?)\n\}", text, re.DOTALL)
+    images: dict[str, str] = {}
+    if block:
+        for key, ref in re.findall(
+            rf'"(\d+)":\s*"({IMAGE_RE})"',
+            block.group(1),
+        ):
+            if not ref.startswith(f"postgres:{key}."):
+                errors.append(
+                    f"{rel(CONFTEST)}: POSTGRES_IMAGES key {key!r} does not match "
+                    f"the tag of {ref!r}"
+                )
+            images[key] = ref
+    entries = (
+        len(re.findall(r'^\s+"[^"]*":', block.group(1), re.MULTILINE)) if block else 0
+    )
+    if not images or entries != len(images):
         errors.append(
-            f"{rel(CONFTEST)}: POSTGRES_IMAGE must be 'postgres:<tag>@sha256:<digest>'"
+            f"{rel(CONFTEST)}: POSTGRES_IMAGES must map each major to "
+            "'postgres:<major>.<minor>@sha256:<digest>', one entry per line"
         )
+    default = re.search(r'DEFAULT_POSTGRES_MAJOR\s*=\s*"(\d+)"', text)
+    if not default or default.group(1) not in images:
+        errors.append(
+            f"{rel(CONFTEST)}: DEFAULT_POSTGRES_MAJOR must be one of {sorted(images)}"
+        )
+    return images
+
+
+def check_postgres(workflows: list[Workflow], errors: list[str]) -> None:
+    """Compare the PostgreSQL images across conftest, compose and workflows."""
+    images = postgres_images(errors)
+    pinned = set(images.values())
 
     compose = re.search(rf"image:\s*({LOOSE_IMAGE_RE})", COMPOSE.read_text())
-    if compose:
-        refs[f"{rel(COMPOSE)} image"] = compose.group(1)
-    else:
+    if not compose:
         errors.append(f"{rel(COMPOSE)}: no postgres image found")
+    elif compose.group(1) not in pinned:
+        major = re.match(r"postgres:(\d+)", compose.group(1))
+        expected = images.get(major.group(1)) if major else None
+        errors.append(
+            f"postgres image: {rel(COMPOSE)} image is {compose.group(1)}, "
+            f"expected conftest's {expected or 'image for its major'}"
+        )
 
     for workflow in workflows:
         for number, line in enumerate(workflow.lines, start=1):
-            for ref in re.findall(rf"(?<![\w/.-]){LOOSE_IMAGE_RE}", line):
-                refs[f"{workflow.name}:{number}"] = ref
-
-    if len(set(refs.values())) > 1:
-        detail = "; ".join(f"{where}={ref}" for where, ref in refs.items())
-        errors.append(f"postgres image: references differ: {detail}")
+            where = f"{workflow.name}:{number}"
+            errors.extend(
+                f"postgres image: {where} references {ref}, not in conftest"
+                for ref in re.findall(rf"(?<![\w/.-]){LOOSE_IMAGE_RE}", line)
+                if ref not in pinned
+            )
+            majors = re.findall(MAJOR_VALUE_RE, line)
+            for matrix in re.findall(MAJOR_MATRIX_RE, line):
+                majors.extend(re.findall(r"[\"']?(\w+)[\"']?", matrix))
+            errors.extend(
+                f"postgres image: {where} names major {major!r}, conftest has "
+                f"{sorted(images)}"
+                for major in majors
+                if major and not major.startswith("$") and major not in images
+            )
 
 
 def minor_of(version: str) -> int:

@@ -19,8 +19,32 @@ from tests.helpers import (
 
 _ReturnType = TypeVar("_ReturnType")
 
-# Kept on one line: scripts/check_pins.py matches it with a regex.
-POSTGRES_IMAGE = "postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317"  # noqa: E501
+# One pinned image per supported major. Each entry stays on one line:
+# scripts/check_pins.py matches them with a regex.
+POSTGRES_IMAGES = {
+    "17": "postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317",  # noqa: E501
+    "18": "postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636",  # noqa: E501
+}
+DEFAULT_POSTGRES_MAJOR = "18"
+
+
+def postgres_image() -> str:
+    """
+    Pinned image for the major named by ``TEST_POSTGRES_MAJOR``.
+
+    CI sets the variable to an empty string on the legs that keep the default,
+    so unset and empty both mean the default major.
+
+    :raises pytest.UsageError: when the value is not a supported major.
+    :return: the pinned image reference.
+    """
+    major = os.environ.get("TEST_POSTGRES_MAJOR") or DEFAULT_POSTGRES_MAJOR
+    if major not in POSTGRES_IMAGES:
+        raise pytest.UsageError(
+            f"TEST_POSTGRES_MAJOR={major!r} is not supported; "
+            f"use one of {sorted(POSTGRES_IMAGES)}",
+        )
+    return POSTGRES_IMAGES[major]
 
 
 @pytest.fixture(scope="session")
@@ -54,8 +78,9 @@ def postgresql_dsn() -> Generator[str, None, None]:
     """
     DSN to PostgreSQL.
 
-    Uses the ``POSTGRESQL_URL`` environment variable when it is set, otherwise
-    starts a throwaway PostgreSQL container for the whole test session.
+    Uses the ``POSTGRESQL_URL`` environment variable when it is set (it wins
+    over ``TEST_POSTGRES_MAJOR``), otherwise starts a throwaway PostgreSQL
+    container for the whole test session.
 
     :yield: dsn to PostgreSQL.
     """
@@ -65,7 +90,7 @@ def postgresql_dsn() -> Generator[str, None, None]:
         return
 
     # The DSN is built from the credentials the container itself holds.
-    with PostgresContainer(POSTGRES_IMAGE) as container:
+    with PostgresContainer(postgres_image()) as container:
         yield container.get_connection_url(driver=None)
 
 

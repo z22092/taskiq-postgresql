@@ -56,7 +56,9 @@ uv run pre-commit install
 ### Database Setup
 
 The test suite starts a throwaway PostgreSQL container by itself
-(testcontainers, image pinned by digest), so no setup is needed.
+(testcontainers, image pinned by digest), so no setup is needed. It runs on
+PostgreSQL 18 by default; set `TEST_POSTGRES_MAJOR=17` to run on 17 (CI covers
+both). An unknown value fails at once, naming the supported majors.
 
 To run the tests against a database you already have, set `POSTGRESQL_URL`
 (credentials come from your environment, never from the repository):
@@ -65,7 +67,7 @@ To run the tests against a database you already have, set `POSTGRESQL_URL`
 export POSTGRESQL_URL="postgresql://<user>@<host>:5432/<database>"
 ```
 
-For manual work, `docker-compose.yml` starts a local PostgreSQL bound to
+For manual work, `docker-compose.yml` starts a local PostgreSQL 18 bound to
 `127.0.0.1:5432` with trust authentication (development only), so the DSN has
 no password:
 
@@ -78,6 +80,11 @@ export POSTGRESQL_URL="postgresql://postgres@localhost:5432/postgres"
 you ran an earlier compose file (password authentication), run
 `docker compose down -v` once, or the passwordless DSN fails with
 `fe_sendauth: no password supplied`.
+
+Moving from the PostgreSQL 17 compose file to this one needs the same
+`docker compose down -v`: the 18 image keeps its data under
+`/var/lib/postgresql/18/` on a volume mounted at `/var/lib/postgresql`, and it
+refuses to start over a volume that still holds the 17 data format.
 
 Port 5432 must be free on the host. The tests do not need the compose
 database; the `postgresql_dsn` fixture uses `POSTGRESQL_URL` when it is set and
@@ -205,9 +212,11 @@ async def process_task(
   there.
 - Dependabot waits 14 days before proposing a release, matching
   `exclude-newer = "14 days"` in `[tool.uv]`.
-- The Postgres image is declared in both `tests/conftest.py` and
-  `docker-compose.yml`. `scripts/check_pins.py` fails when they differ, and a
-  Dependabot docker PR needs the matching manual bump in `tests/conftest.py`.
+- `tests/conftest.py` pins one Postgres image per supported major
+  (`POSTGRES_IMAGES`), and `docker-compose.yml` must use the image of its major.
+  `scripts/check_pins.py` fails when they differ or when a workflow names an
+  image or `TEST_POSTGRES_MAJOR` value conftest does not declare. A Dependabot
+  docker PR needs the matching manual bump in `tests/conftest.py`.
 
 ### Regenerating the build-constraint hashes
 
