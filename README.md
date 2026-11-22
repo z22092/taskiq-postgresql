@@ -1,113 +1,102 @@
-# TaskIQ PostgreSQL
+# taskiq-postgresql
 
-TaskIQ PostgreSQL is a comprehensive plugin for [TaskIQ](https://taskiq-python.github.io/) that provides PostgreSQL-based broker, result backend, and scheduler source with support for multiple PostgreSQL drivers.
-
-## Features
-
-- **🚀 PostgreSQL Broker**: High-performance message broker using PostgreSQL LISTEN/NOTIFY
-- **📦 Result Backend**: Persistent task result storage with configurable retention
-- **⏰ Scheduler Source**: Cron-like task scheduling with PostgreSQL persistence
-- **🔌 Multiple Drivers**: Support for asyncpg, psycopg3, and psqlpy
-- **⚡ Async/Await**: Built for high-performance async operations
-- **🛠️ Flexible Configuration**: Customizable table names, field types, and connection options
-- **🔄 Multiple Serializers**: Support for different serialization methods (Pickle, JSON, etc.)
-- **🔐 Connection Pooling**: Built-in connection pool management for all drivers
+PostgreSQL integration for [taskiq](https://taskiq-python.github.io/): a broker
+that delivers messages with `LISTEN`/`NOTIFY`, a result backend, and a
+persistent schedule source, all in one PostgreSQL database. It works with three
+drivers, [asyncpg](https://magicstack.github.io/asyncpg/),
+[psycopg 3](https://www.psycopg.org/psycopg3/) and
+[psqlpy](https://github.com/psqlpy-python/psqlpy), each installed as an extra.
 
 ## Installation
 
-### Basic Installation
+Install the package with the extra for the driver you use. The drivers are
+optional dependencies, so without an extra no driver is available.
 
 ```bash
-pip install taskiq-postgresql
+pip install "taskiq-postgresql[asyncpg]"
+pip install "taskiq-postgresql[psycopg]"
+pip install "taskiq-postgresql[psqlpy]"
 ```
 
-### With Driver Dependencies
+With uv: `uv add "taskiq-postgresql[asyncpg]"`.
 
-Choose your preferred PostgreSQL driver:
+## Quickstart
 
-**AsyncPG (Recommended)**
-```bash
-pip install taskiq-postgresql[asyncpg]
-```
-
-**Psycopg3**
-```bash
-pip install taskiq-postgresql[psycopg]
-```
-
-**PSQLPy**
-```bash
-pip install taskiq-postgresql[psqlpy]
-```
-
-
-
-### Using Package Managers
-
-**Poetry:**
-```bash
-poetry add taskiq-postgresql[asyncpg]
-```
-
-**UV:**
-```bash
-uv add taskiq-postgresql[asyncpg]
-```
-
-**Rye:**
-```bash
-rye add taskiq-postgresql[asyncpg]
-```
-
-> **Note**: Driver extras are required as PostgreSQL drivers are optional dependencies. Without them, the PostgreSQL drivers won't be available.
-
-## Quick Start
-
-### Basic Task Processing
-
-Start a local PostgreSQL with the repository's `docker-compose.yml` (bound to
-`127.0.0.1:5432`, trust authentication, development only):
+The connection string comes from an environment variable. There is no default
+DSN: omitting `dsn`, or passing `None` (what `os.environ.get` returns for an
+unset variable), raises `TypeError`, and an empty string is rejected at
+construction.
 
 ```bash
-docker compose up -d --wait
+export POSTGRESQL_URL="postgresql://<user>@<host>:5432/<database>"
 ```
 
-The DSN below connects to it without a password:
+Put the broker, the result backend and the scheduler source in one module, so
+the worker and the scheduler import the same objects:
 
 ```python
-import asyncio
+# app.py
+import os
+
+from taskiq import TaskiqScheduler
+
 from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
+from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 
-# Configure the result backend
+dsn = os.environ["POSTGRESQL_URL"]
+
+# "asyncpg" is the default; "psycopg" and "psqlpy" are the other drivers.
 result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres@localhost:5432/postgres",
+    dsn=dsn,
+    driver="asyncpg",
+    run_migrations=True,
 )
-
-# Configure the broker with result backend
 broker = PostgresqlBroker(
-    dsn="postgresql://postgres@localhost:5432/postgres",
+    dsn=dsn,
+    driver="asyncpg",
+    run_migrations=True,
 ).with_result_backend(result_backend)
+scheduler_source = PostgresqlSchedulerSource(
+    dsn=dsn,
+    driver="asyncpg",
+    run_migrations=True,
+)
+scheduler = TaskiqScheduler(broker=broker, sources=[scheduler_source])
 
 
 @broker.task
-async def calculate_sum(a: int, b: int) -> int:
-    """Calculate the sum of two numbers."""
-    await asyncio.sleep(1)  # Simulate some work
+async def add(a: int, b: int) -> int:
+    """Add two numbers."""
     return a + b
+```
+
+`run_migrations=True` creates the tables and indexes on startup (`CREATE ... IF
+NOT EXISTS`). It is off by default, so a deployment where the application user
+may not create tables can leave it off and create the tables itself, using the
+layout in [Database schema](#database-schema).
+
+Start a worker. Start it before anything sends tasks: the worker claims a
+message when it receives its `NOTIFY`, and a notification sent while no worker
+is listening is not replayed.
+
+```bash
+taskiq worker app:broker
+```
+
+Send a task and wait for its result:
+
+```python
+# kick.py
+import asyncio
+
+from app import add, broker
 
 
-async def main():
-    # Startup the broker
+async def main() -> None:
     await broker.startup()
-
-    # Send a task
-    task = await calculate_sum.kiq(10, 20)
-
-    # Wait for result
-    result = await task.wait_result()
-    print(f"Result: {result}")  # Result: 30
-
-    # Shutdown the broker
+    task = await add.kiq(1, 2)
+    result = await task.wait_result(timeout=10)
+    print(result.return_value)  # 3
     await broker.shutdown()
 
 
@@ -115,279 +104,234 @@ if __name__ == "__main__":
     asyncio.run(main())
 ```
 
-### Task Scheduling
+Store a schedule and run the scheduler, which sends the task whenever the
+schedule is due:
 
 ```python
-from taskiq_postgresql import PostgresqlBroker, PostgresqlSchedulerSource
-from taskiq import TaskiqScheduler
+# schedule.py
+import asyncio
 
-# Initialize broker
-broker = PostgresqlBroker(dsn="postgresql://postgres@localhost:5432/postgres")
+from taskiq import ScheduledTask
 
-# Initialize scheduler source
-scheduler_source = PostgresqlSchedulerSource(
-    dsn="postgresql://postgres@localhost:5432/postgres",
-    table_name="taskiq_schedules",
-    driver="asyncpg",
-)
-
-# Create scheduler
-scheduler = TaskiqScheduler(
-    broker=broker,
-    sources=[scheduler_source],
-)
+from app import scheduler_source
 
 
-@broker.task
-async def scheduled_task():
-    print("This task runs on schedule!")
-
-
-# Schedule task to run every minute
-async def setup_schedule():
+async def main() -> None:
+    await scheduler_source.startup()
     await scheduler_source.add_schedule(
-        schedule_id="task-every-minute",
-        task_name="scheduled_task",
-        cron="* * * * *",  # Every minute
-        args=[],
-        kwargs={},
+        ScheduledTask(
+            task_name="app:add",
+            labels={},
+            args=[1, 2],
+            kwargs={},
+            cron="* * * * *",
+        ),
     )
+    await scheduler_source.shutdown()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
 ```
+
+```bash
+taskiq scheduler app:scheduler
+```
+
+`PostgresqlSchedulerSource` is imported from
+`taskiq_postgresql.scheduler_source`; the package root exports only the broker
+and the result backend.
 
 ## Configuration
 
+Every constructor takes `dsn` as its first argument. It is a connection string
+or a callable that takes no arguments and returns one. A callable is resolved
+once, at startup, for all three components and all drivers; if it returns
+`None` or an empty string, startup fails with an error that says so.
+
 ### PostgresqlBroker
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `dsn` | `str` | Required | PostgreSQL connection string |
-| `queue_name` | `str` | `"taskiq_queue"` | Name of the queue table |
-| `field_for_task_id` | `Literal["VarChar", "Text", "Uuid"]` | `"Uuid"` | Field type for task IDs |
-| `driver` | `Literal["asyncpg", "psycopg", "psqlpy"]` | `"asyncpg"` | Database driver |
-| `**connect_kwargs` | `Any` | - | Additional driver-specific connection parameters |
+| Argument | Type | Default | Meaning |
+|---|---|---|---|
+| `dsn` | `str` or `Callable[[], str]` | required | Connection string. |
+| `result_backend` | `AsyncResultBackend` or `None` | `None` | Result backend; `.with_result_backend(...)` does the same. |
+| `task_id_generator` | `Callable[[], str]` or `None` | `None` | Custom task id factory. |
+| `field_for_task_id` | `"VarChar"`, `"Text"` or `"Uuid"` | `"Uuid"` | SQL type of the `task_id` column. |
+| `channel_name` | `str` | `"taskiq"` | `LISTEN`/`NOTIFY` channel. Use a different one per queue that shares a database. |
+| `table_name` | `str` | `"taskiq_messages"` | Table that holds pending messages. |
+| `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. `"pg8000"` is in the type annotation but raises `ValueError`. |
+| `max_retry_attempts` | `int` | `5` | Stored on the broker; the delivery code does not read it. |
+| `connection_kwargs` | `dict` or `None` | `None` | Keyword arguments for the driver's pool and for its `LISTEN` connection, so each option must be valid for both. |
+| `pool_kwargs` | `dict` or `None` | `None` | Stored on the broker; the drivers do not read it. Use `connection_kwargs`. |
+| `run_migrations` | `bool` | `False` | Create the table and index on startup. |
 
 ### PostgresqlResultBackend
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `dsn` | `str` | Required | PostgreSQL connection string |
-| `keep_results` | `bool` | `True` | Whether to keep results after reading |
-| `table_name` | `str` | `"taskiq_results"` | Name of the results table |
-| `field_for_task_id` | `Literal["VarChar", "Text", "Uuid"]` | `"Uuid"` | Field type for task IDs |
-| `serializer` | `BaseSerializer` | `PickleSerializer()` | Serializer instance |
-| `driver` | `Literal["asyncpg", "psycopg", "psqlpy"]` | `"asyncpg"` | Database driver |
-| `**connect_kwargs` | `Any` | - | Additional driver-specific connection parameters |
+| Argument | Type | Default | Meaning |
+|---|---|---|---|
+| `dsn` | `str` or `Callable[[], str]` | required | Connection string. |
+| `keep_results` | `bool` | `True` | When `False`, a result row is deleted after it is read. |
+| `table_name` | `str` | `"taskiq_results"` | Table that holds results. |
+| `field_for_task_id` | `"VarChar"`, `"Text"` or `"Uuid"` | `"Uuid"` | SQL type of the `task_id` column. |
+| `serializer` | `TaskiqSerializer` or `None` | `None` | Result serializer; `None` means `PickleSerializer()`. |
+| `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. |
+| `run_migrations` | `bool` | `False` | Create the table and index on startup. |
+| `**connect_kwargs` | `Any` | none | Keyword arguments for the driver's connection pool. |
+
+Results are deserialized with the serializer, and pickle can run code while
+loading. Anyone who can write to the results table can therefore run code in
+the process that reads it. Pass `serializer=JSONSerializer()` (from
+`taskiq.serializers`) when the table is not fully trusted.
 
 ### PostgresqlSchedulerSource
 
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `dsn` | `str` | Required | PostgreSQL connection string |
-| `table_name` | `str` | `"taskiq_schedules"` | Name of the schedules table |
-| `driver` | `Literal["asyncpg", "psycopg", "psqlpy"]` | `"asyncpg"` | Database driver |
-| `startup_schedule` | `dict` | `None` | Schedule definitions to create on startup |
-| `**connect_kwargs` | `Any` | - | Additional driver-specific connection parameters |
+| Argument | Type | Default | Meaning |
+|---|---|---|---|
+| `dsn` | `str` or `Callable[[], str]` | required | Connection string. |
+| `table_name` | `str` | `"taskiq_schedulers"` | Table that holds schedules. |
+| `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. |
+| `startup_schedule` | `dict[str, list[dict]]` or `None` | `None` | Schedules to insert on startup, keyed by task name. Each entry needs `cron` or `time` and may have `args`, `kwargs` and `cron_offset`. A task that already has a stored schedule is skipped, and so is a task the broker does not know. |
+| `broker` | `AsyncBroker` or `None` | `None` | Needed only with `startup_schedule`, to look the tasks up. |
+| `run_migrations` | `bool` | `False` | Create the table and indexes on startup. |
+| `**connect_kwargs` | `Any` | none | Keyword arguments for the driver's connection pool. |
 
-## Database Drivers
+The source implements taskiq's `ScheduleSource` (`get_schedules`,
+`add_schedule`, `delete_schedule`, `post_send`). A schedule with a `time` is
+deleted after it is sent. `schedule_id` is stored in a `UUID` column, so keep
+the generated value or pass a UUID string.
 
-### AsyncPG (Recommended)
-- **Performance**: Fastest PostgreSQL driver for Python
-- **Features**: Full asyncio support, prepared statements, connection pooling
-- **Use case**: High-performance applications
+Table names are placed in SQL as written. Use identifiers you control, never
+user input.
 
-### Psycopg3
-- **Performance**: Good performance with extensive features
-- **Features**: Full PostgreSQL feature support, mature ecosystem
-- **Use case**: Feature-rich applications needing advanced PostgreSQL features
+### Driver options
 
-### PSQLPy
-- **Performance**: Rust-based driver with excellent performance
-- **Features**: Modern async implementation
-- **Use case**: Applications prioritizing performance and modern architecture
+The keyword arguments go to the driver you chose:
 
-
-
-## Advanced Configuration
-
-### Custom Serializer
-
-```python
-from taskiq.serializers import JSONSerializer
-
-result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres@localhost:5432/postgres",
-    serializer=JSONSerializer(),
-)
-```
-
-### Custom Table Names and Field Types
-
-```python
-broker = PostgresqlBroker(
-    dsn="postgresql://postgres@localhost:5432/postgres",
-    queue_name="my_custom_queue",
-    field_for_task_id="Text",  # Use TEXT instead of UUID
-)
-
-result_backend = PostgresqlResultBackend(
-    dsn="postgresql://postgres@localhost:5432/postgres",
-    table_name="my_custom_results",
-    field_for_task_id="VarChar",  # Use VARCHAR instead of UUID
-)
-```
-
-### Connection Pool Configuration
-
-```python
-# AsyncPG
-broker = PostgresqlBroker(
-    dsn="postgresql://postgres@localhost:5432/postgres",
-    driver="asyncpg",
-    min_size=5,
-    max_size=20,
-    max_inactive_connection_lifetime=300,
-)
-
-# Psycopg3
-broker = PostgresqlBroker(
-    dsn="postgresql://postgres@localhost:5432/postgres",
-    driver="psycopg",
-    min_size=5,
-    max_size=20,
-    max_lifetime=3600,
-)
-```
-
-### Using Environment Variables
+| Driver | Pool | `LISTEN` connection |
+|---|---|---|
+| `asyncpg` | `asyncpg.create_pool` | `asyncpg.connect` |
+| `psycopg` | `psycopg_pool.AsyncConnectionPool` | `psycopg.AsyncConnection.connect` |
+| `psqlpy` | `psqlpy.ConnectionPool` | `psqlpy.ConnectionPool` |
 
 ```python
 import os
 
-# From environment
+from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
+
 dsn = os.environ["POSTGRESQL_URL"]
 
-broker = PostgresqlBroker(dsn=dsn)
+# A pool option goes to the result backend directly; the broker shares its
+# kwargs with the LISTEN connection, so give it only options both accept.
+result_backend = PostgresqlResultBackend(dsn=dsn, min_size=1, max_size=10)
+broker = PostgresqlBroker(
+    dsn=dsn,
+    connection_kwargs={"command_timeout": 30},
+).with_result_backend(result_backend)
 ```
 
-### TLS
+## TLS
 
-Verify the server certificate and host name with `sslmode=verify-full` and
-point `sslrootcert` at the CA bundle. Keep credentials out of the DSN and supply
-them from the environment or a secret store.
+To verify the server certificate and its host name, set `sslmode=verify-full`
+and point `sslrootcert` at the CA bundle. asyncpg and psycopg read both from the
+DSN:
+
+```text
+postgresql://<user>@<host>:5432/<database>?sslmode=verify-full&sslrootcert=/path/to/ca.pem
+```
+
+psqlpy takes the equivalent keyword arguments instead:
 
 ```python
+import os
+
+from psqlpy import SslMode
+
+from taskiq_postgresql import PostgresqlBroker
+
 broker = PostgresqlBroker(
-    dsn="postgresql://<user>@<host>:5432/<database>"
-    "?sslmode=verify-full&sslrootcert=<path-to-ca.pem>",
+    dsn=os.environ["POSTGRESQL_URL"],
+    driver="psqlpy",
+    connection_kwargs={
+        "ssl_mode": SslMode.VerifyFull,
+        "ca_file": "/path/to/ca.pem",
+    },
 )
 ```
 
-## Database Schema
+Keep the password out of the source and out of version control: read the DSN
+from the environment or a secret store, or pass a callable as `dsn`.
 
-The library automatically creates the necessary tables:
+## Database schema
 
-### Queue Table (default: `taskiq_queue`)
-```sql
-CREATE TABLE taskiq_queue (
-    id SERIAL PRIMARY KEY,
-    task_id UUID NOT NULL,
-    task_name VARCHAR NOT NULL,
-    message BYTEA NOT NULL,
-    labels JSONB,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-```
+With `run_migrations=True` the package creates these tables. Every column is
+`NOT NULL`, and each table also has a `created_at timestamptz DEFAULT now()`
+column.
 
-### Results Table (default: `taskiq_results`)
-```sql
-CREATE TABLE taskiq_results (
-    task_id UUID PRIMARY KEY,
-    result BYTEA,
-    is_err BOOLEAN DEFAULT FALSE,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-```
+| Table (default name) | Columns | Indexes |
+|---|---|---|
+| Broker (`taskiq_messages`) | `id SERIAL` primary key, `task_id`, `task_name VARCHAR`, `message BYTEA`, `labels JSONB` | hash on `id` |
+| Result backend (`taskiq_results`) | `task_id` primary key, `result BYTEA` | hash on `task_id` |
+| Scheduler source (`taskiq_schedulers`) | `id UUID` primary key, `task_name VARCHAR(100)`, `schedule JSONB`, `updated_at` | hash on `id` and on `task_name` |
 
-### Schedules Table (default: `taskiq_schedules`)
-```sql
-CREATE TABLE taskiq_schedules (
-    id UUID PRIMARY KEY,
-    task_name VARCHAR(100) NOT NULL,
-    schedule JSONB NOT NULL,
-    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-);
-```
+`task_id` has the type set by `field_for_task_id`. A broker message is deleted
+when a worker claims it (`DELETE ... RETURNING`), which is why only one worker
+gets each message.
 
-## Performance Tips
+## Compatibility
 
-1. **Choose the Right Driver**: AsyncPG typically offers the best performance
-2. **Connection Pooling**: Configure appropriate pool sizes for your workload
-3. **Field Types**: Use UUID for high-performance task IDs, TEXT for debugging
-4. **Indexes**: Consider adding indexes on frequently queried columns
-5. **Connection Reuse**: Keep broker connections alive during application lifetime
+- **Python and dependencies**: the supported ranges are in
+  [`pyproject.toml`](https://github.com/z22092/taskiq-postgresql/blob/main/pyproject.toml)
+  (`requires-python`, `dependencies` and the driver extras). PyPI shows the
+  Python requirement and the extras but not the version ranges.
+- **PostgreSQL**: the test suite runs on PostgreSQL 17 and 18.
+- **Drivers**: asyncpg, psycopg 3 and psqlpy, selected with the `driver`
+  argument. The tests that need a database run once per installed driver.
+
+## Upgrading from 0.4 to 0.5
+
+The full list is in the
+[changelog](https://github.com/z22092/taskiq-postgresql/blob/main/CHANGELOG.md).
+Three changes can break an existing application:
+
+- **`dsn` is required.** The old default embedded a user name and password for a
+  server on localhost and is gone. Code that relied on it, or on
+  `os.environ.get("...")` returning `None`, now gets `TypeError`. Pass the DSN
+  explicitly, as in the quickstart.
+- **Pydantic v1 and Python 3.9 are dropped.** The package needs `pydantic>=2.5`
+  and Python 3.10 or newer, and works with taskiq 0.11.7 up to 0.13.
+- **`PostgresqlBroker.startup()` raises `DatabaseConnectionError`** when the
+  `LISTEN` connection cannot start, with every driver. Handle it where you start
+  the broker (`from taskiq_postgresql.exceptions import DatabaseConnectionError`).
+
+Schedules saved by 0.4 under pydantic v1 keep working. A numeric `cron_offset`
+is converted when the schedule is loaded, and a stored row that still fails
+validation is skipped and logged, so one bad row does not empty the schedule
+source.
 
 ## Troubleshooting
 
-### Common Issues
+- `TypeError: ... missing required argument 'dsn'`: pass a connection string, and
+  check the environment variable it comes from is set.
+- `relation "..." does not exist`: the tables are missing. Start once with
+  `run_migrations=True`, or create them with the layout above.
+- `ImportError: ... is not installed`: install the extra for the driver you
+  selected, for example `pip install "taskiq-postgresql[psycopg]"`.
+- `DatabaseConnectionError` on startup: the DSN, the network path or TLS
+  settings are wrong; the message carries the driver's own error.
+- A task is sent but no worker runs it: start the worker before the sender, and
+  use the same `channel_name` on both sides.
 
-**Connection Errors**
-```python
-# Ensure your connection string is correct
-dsn = os.environ["POSTGRESQL_URL"]  # postgresql://user@host:port/database
+## Contributing and security
 
-# Check PostgreSQL is running and accessible
-import asyncpg
-
-conn = await asyncpg.connect(dsn)
-await conn.close()
-```
-
-**Table Creation Issues**
-```python
-# Ensure user has CREATE TABLE permissions
-# Or manually create tables using provided schemas
-```
-
-**Driver Import Errors**
-```bash
-# Install the appropriate driver extra
-pip install taskiq-postgresql[asyncpg]
-```
-
-## Requirements
-
-- **Python, TaskIQ and driver versions**: supported ranges are declared in
-  [`pyproject.toml`](https://github.com/z22092/taskiq-postgresql/blob/main/pyproject.toml)
-  (`requires-python`, `dependencies` and the driver extras). PyPI shows the
-  Python requirement and the extras, but not the dependency ranges.
-- **PostgreSQL**: 10+
-
-Each driver is an optional extra: `[asyncpg]`, `[psycopg]` or `[psqlpy]`.
-
-## Development
-
-Setup, tests, linting, the dependency policy and the release process are in
+Setup, tests, the dependency policy and the release process are in
 [CONTRIBUTING.md](https://github.com/z22092/taskiq-postgresql/blob/main/.github/CONTRIBUTING.md).
-
-## Contributing
-
-Contributions are welcome! Please:
-
-1. Fork the repository
-2. Create a feature branch
-3. Add tests for new functionality
-4. Ensure all tests pass
-5. Submit a pull request
+Changes are listed in
+[CHANGELOG.md](https://github.com/z22092/taskiq-postgresql/blob/main/CHANGELOG.md).
+Report vulnerabilities as described in
+[SECURITY.md](https://github.com/z22092/taskiq-postgresql/blob/main/SECURITY.md),
+not in a public issue.
 
 ## License
 
-This project is licensed under the MIT License. See the LICENSE file for details.
-
-## Links
-
-- **[TaskIQ Documentation](https://taskiq-python.github.io/)** - Main TaskIQ framework
-- **[AsyncPG Documentation](https://magicstack.github.io/asyncpg/)** - AsyncPG driver docs
-- **[Psycopg Documentation](https://www.psycopg.org/psycopg3/)** - Psycopg3 driver docs
-- **[PostgreSQL Documentation](https://www.postgresql.org/docs/)** - PostgreSQL database docs
-- **[GitHub Repository](https://github.com/z22092/taskiq-postgresql)** - Source code and issues
+MIT. See
+[LICENSE](https://github.com/z22092/taskiq-postgresql/blob/main/LICENSE).
