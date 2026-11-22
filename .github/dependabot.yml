@@ -39,13 +39,14 @@ updates:
     cooldown:
       default-days: 14
     open-pull-requests-limit: 5
-    # Dependabot parsed the commit tagged "varcon-core-v5.0.7", a sibling crate
-    # of the same repository, as typos 5.0.7. Real typos releases are still
-    # below 5, so a genuine 2.x-4.x release must keep being proposed. The
+    # The typos repository also tags its sibling crates, and Dependabot reads
+    # "varcon-core-v4.0.10" as typos 4.0.10 (a 2024 commit, older than
+    # v1.52.0). varcon-core has tags from 2.0.0 upwards, so any typos version
+    # at 2 or above is ambiguous; a real typos 2.x is bumped by hand. The
     # dependency name is the repository URL.
     ignore:
       - dependency-name: "https://github.com/crate-ci/typos"
-        versions: [">=5"]
+        versions: [">=2"]
     groups:
       pre-commit-hooks:
         patterns:
