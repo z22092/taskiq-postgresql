@@ -71,16 +71,13 @@ async def add(a: int, b: int) -> int:
 ```
 
 `run_migrations=True` creates the tables and indexes on startup (`CREATE ... IF
-NOT EXISTS`). It is off by default, so a deployment where the application user
-may not create tables can leave it off and create the tables itself, using the
-layout in [Database schema](#database-schema).
-
-Processes that start at the same time can race on that first `CREATE TABLE`:
-PostgreSQL may reject one of them with `duplicate key value violates unique
-constraint "pg_type_typname_nsp_index"`, and `taskiq worker` starts two
-processes by default. Create the tables before the first start, or let one
-process (for example `taskiq worker --workers 1 app:broker`) start once before
-the others.
+NOT EXISTS`). Processes that start at the same time, such as the two that
+`taskiq worker` starts by default, take a PostgreSQL advisory lock first, so
+they create the tables one after the other. Once the tables and indexes exist,
+startup only checks for them, so the application's role needs no `CREATE`
+privilege from then on. `run_migrations` is off by default; you can leave it
+off and create the tables yourself, using the layout in
+[Database schema](#database-schema).
 
 Start a worker. Start it before anything sends tasks: the worker claims a
 message when it receives its `NOTIFY`, and a notification sent while no worker
