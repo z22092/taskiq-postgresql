@@ -63,7 +63,7 @@ repos:
           - 'checksum: "[0-9a-f]{64}"'
 
   - repo: https://github.com/crate-ci/typos
-    rev: 4c8b7f51ca60df14e3c5ca82770dfbbe6c3dae85 # frozen: v1.52.0
+    rev: 7dbdf8c01c6304e84f7549ec6753946dd2b1af45 # frozen: varcon-core-v4.0.10
     hooks:
       - id: typos
         # Report only. The upstream args include --write-changes.
