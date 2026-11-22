@@ -50,6 +50,11 @@ Upgrading from 0.4.x:
 
 - A callable `dsn` works with `PostgresqlResultBackend` and
   `PostgresqlSchedulerSource`; it used to reach the driver uncalled.
+- `PostgresqlBroker.kick()` accepts a fractional `delay` label, such as the
+  ones `SmartRetryMiddleware` and `@broker.task(delay=2.5)` send; it used to
+  raise `ValueError` after storing the message, which was then never
+  delivered. A `delay` that is not a finite number of seconds still raises
+  `ValueError`, now before anything is stored.
 
 ### Removed
 
