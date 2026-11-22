@@ -53,8 +53,17 @@ Upgrading from 0.4.x:
 
 ### Fixed
 
+- A schedule stored with a `timedelta` `cron_offset` loads back as a
+  `timedelta` on taskiq older than 0.13 too. It used to come back as its ISO
+  8601 string (`"PT1H"`), which the scheduler took for a time zone name and
+  failed on.
 - A callable `dsn` works with `PostgresqlResultBackend` and
   `PostgresqlSchedulerSource`; it used to reach the driver uncalled.
+- `PostgresqlBroker.kick()` accepts a fractional `delay` label, such as the
+  ones `SmartRetryMiddleware` and `@broker.task(delay=2.5)` send; it used to
+  raise `ValueError` after storing the message, which was then never
+  delivered. A `delay` that is not a finite number of seconds still raises
+  `ValueError`, now before anything is stored.
 - Concurrent first startups with `run_migrations=True`, such as the two
   processes `taskiq worker` starts by default, no longer fail with
   `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`.
