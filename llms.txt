@@ -1,19 +1,10 @@
 # taskiq-postgresql
 
-> PostgreSQL integration for taskiq: a broker that delivers messages with LISTEN/NOTIFY, a result backend and a persistent schedule source, all in one PostgreSQL database. Python 3.10 or newer; drivers asyncpg, psycopg 3 and psqlpy, each an optional extra.
-
-Notes for people and tools that use this package:
-
-- Install with the extra for one driver, for example `pip install "taskiq-postgresql[asyncpg]"`, and select it with the `driver` argument (`"asyncpg"` by default, `"psycopg"` or `"psqlpy"`).
-- `dsn` is the first argument of `PostgresqlBroker`, `PostgresqlResultBackend` and `PostgresqlSchedulerSource`. It is required, there is no default, and it is a connection string or a callable that returns one.
-- The tables are created on startup only with `run_migrations=True`; it is `False` by default.
-- `PostgresqlBroker` and `PostgresqlResultBackend` are exported from `taskiq_postgresql`. `PostgresqlSchedulerSource` is imported from `taskiq_postgresql.scheduler_source`.
-- A broker message is claimed when a worker receives its NOTIFY, so start workers before the code that sends tasks.
-- The test suite runs on PostgreSQL 17 and 18. Supported Python, taskiq and driver versions are the ranges in `pyproject.toml`.
+> PostgreSQL integration for taskiq: a broker that delivers messages with LISTEN/NOTIFY, a result backend and a persistent schedule source, all in one PostgreSQL database.
 
 ## Docs
 
-- [README](https://github.com/z22092/taskiq-postgresql/blob/main/README.md): installation, quickstart, configuration reference, TLS, database schema, upgrading from 0.4 to 0.5
+- [README](https://github.com/z22092/taskiq-postgresql/blob/main/README.md): installation, quickstart, configuration reference, TLS, database schema, upgrading
 - [CONTRIBUTING](https://github.com/z22092/taskiq-postgresql/blob/main/.github/CONTRIBUTING.md): development setup, tests, dependency policy, changelog conventions, release process
 - [CHANGELOG](https://github.com/z22092/taskiq-postgresql/blob/main/CHANGELOG.md): notable changes per release
 - [SECURITY](https://github.com/z22092/taskiq-postgresql/blob/main/SECURITY.md): how to report a vulnerability

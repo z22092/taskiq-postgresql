@@ -375,7 +375,9 @@ Use the feature request template and include:
 ```
 tests/
 ├── conftest.py                 # Fixtures: postgresql_dsn, drivers, teardown
-├── test_readme_examples.py     # Runs the README's Python examples
+├── helpers.py                  # Shared helpers: teardown, scratch databases, DSN and port utilities
+├── test_dsn.py                 # DSN validation tests
+├── test_readme_examples.py     # Runs the README's examples and checks its tables
 ├── test_broker.py              # Broker functionality tests
 ├── test_result_backend.py      # Result backend tests
 └── test_scheduler_source.py    # Scheduler tests
