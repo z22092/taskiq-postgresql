@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import secrets
 from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
 from urllib.parse import urlsplit
@@ -37,6 +40,28 @@ SMALLEST_POOL = {
     "psycopg": {"min_size": 1, "max_size": 1},
     "psqlpy": {"max_db_pool_size": 2},
 }
+
+SCRAM_ITERATIONS = 4096
+
+
+def scram_verifier(password: str) -> str:
+    """
+    Return the SCRAM-SHA-256 verifier PostgreSQL stores for ``password``.
+
+    ``CREATE ROLE`` gets the verifier instead of the password, so the password
+    never reaches the server log, which records DDL text under
+    ``log_statement = 'ddl'`` and the text of a failed statement.
+    """
+    salt = secrets.token_bytes(16)
+    salted = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, SCRAM_ITERATIONS)
+    client_key = hmac.digest(salted, b"Client Key", "sha256")
+    server_key = hmac.digest(salted, b"Server Key", "sha256")
+    stored_key = hashlib.sha256(client_key).digest()
+    encoded = [
+        base64.b64encode(part).decode() for part in (salt, stored_key, server_key)
+    ]
+    return f"SCRAM-SHA-256${SCRAM_ITERATIONS}:{encoded[0]}${encoded[1]}:{encoded[2]}"
+
 
 # Keeps eight components per round well under the server's connection limit.
 SMALL_POOL = {
@@ -239,7 +264,9 @@ async def test_startup_needs_no_ddl_privilege_once_the_tables_exist(
         "WHERE oid = to_regclass($1)",
         postgres_table,
     )
-    await admin.execute(f"CREATE ROLE {role} LOGIN PASSWORD '{password}'")
+    await admin.execute(
+        f"CREATE ROLE {role} LOGIN PASSWORD '{scram_verifier(password)}'",
+    )
     try:
         await admin.execute(f"GRANT USAGE ON SCHEMA {schema} TO {role}")
         await admin.execute(
