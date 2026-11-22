@@ -99,19 +99,6 @@ class AsyncpgDriver(QueryDriver):
     ) -> None:
         """Exit the context manager."""
 
-    async def create_table(self) -> str:
-        """Create a table."""
-        async with self, self.connection() as connection:
-            return await connection.execute(self.create_table_query.make_query())
-
-    async def create_index(self) -> None:
-        """Create an index."""
-        if self.index_columns is not None:
-            async with self, self.connection() as connection:
-                await connection.execute(
-                    self.create_index_query.make_query(self.index_columns),
-                )
-
     async def insert(
         self,
         columns: Sequence[Column],
@@ -210,14 +197,27 @@ class AsyncpgDriver(QueryDriver):
             )
 
     async def on_startup(self) -> None:
-        """On startup."""
+        """Create the table and its indexes, see ``QueryDriver.on_startup``."""
         if self.run_migrations:
-            async with self, self.connection() as connection:
-                transaction = connection.transaction()
-                await transaction.start()
-                await self.create_table()
-                await self.create_index()
-                await transaction.commit()
+            async with (
+                self,
+                self.connection() as connection,
+                connection.transaction(),
+            ):
+                if await connection.fetchval(
+                    self.relations_exist_query.make_query(self.index_columns),
+                    *self.relations_exist_query.relation_names(self.index_columns),
+                ):
+                    return
+                await connection.execute(
+                    self.migration_lock_query.make_query(),
+                    *self.migration_lock_query.params(),
+                )
+                await connection.execute(self.create_table_query.make_query())
+                if self.index_columns is not None:
+                    await connection.execute(
+                        self.create_index_query.make_query(self.index_columns),
+                    )
 
     async def on_shutdown(self) -> None:
         """On shutdown."""
