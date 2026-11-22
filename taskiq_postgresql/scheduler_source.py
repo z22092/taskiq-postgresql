@@ -1,7 +1,11 @@
+import json
 from dataclasses import dataclass
-from typing import Any, Callable, Final, Literal, Optional, Union
+from datetime import timedelta
+from logging import getLogger
+from typing import Any, Final, Literal, Optional, Union
 from uuid import uuid4
 
+from pydantic import ValidationError
 from taskiq import ScheduledTask, ScheduleSource
 from taskiq.abc.broker import AsyncBroker
 
@@ -11,9 +15,34 @@ from taskiq_postgresql.abc.query import (
     PrimaryKeyColumn,
     UpdatedAtColumn,
 )
-from taskiq_postgresql.utils import get_db_driver, require_dsn
+from taskiq_postgresql.utils import (
+    Dsn,
+    dsn_before_startup,
+    get_db_driver,
+    require_dsn,
+    resolve_dsn,
+)
 
 __all__ = ["PostgresqlSchedulerSource"]
+
+logger = getLogger(__name__)
+
+
+def _load_schedule(stored: Union[str, bytes, dict[str, Any]]) -> ScheduledTask:
+    """
+    Validate a stored schedule, accepting the 0.4.x pydantic v1 form.
+
+    Raises:
+        ValidationError: if the row is not a valid ``ScheduledTask``.
+    """
+    data = json.loads(stored) if isinstance(stored, (str, bytes)) else dict(stored)
+    offset = data.get("cron_offset")
+    # pydantic v1 wrote a timedelta as its total seconds. taskiq 0.13 reads a
+    # number as a time zone name and rejects it, and a number can only have
+    # come from a timedelta, so it is read back as one.
+    if isinstance(offset, (int, float)) and not isinstance(offset, bool):
+        data["cron_offset"] = timedelta(seconds=offset)
+    return ScheduledTask.model_validate(data)
 
 
 @dataclass
@@ -41,16 +70,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
 
     def __init__(
         self,
-        # Defaults to None only so a missing DSN fails with an example of the
-        # expected value; it stays first so positional callers keep working.
-        dsn: Union[
-            str,
-            Callable[
-                [],
-                str,
-            ],
-            None,
-        ] = None,
+        dsn: Dsn,
         table_name: str = "taskiq_schedulers",
         driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
         startup_schedule: Optional[dict[str, list[dict[str, Any]]]] = None,
@@ -66,8 +86,9 @@ class PostgresqlSchedulerSource(ScheduleSource):
         retrieval of scheduled tasks across application restarts.
 
         Args:
-            dsn: PostgreSQL connection string, or a callable returning one.
-                Required. Format: "postgres://user@host:port/database"
+            dsn: PostgreSQL connection string, or a callable returning one. A
+                callable is resolved once, by startup(). Format:
+                "postgres://user@host:port/database"
             table_name: Name of the table to store scheduled tasks. Will be created
                 automatically if it doesn't exist. Defaults to "taskiq_schedulers".
             driver: Database driver to use for connections. Currently only "asyncpg"
@@ -103,17 +124,17 @@ class PostgresqlSchedulerSource(ScheduleSource):
             during the startup() method call.
 
         Raises:
-            TypeError: if ``dsn`` is missing or ``None``.
+            TypeError: if ``dsn`` is ``None``, empty or blank.
         """
         dsn = require_dsn(dsn, type(self).__name__)
-        self._dsn: Final = dsn
+        self._dsn: Final[Dsn] = dsn
         self.table_name: Final = table_name
         self.connect_kwargs: Final = connect_kwargs
         self.columns = Table()
         self.startup_schedule = startup_schedule
         self.broker = broker
         self.driver = get_db_driver(driver)(
-            dsn,
+            dsn_before_startup(dsn),
             table_name,
             columns=[
                 self.columns.task_name,
@@ -130,21 +151,22 @@ class PostgresqlSchedulerSource(ScheduleSource):
     @property
     def dsn(self) -> str:
         """
-        Get the DSN string.
+        Get the DSN string, calling the DSN callable if one was given.
 
-        Returns the DSN string or None if not set.
+        Raises:
+            TypeError: if the DSN callable returns ``None`` or an empty string.
         """
-        if callable(self._dsn):
-            return self._dsn()
-        return self._dsn
+        return resolve_dsn(self._dsn, type(self).__name__)
 
     async def startup(self) -> None:
         """
         Create the table and index for the schedules.
 
         Raises:
+            TypeError: if the DSN callable returns ``None`` or an empty string.
             DatabaseConnectionError: if the connection to the database fails.
         """
+        self.driver.connection_string = self.dsn
         await self.driver.on_startup()
 
         if self.startup_schedule is not None and self.broker is not None:
@@ -183,17 +205,31 @@ class PostgresqlSchedulerSource(ScheduleSource):
         await self.driver.on_shutdown()
 
     async def get_schedules(self) -> list[ScheduledTask]:
-        """Get the schedules from the database."""
+        """
+        Get the schedules from the database.
+
+        A row that is not a valid ``ScheduledTask`` is logged and skipped, so
+        one bad row does not stop every other schedule.
+        """
         schedule_rows = await self.driver.select(
-            [self.columns.schedule],
+            [self.columns.primary_key, self.columns.schedule],
         )
 
-        return [
-            ScheduledTask.model_validate_json(schedule_row["schedule"])
-            if isinstance(schedule_row["schedule"], str)
-            else ScheduledTask(**schedule_row["schedule"])
-            for schedule_row in schedule_rows
-        ]
+        schedules: list[ScheduledTask] = []
+        for schedule_row in schedule_rows:
+            try:
+                schedules.append(
+                    _load_schedule(schedule_row[self.columns.schedule.name]),
+                )
+            except ValidationError as error:
+                # Without the input: schedule arguments can hold user data.
+                logger.warning(
+                    "Skipping schedule %s in table %s: not a valid ScheduledTask: %s",
+                    schedule_row[self.columns.primary_key.name],
+                    self.table_name,
+                    error.errors(include_url=False, include_input=False),
+                )
+        return schedules
 
     async def add_schedule(self, schedule: ScheduledTask) -> None:
         """Add a schedule to the database."""

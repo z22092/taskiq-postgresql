@@ -1,5 +1,8 @@
+import json
+import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -388,3 +391,71 @@ async def test_connection_failures(connection_failure_dsn: str) -> None:
 
     with pytest.raises(DatabaseConnectionError):
         await scheduler.startup()
+
+
+async def insert_raw_schedule(
+    scheduler: PostgresqlSchedulerSource,
+    schedule_id: str,
+    schedule: dict[str, Any],
+) -> None:
+    """Store ``schedule`` as JSON exactly as given, bypassing validation."""
+    await scheduler.driver.insert(
+        [
+            scheduler.columns.primary_key,
+            scheduler.columns.task_name,
+            scheduler.columns.schedule,
+        ],
+        [schedule_id, schedule["task_name"], json.dumps(schedule)],
+    )
+
+
+async def test_when_a_row_has_a_numeric_cron_offset__then_it_loads_as_seconds(
+    scheduler_source: PostgresqlSchedulerSource,
+    sample_scheduled_task: ScheduledTask,
+) -> None:
+    """Rows written under pydantic v1 hold a timedelta offset as seconds."""
+    legacy = sample_scheduled_task.model_dump(mode="json")
+    legacy["cron_offset"] = 3600.0
+    await insert_raw_schedule(
+        scheduler_source,
+        sample_scheduled_task.schedule_id,
+        legacy,
+    )
+
+    schedules = await scheduler_source.get_schedules()
+
+    assert len(schedules) == 1
+    assert schedules[0].schedule_id == sample_scheduled_task.schedule_id
+    assert schedules[0].cron_offset == timedelta(hours=1)
+
+
+async def test_when_a_row_does_not_validate__then_only_that_row_is_skipped(
+    scheduler_source: PostgresqlSchedulerSource,
+    sample_scheduled_task: ScheduledTask,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """One bad row must not hide every other schedule."""
+    broken_id = uuid.uuid4().hex
+    # No cron, time or interval: no taskiq version accepts it.
+    broken = {
+        "task_name": "broken_task",
+        "labels": {},
+        "args": [],
+        "kwargs": {},
+        "schedule_id": broken_id,
+    }
+    await insert_raw_schedule(scheduler_source, broken_id, broken)
+    await scheduler_source.add_schedule(sample_scheduled_task)
+
+    with caplog.at_level(logging.WARNING):
+        schedules = await scheduler_source.get_schedules()
+
+    assert [schedule.schedule_id for schedule in schedules] == [
+        sample_scheduled_task.schedule_id,
+    ]
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+    ]
+    assert any(str(uuid.UUID(broken_id)) in message for message in warnings), warnings
