@@ -160,9 +160,9 @@ once, at startup, for all three components and all drivers; if it returns
 | `channel_name` | `str` | `"taskiq"` | `LISTEN`/`NOTIFY` channel. Use a different one per queue that shares a database. |
 | `table_name` | `str` | `"taskiq_messages"` | Table that holds pending messages. |
 | `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. `"pg8000"` is in the type annotation but raises `ValueError`. |
-| `max_retry_attempts` | `int` | `5` | Stored on the broker; the delivery code does not read it. |
+| `max_retry_attempts` | `int` | `5` | Accepted for compatibility, currently unused. |
 | `connection_kwargs` | `dict` or `None` | `None` | Keyword arguments for the driver's pool and for its `LISTEN` connection, so each option must be valid for both. |
-| `pool_kwargs` | `dict` or `None` | `None` | Stored on the broker; the drivers do not read it. Use `connection_kwargs`. |
+| `pool_kwargs` | `dict` or `None` | `None` | Accepted for compatibility, currently unused. Use `connection_kwargs`. |
 | `run_migrations` | `bool` | `False` | Create the table and index on startup. |
 
 ### PostgresqlResultBackend
@@ -173,15 +173,20 @@ once, at startup, for all three components and all drivers; if it returns
 | `keep_results` | `bool` | `True` | When `False`, a result row is deleted after it is read. |
 | `table_name` | `str` | `"taskiq_results"` | Table that holds results. |
 | `field_for_task_id` | `"VarChar"`, `"Text"` or `"Uuid"` | `"Uuid"` | SQL type of the `task_id` column. |
-| `serializer` | `TaskiqSerializer` or `None` | `None` | Result serializer; `None` means `PickleSerializer()`. |
+| `serializer` | `TaskiqSerializer` or `None` | `None` | Result serializer; `None` means `PickleSerializer()`; see the note below before changing it. |
 | `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. |
 | `run_migrations` | `bool` | `False` | Create the table and index on startup. |
 | `**connect_kwargs` | `Any` | none | Keyword arguments for the driver's connection pool. |
 
-Results are deserialized with the serializer, and pickle can run code while
-loading. Anyone who can write to the results table can therefore run code in
-the process that reads it. Pass `serializer=JSONSerializer()` (from
-`taskiq.serializers`) when the table is not fully trusted.
+Results are stored with pickle, and unpickling can run code. Treat the results
+table as trusted data that only your own workers write: anyone who can write to
+it can run code in the process that reads a result. Restrict database access
+accordingly, for example with a role that only the workers use to write the
+results table.
+
+Leave `serializer` unset. A result is a `TaskiqResult` object, and taskiq's
+`JSONSerializer` and `MSGPackSerializer` raise `TypeError` when asked to store
+one, so they cannot replace pickle here.
 
 ### PostgresqlSchedulerSource
 
@@ -231,31 +236,69 @@ broker = PostgresqlBroker(
 
 ## TLS
 
-To verify the server certificate and its host name, set `sslmode=verify-full`
-and point `sslrootcert` at the CA bundle. asyncpg and psycopg read both from the
-DSN:
+The broker, the result backend and the scheduler source each open their own
+connections, so give all three the same TLS settings. To verify the server
+certificate and its host name, each driver takes its own options:
+
+- **asyncpg**: the `ssl` keyword argument, here an `ssl.SSLContext` that trusts
+  your CA and checks the host name (the default of `create_default_context`).
+- **psycopg**: `sslmode=verify-full` and `sslrootcert` in the DSN. They are
+  libpq parameters, so the same DSN serves all three components.
+- **psqlpy**: the `ssl_mode` and `ca_file` keyword arguments.
+
+The broker takes keyword arguments in `connection_kwargs`; the result backend
+and the scheduler source take them directly.
+
+```python
+import os
+import ssl
+
+from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
+from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
+
+dsn = os.environ["POSTGRESQL_URL"]
+tls = {"ssl": ssl.create_default_context(cafile="/path/to/ca.pem")}
+
+broker = PostgresqlBroker(dsn=dsn, driver="asyncpg", connection_kwargs=tls)
+result_backend = PostgresqlResultBackend(dsn=dsn, driver="asyncpg", **tls)
+scheduler_source = PostgresqlSchedulerSource(dsn=dsn, driver="asyncpg", **tls)
+```
+
+For psycopg the options live in the DSN, so nothing else changes:
 
 ```text
 postgresql://<user>@<host>:5432/<database>?sslmode=verify-full&sslrootcert=/path/to/ca.pem
 ```
 
-psqlpy takes the equivalent keyword arguments instead:
+```python
+import os
+
+from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
+from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
+
+dsn = os.environ["POSTGRESQL_URL"]  # the DSN above
+
+broker = PostgresqlBroker(dsn=dsn, driver="psycopg")
+result_backend = PostgresqlResultBackend(dsn=dsn, driver="psycopg")
+scheduler_source = PostgresqlSchedulerSource(dsn=dsn, driver="psycopg")
+```
+
+For psqlpy:
 
 ```python
 import os
 
 from psqlpy import SslMode
 
-from taskiq_postgresql import PostgresqlBroker
+from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
+from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 
-broker = PostgresqlBroker(
-    dsn=os.environ["POSTGRESQL_URL"],
-    driver="psqlpy",
-    connection_kwargs={
-        "ssl_mode": SslMode.VerifyFull,
-        "ca_file": "/path/to/ca.pem",
-    },
-)
+dsn = os.environ["POSTGRESQL_URL"]
+tls = {"ssl_mode": SslMode.VerifyFull, "ca_file": "/path/to/ca.pem"}
+
+broker = PostgresqlBroker(dsn=dsn, driver="psqlpy", connection_kwargs=tls)
+result_backend = PostgresqlResultBackend(dsn=dsn, driver="psqlpy", **tls)
+scheduler_source = PostgresqlSchedulerSource(dsn=dsn, driver="psqlpy", **tls)
 ```
 
 Keep the password out of the source and out of version control: read the DSN
@@ -263,55 +306,81 @@ from the environment or a secret store, or pass a callable as `dsn`.
 
 ## Database schema
 
-With `run_migrations=True` the package creates these tables. Every column is
-`NOT NULL`, and each table also has a `created_at timestamptz DEFAULT now()`
-column.
+With `run_migrations=True` the package runs this SQL, shown with the default
+table names and `field_for_task_id="Uuid"`. A test builds the same statements
+from the code and compares them with these blocks. To create the tables
+yourself, run them with your own names.
 
-| Table (default name) | Columns | Indexes |
-|---|---|---|
-| Broker (`taskiq_messages`) | `id SERIAL` primary key, `task_id`, `task_name VARCHAR`, `message BYTEA`, `labels JSONB` | hash on `id` |
-| Result backend (`taskiq_results`) | `task_id` primary key, `result BYTEA` | hash on `task_id` |
-| Scheduler source (`taskiq_schedulers`) | `id UUID` primary key, `task_name VARCHAR(100)`, `schedule JSONB`, `updated_at` | hash on `id` and on `task_name` |
+The broker (`taskiq_messages`):
 
-`task_id` has the type set by `field_for_task_id`. A broker message is deleted
+```sql
+CREATE TABLE IF NOT EXISTS taskiq_messages (
+    id SERIAL NOT NULL PRIMARY KEY,
+    task_id Uuid NOT NULL,
+    task_name VARCHAR NOT NULL,
+    message BYTEA NOT NULL,
+    labels JSONB NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS taskiq_messages_id_idx ON taskiq_messages USING HASH (id);
+```
+
+The result backend (`taskiq_results`):
+
+```sql
+CREATE TABLE IF NOT EXISTS taskiq_results (
+    task_id Uuid NOT NULL PRIMARY KEY,
+    result BYTEA NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS taskiq_results_task_id_idx ON taskiq_results USING HASH (task_id);
+```
+
+The scheduler source (`taskiq_schedulers`):
+
+```sql
+CREATE TABLE IF NOT EXISTS taskiq_schedulers (
+    id UUID NOT NULL PRIMARY KEY,
+    task_name VARCHAR(100) NOT NULL,
+    schedule JSONB NOT NULL,
+    updated_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS taskiq_schedulers_id_idx ON taskiq_schedulers USING HASH (id);
+CREATE INDEX IF NOT EXISTS taskiq_schedulers_task_name_idx ON taskiq_schedulers USING HASH (task_name);
+```
+
+`task_id` has the type set by `field_for_task_id` (`VarChar`, `Text` or
+`Uuid`). A broker message is deleted
 when a worker claims it (`DELETE ... RETURNING`), which is why only one worker
 gets each message.
 
 ## Compatibility
 
-- **Python and dependencies**: the supported ranges are in
-  [`pyproject.toml`](https://github.com/z22092/taskiq-postgresql/blob/main/pyproject.toml)
-  (`requires-python`, `dependencies` and the driver extras). PyPI shows the
-  Python requirement and the extras but not the version ranges.
+- **Python and dependencies**: the supported Python versions are the
+  `requires-python` field of
+  [`pyproject.toml`](https://github.com/z22092/taskiq-postgresql/blob/main/pyproject.toml);
+  its `dependencies` and driver extras hold the supported ranges of taskiq,
+  pydantic and the drivers.
 - **PostgreSQL**: the test suite runs on PostgreSQL 17 and 18.
 - **Drivers**: asyncpg, psycopg 3 and psqlpy, selected with the `driver`
   argument. The tests that need a database run once per installed driver.
 
-## Upgrading from 0.4 to 0.5
+## Upgrading
 
-The full list is in the
+Coming from 0.4.x? Follow "Upgrading from 0.4.x" in the
 [changelog](https://github.com/z22092/taskiq-postgresql/blob/main/CHANGELOG.md).
-Three changes can break an existing application:
-
-- **`dsn` is required.** The old default embedded a user name and password for a
-  server on localhost and is gone. Code that relied on it, or on
-  `os.environ.get("...")` returning `None`, now gets `TypeError`. Pass the DSN
-  explicitly, as in the quickstart.
-- **Pydantic v1 and Python 3.9 are dropped.** The package needs `pydantic>=2.5`
-  and Python 3.10 or newer, and works with taskiq 0.11.7 up to 0.13.
-- **`PostgresqlBroker.startup()` raises `DatabaseConnectionError`** when the
-  `LISTEN` connection cannot start, with every driver. Handle it where you start
-  the broker (`from taskiq_postgresql.exceptions import DatabaseConnectionError`).
-
-Schedules saved by 0.4 under pydantic v1 keep working. A numeric `cron_offset`
-is converted when the schedule is loaded, and a stored row that still fails
-validation is skipped and logged, so one bad row does not empty the schedule
-source.
+It is the only upgrade guide.
 
 ## Troubleshooting
 
-- `TypeError: ... missing required argument 'dsn'`: pass a connection string, and
-  check the environment variable it comes from is set.
+- `TypeError: PostgresqlBroker.__init__() missing 1 required positional argument:
+  'dsn'` (or the same for `PostgresqlResultBackend` or
+  `PostgresqlSchedulerSource`): pass a connection string.
+- `TypeError: PostgresqlBroker needs a non-empty PostgreSQL connection string for
+  'dsn', but got None.`: the value you passed is `None` or empty, usually an
+  environment variable that is not set. For an empty string the message says
+  `got ''`.
 - `relation "..." does not exist`: the tables are missing. Start once with
   `run_migrations=True`, or create them with the layout above.
 - `ImportError: ... is not installed`: install the extra for the driver you
