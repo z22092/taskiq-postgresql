@@ -1,5 +1,5 @@
 from abc import ABC, abstractmethod
-from typing import Any, Literal, Optional, Sequence
+from typing import Any, Final, Literal, Optional, Sequence
 
 
 class QueryBase(ABC):
@@ -64,6 +64,11 @@ class CreateTableQuery(QueryBase):
         )
 
 
+def index_name(table_name: str, column: Column) -> str:
+    """Return the name of the index ``CreateIndexQuery`` creates on ``column``."""
+    return f"{table_name}_{column.name}_idx"
+
+
 class CreateIndexQuery(QueryBase):
     """Query to create an index."""
 
@@ -75,9 +80,46 @@ class CreateIndexQuery(QueryBase):
         """Return the query as a string."""
         return "\n".join(
             "CREATE INDEX IF NOT EXISTS "
-            f"{self.table_name}_{column.name}_idx "
+            f"{index_name(self.table_name, column)} "
             f"ON {self.table_name} USING HASH ({column.name});"
             for column in columns
+        )
+
+
+# The lock key is a contract between releases: every release takes
+# pg_advisory_xact_lock(hashtext('taskiq_postgresql'), hashtext(<table name as
+# configured>)), so two releases running side by side, as in a rolling deploy,
+# still serialize their migrations. Changing the SQL or the namespace breaks it.
+MIGRATION_LOCK_NAMESPACE: Final = "taskiq_postgresql"
+
+
+class MigrationLockQuery(QueryBase):
+    """Query taking the transaction lock that serializes migrations of a table."""
+
+    def make_query(self) -> str:
+        """Return the query as a string."""
+        return "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))"
+
+    def params(self) -> tuple[str, str]:
+        """Return the lock key arguments, in the order of the query."""
+        return (MIGRATION_LOCK_NAMESPACE, self.table_name)
+
+
+class RelationsExistQuery(QueryBase):
+    """Query telling whether a table and every index it gets all exist."""
+
+    def relation_names(self, index_columns: Optional[Sequence[Column]]) -> list[str]:
+        """Return the table name, then the name of each index on it."""
+        return [
+            self.table_name,
+            *(index_name(self.table_name, column) for column in index_columns or ()),
+        ]
+
+    def make_query(self, index_columns: Optional[Sequence[Column]]) -> str:
+        """Return the query as a string, one parameter per relation name."""
+        return "SELECT " + " AND ".join(
+            f"to_regclass(${position}) IS NOT NULL"
+            for position in range(1, len(self.relation_names(index_columns)) + 1)
         )
 
 

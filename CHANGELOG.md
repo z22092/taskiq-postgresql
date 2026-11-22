@@ -45,11 +45,37 @@ Upgrading from 0.4.x:
   connection cannot start, for every driver (asyncpg, psqlpy and psycopg).
 - The drivers pair query columns and values with `zip(..., strict=True)`, so a
   count mismatch raises `ValueError` instead of silently dropping values.
+- With `run_migrations=True`, `startup()` runs no DDL and takes no lock when the
+  table and every index it creates already exist. A role with `USAGE` on the
+  schema, `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables and `USAGE`
+  on the broker's sequence can now start with it; every start used to need
+  `CREATE` on the schema and ownership of the table.
 
 ### Fixed
 
+- A schedule stored with a `timedelta` `cron_offset` loads back as a
+  `timedelta` on taskiq older than 0.13 too. It used to come back as its ISO
+  8601 string (`"PT1H"`), which the scheduler took for a time zone name and
+  failed on.
 - A callable `dsn` works with `PostgresqlResultBackend` and
   `PostgresqlSchedulerSource`; it used to reach the driver uncalled.
+- `PostgresqlBroker.kick()` accepts a fractional `delay` label, such as the
+  ones `SmartRetryMiddleware` and `@broker.task(delay=2.5)` send; it used to
+  raise `ValueError` after storing the message, which was then never
+  delivered. A `delay` that is not a finite number of seconds still raises
+  `ValueError`, now before anything is stored.
+- Concurrent first startups with `run_migrations=True`, such as the two
+  processes `taskiq worker` starts by default, no longer fail with
+  `duplicate key value violates unique constraint "pg_type_typname_nsp_index"`.
+  The migration runs on one connection, in one transaction that first takes
+  `pg_advisory_xact_lock(hashtext('taskiq_postgresql'), hashtext(<table_name>))`
+  with the table name as configured. This lock key stays the same across
+  releases, so two versions running side by side in a rolling deploy wait for
+  each other too.
+- `run_migrations=True` works with a pool of one connection (asyncpg or psycopg
+  `min_size=1, max_size=1`). The migration used to hold one connection while it
+  waited for a second: asyncpg waited with no timeout, psycopg until its pool
+  timeout.
 
 ### Removed
 
