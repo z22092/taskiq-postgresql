@@ -35,6 +35,18 @@ repos:
         language: system
         pass_filenames: false
         always_run: true
+      # ty checks the whole package at once, since a change in one module can
+      # break a caller in another; [tool.ty.src] in pyproject.toml sets the
+      # scope. It resolves the driver packages, so the environment needs the
+      # extras (`uv sync --all-extras --group lint`).
+      - id: ty
+        name: ty check
+        entry: uv run --no-sync ty check
+        language: system
+        types_or: [python, pyi]
+        files: ^taskiq_postgresql/
+        pass_filenames: false
+        require_serial: true
 
   - repo: https://github.com/gitleaks/gitleaks
     rev: 83d9cd684c87d95d656c1458ef04895a7f1cbd8e # frozen: v8.30.1

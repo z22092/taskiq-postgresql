@@ -88,6 +88,7 @@ audit = [
 lint = [
     "ruff==0.17.3",
     "pre-commit==4.7.0; python_version >= \"3.11\"",
+    "ty==0.0.99",
 ]
 
 [tool.uv]
@@ -113,6 +114,17 @@ packages = ["taskiq_postgresql"]
 testpaths = ["tests"]
 timeout = 60
 addopts = ["--strict-markers", "--strict-config"]
+
+# Applies whenever pytest runs with --cov (CI's test job does). The floor is
+# the line coverage the full suite measured, rounded down, so a change that
+# drops coverage fails; raise it when coverage rises.
+[tool.coverage.report]
+fail_under = 94
+
+# scripts/ stays out: check_pins.py imports tomllib, which ty rejects at the
+# Python 3.10 floor although the script only ever runs on 3.13.
+[tool.ty.src]
+include = ["taskiq_postgresql"]
 
 [tool.ruff.format]
 exclude = [".venv/"]
