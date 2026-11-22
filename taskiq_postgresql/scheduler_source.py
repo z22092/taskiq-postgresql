@@ -1,12 +1,13 @@
 import json
 import math
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import timedelta
 from logging import getLogger
 from typing import Any, Final, Literal, Optional
 from uuid import uuid4
 
-from pydantic import ValidationError
+from pydantic import TypeAdapter, ValidationError
 from taskiq import ScheduledTask, ScheduleSource
 from taskiq.abc.broker import AsyncBroker
 
@@ -31,22 +32,19 @@ logger = getLogger(__name__)
 # The largest whole-day span a timedelta holds, in seconds.
 _MAX_OFFSET_SECONDS = timedelta.max.days * 24 * 60 * 60
 
+_TIMEDELTA: Final = TypeAdapter(timedelta)
 
-def _load_schedule(stored: Any) -> ScheduledTask:
+
+def _read_offset(offset: Any) -> Any:
     """
-    Validate a stored schedule, accepting the 0.4.x pydantic v1 form.
+    Return a stored ``cron_offset`` as a ``timedelta`` when it was written as one.
+
+    Anything else, such as a time zone name, is returned unchanged for
+    ``ScheduledTask`` to validate.
 
     Raises:
-        ValueError: if the schedule is not JSON, or not a valid
-            ``ScheduledTask`` (pydantic's ``ValidationError``).
-        TypeError: if the schedule is JSON but not an object.
+        OverflowError: if a duration string is beyond what ``timedelta`` holds.
     """
-    data = json.loads(stored) if isinstance(stored, (str, bytes)) else stored
-    if not isinstance(data, dict):
-        msg = f"expected a JSON object, got {type(data).__name__}"
-        raise TypeError(msg)
-    data = dict(data)
-    offset = data.get("cron_offset")
     # pydantic v1 wrote a timedelta as its total seconds. taskiq 0.13 reads a
     # number as a time zone name and rejects it, and a number can only have
     # come from a timedelta, so it is read back as one. An offset timedelta
@@ -57,7 +55,36 @@ def _load_schedule(stored: Any) -> ScheduledTask:
         and math.isfinite(offset)
         and abs(offset) <= _MAX_OFFSET_SECONDS
     ):
-        data["cron_offset"] = timedelta(seconds=offset)
+        return timedelta(seconds=offset)
+    # pydantic v2 writes a timedelta as an ISO 8601 duration ("PT1H"). taskiq
+    # 0.13 turns any string that pydantic accepts as a timedelta into one;
+    # older taskiq keeps the string and takes it for a time zone name. The
+    # same rule is applied here so the offset survives on every supported
+    # version.
+    if isinstance(offset, str):
+        with suppress(ValidationError):
+            return _TIMEDELTA.validate_python(offset)
+    return offset
+
+
+def _load_schedule(stored: Any) -> ScheduledTask:
+    """
+    Validate a stored schedule, reading ``cron_offset`` with ``_read_offset``.
+
+    Raises:
+        ValueError: if the schedule is not JSON, or not a valid
+            ``ScheduledTask`` (pydantic's ``ValidationError``).
+        TypeError: if the schedule is JSON but not an object.
+        OverflowError: if its ``cron_offset`` duration does not fit a
+            ``timedelta``.
+    """
+    data = json.loads(stored) if isinstance(stored, (str, bytes)) else stored
+    if not isinstance(data, dict):
+        msg = f"expected a JSON object, got {type(data).__name__}"
+        raise TypeError(msg)
+    data = dict(data)
+    if "cron_offset" in data:
+        data["cron_offset"] = _read_offset(data["cron_offset"])
     return ScheduledTask.model_validate(data)
 
 

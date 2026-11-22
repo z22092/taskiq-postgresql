@@ -1,6 +1,7 @@
 import json
 import logging
 import uuid
+import zoneinfo
 from datetime import datetime, timedelta, timezone
 from typing import Any
 from unittest.mock import Mock
@@ -14,6 +15,9 @@ from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from tests.helpers import drop_and_shutdown
 
 pytestmark = pytest.mark.anyio
+
+# The IANA database has several hundred names; fewer means tzdata is missing.
+MIN_KNOWN_ZONES = 100
 
 
 @pytest.fixture
@@ -477,7 +481,10 @@ async def insert_raw_json_row(
 ERROR_TYPES = ("TypeError", "ValueError", "OverflowError", "ValidationError")
 
 
-@pytest.mark.parametrize("kind", ["empty_list", "number", "huge_cron_offset"])
+@pytest.mark.parametrize(
+    "kind",
+    ["empty_list", "number", "huge_cron_offset", "huge_duration_cron_offset"],
+)
 async def test_when_a_row_cannot_become_a_schedule__then_only_that_row_is_skipped(
     scheduler_source: PostgresqlSchedulerSource,
     sample_scheduled_task: ScheduledTask,
@@ -494,6 +501,12 @@ async def test_when_a_row_cannot_become_a_schedule__then_only_that_row_is_skippe
             **sample_scheduled_task.model_dump(mode="json"),
             "schedule_id": broken_id,
             "cron_offset": 1e20,
+            "kwargs": {"marker": marker},
+        },
+        "huge_duration_cron_offset": {
+            **sample_scheduled_task.model_dump(mode="json"),
+            "schedule_id": broken_id,
+            "cron_offset": "-P999999999DT1S",
             "kwargs": {"marker": marker},
         },
     }
@@ -557,3 +570,42 @@ async def test_when_a_row_cannot_become_a_schedule__then_startup_schedule_runs(
         await scheduler.shutdown()
 
     assert [schedule.task_name for schedule in schedules] == ["test_task"]
+
+
+@pytest.mark.parametrize(
+    "offset",
+    [
+        timedelta(hours=1),
+        timedelta(hours=-3),
+        timedelta(days=1, minutes=30),
+        timedelta(seconds=90.5),
+        "Europe/Berlin",
+        "America/Sao_Paulo",
+    ],
+)
+async def test_when_cron_offset_is_stored__then_it_loads_with_its_type(
+    scheduler_source: PostgresqlSchedulerSource,
+    sample_scheduled_task: ScheduledTask,
+    offset: timedelta | str,
+) -> None:
+    """A stored ISO 8601 duration must not come back as a time zone name."""
+    await scheduler_source.add_schedule(
+        sample_scheduled_task.model_copy(update={"cron_offset": offset}),
+    )
+
+    schedules = await scheduler_source.get_schedules()
+
+    assert len(schedules) == 1
+    assert type(schedules[0].cron_offset) is type(offset)
+    assert schedules[0].cron_offset == offset
+
+
+def test_when_cron_offset_is_a_known_zone__then_it_is_not_a_duration() -> None:
+    """No IANA zone name may be mistaken for a duration."""
+    from taskiq_postgresql.scheduler_source import _read_offset  # noqa: PLC0415
+
+    names = zoneinfo.available_timezones()
+    # Without tzdata the set is empty and the loop below would pass vacuously.
+    assert len(names) > MIN_KNOWN_ZONES, "tzdata is missing: the sweep is vacuous"
+
+    assert [name for name in sorted(names) if _read_offset(name) != name] == []
