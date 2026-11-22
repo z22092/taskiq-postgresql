@@ -109,23 +109,6 @@ class PsycopgDriver(QueryDriver):
     ) -> None:
         """Exit the context manager."""
 
-    async def create_table(self) -> str:
-        """Create a table."""
-        async with self, self.connection() as connection:
-            cursor: AsyncCursor[TupleRow] = await connection.execute(
-                self.create_table_query.make_query(),
-            )
-
-            return cursor.statusmessage
-
-    async def create_index(self) -> None:
-        """Create an index."""
-        if self.index_columns is not None:
-            async with self, self.connection() as connection:
-                await connection.execute(
-                    self.create_index_query.make_query(self.index_columns),
-                )
-
     async def insert(
         self,
         columns: Sequence[Column],
@@ -259,12 +242,31 @@ class PsycopgDriver(QueryDriver):
             return None
 
     async def on_startup(self) -> None:
-        """On startup."""
+        """Create the table and its indexes, see ``QueryDriver.on_startup``."""
         if self.run_migrations:
-            async with self, self.connection() as connection:  # noqa: SIM117
-                async with connection.transaction():
-                    await self.create_table()
-                    await self.create_index()
+            async with (
+                self,
+                self.connection() as connection,
+                connection.transaction(),
+            ):
+                cursor: AsyncCursor[TupleRow] = await connection.execute(
+                    self.relations_exist_query.make_query(self.index_columns),
+                    params=self.relations_exist_query.relation_names(
+                        self.index_columns,
+                    ),
+                )
+                exists = await cursor.fetchone()
+                if exists is not None and exists[0]:
+                    return
+                await connection.execute(
+                    self.migration_lock_query.make_query(),
+                    params=self.migration_lock_query.params(),
+                )
+                await connection.execute(self.create_table_query.make_query())
+                if self.index_columns is not None:
+                    await connection.execute(
+                        self.create_index_query.make_query(self.index_columns),
+                    )
 
     async def on_shutdown(self) -> None:
         """On shutdown."""
