@@ -63,7 +63,7 @@ class PostgresqlBroker(AsyncBroker):
         field_for_task_id: Literal["VarChar", "Text", "Uuid"] = "Uuid",
         channel_name: str = "taskiq",
         table_name: str = "taskiq_messages",
-        driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
+        driver: Literal["asyncpg", "psqlpy", "psycopg"] = "asyncpg",
         max_retry_attempts: int = 5,
         connection_kwargs: dict[str, Any] | None = None,
         pool_kwargs: dict[str, Any] | None = None,
@@ -244,7 +244,7 @@ class PostgresqlBroker(AsyncBroker):
                     # Normalize payload to integer ID
                     # (psycopg may yield string payloads).
                     try:
-                        normalized_id = int(message_id)  # type: ignore[arg-type]
+                        normalized_id = int(message_id)
                     except (TypeError, ValueError):
                         logger.warning(
                             "Invalid NOTIFY payload %r on channel %s",
@@ -274,7 +274,7 @@ class PostgresqlBroker(AsyncBroker):
                         )
                         continue
 
-                    async def ack(*, _message_id: int = message_id) -> None:
+                    async def ack(*, _message_id: int = normalized_id) -> None:
                         # No-op: the row was already deleted when claimed.
                         return None
 

@@ -2,11 +2,12 @@ from asyncio import Queue as AsyncQueue
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncIterator, Optional, Sequence, Union
+from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
 from uuid import UUID
 
 from asyncpg import Connection, Pool, connect, create_pool
 from asyncpg.transaction import Transaction
+from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
@@ -17,8 +18,8 @@ from taskiq_postgresql.exceptions import DatabaseConnectionError
 class AsyncpgDriver(QueryDriver):
     """Asyncpg backend."""
 
-    pool: Pool = None
-    transaction: Transaction = None
+    pool: Optional[Pool] = None
+    transaction: Optional[Transaction] = None
 
     def __init__(
         self,
@@ -45,17 +46,17 @@ class AsyncpgDriver(QueryDriver):
 
     def __parser_query(
         self,
-        columns: Sequence[Column],
-        values: Sequence[Any],
-    ) -> list[Any]:
+        columns: Optional[Sequence[Column]],
+        values: Optional[Sequence[Any]],
+    ) -> Sequence[Any]:
         """Parser query.
 
         Args:
-            columns (Sequence[Column]): Columns to parse.
-            values (Sequence[Any]): Values to parse.
+            columns (Sequence[Column] | None): Columns to parse.
+            values (Sequence[Any] | None): Values to parse.
 
         Returns:
-            list[Any]: Parsed values.
+            Sequence[Any]: Parsed values.
         """
         if not values:
             return []
@@ -75,11 +76,15 @@ class AsyncpgDriver(QueryDriver):
         return new_values
 
     @asynccontextmanager
-    async def connection(self) -> AsyncIterator[Connection]:
+    async def connection(self) -> AsyncGenerator[Connection, None]:
+        if self.pool is None:
+            raise DatabaseConnectionError(
+                "The pool is not open: enter `async with driver` first.",
+            )
         async with self.pool.acquire() as connection:
             yield connection
 
-    async def __aenter__(self) -> Connection:
+    async def __aenter__(self) -> Self:
         """Enter the context manager."""
         try:
             if self.pool is None:
@@ -221,10 +226,14 @@ class AsyncpgDriver(QueryDriver):
 
     async def on_shutdown(self) -> None:
         """On shutdown."""
+        # The pool opens on the first query, so a component that never ran
+        # one has nothing to close.
+        if self.pool is None:
+            return
         await self.pool.close()
         self.pool = None
 
-    async def execute(self, query: str, *values: Any) -> str:
+    async def execute(self, query: str, *values: Any) -> list[Any]:
         """Execute a query."""
         async with self, self.connection() as connection:
             return await connection.fetch(query, *values)
@@ -270,7 +279,7 @@ class AsyncpgListenDriver(ListenDriver):
         con_ref: object,
         pid: int,
         channel: str,
-        payload: object,
+        payload: str,
         /,
     ) -> None:
         """
@@ -286,7 +295,7 @@ class AsyncpgListenDriver(ListenDriver):
         if self._queue is not None:
             self._queue.put_nowait(int(payload))
 
-    async def __aiter__(self) -> AsyncIterator[Any]:
+    async def __aiter__(self) -> AsyncIterator[int]:
         """Iterate over the queue."""
         while not self.connection.is_closed():
             message_id = await self._queue.get()

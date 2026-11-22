@@ -150,7 +150,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self,
         from_date: Union[datetime, date],
         to_date: Optional[Union[datetime, date]] = None,
-    ) -> None:
+    ) -> Any:
         """Delete results by date."""
 
     @abstractmethod
@@ -204,6 +204,8 @@ class ListenDriver(_ConnectionStringHolder, ABC):
     async def on_shutdown(self) -> None:
         """On shutdown."""
 
+    # A plain def: the drivers implement it as an async generator, which
+    # returns the iterator directly instead of a coroutine.
     @abstractmethod
-    async def __aiter__(self) -> AsyncIterator[bytes]:
-        """Iterate over the queue."""
+    def __aiter__(self) -> AsyncIterator[Union[int, str]]:
+        """Iterate over the ids of the notified messages."""

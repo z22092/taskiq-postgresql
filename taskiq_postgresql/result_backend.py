@@ -43,7 +43,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         table_name: str = "taskiq_results",
         field_for_task_id: Literal["VarChar", "Text", "Uuid"] = "Uuid",
         serializer: Optional[TaskiqSerializer] = None,
-        driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
+        driver: Literal["asyncpg", "psqlpy", "psycopg"] = "asyncpg",
         run_migrations: bool = False,
         **connect_kwargs: Any,
     ) -> None:

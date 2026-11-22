@@ -3,11 +3,12 @@ from asyncio import Queue as AsyncQueue
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncIterator, Final, Optional, Sequence, Union
+from typing import Any, AsyncGenerator, AsyncIterator, Final, Optional, Sequence, Union
 from uuid import UUID
 
 from psqlpy import Connection, ConnectionPool, QueryResult
 from psqlpy.extra_types import JSONB
+from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
@@ -17,7 +18,7 @@ from taskiq_postgresql.exceptions import DatabaseConnectionError
 class PsqlpyDriver(QueryDriver):
     """Asyncpg backend."""
 
-    pool: ConnectionPool = None
+    pool: Optional[ConnectionPool] = None
 
     def __init__(
         self,
@@ -45,7 +46,7 @@ class PsqlpyDriver(QueryDriver):
     def __parser_query(
         self,
         columns: Sequence[Column],
-        values: Sequence[Any],
+        values: Optional[Sequence[Any]],
     ) -> list[Any]:
         """Parser query."""
         if values is None:
@@ -65,14 +66,18 @@ class PsqlpyDriver(QueryDriver):
         return new_values
 
     @asynccontextmanager
-    async def connection(self) -> AsyncIterator[Connection]:
+    async def connection(self) -> AsyncGenerator[Connection, None]:
+        if self.pool is None:
+            raise DatabaseConnectionError(
+                "The pool is not open: enter `async with driver` first.",
+            )
         try:
             async with self.pool.acquire() as connection:
                 yield connection
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
 
-    async def __aenter__(self) -> Connection:
+    async def __aenter__(self) -> Self:
         """Enter the context manager."""
         if self.pool is None:
             self.pool = ConnectionPool(
@@ -159,7 +164,7 @@ class PsqlpyDriver(QueryDriver):
 
             return None
 
-    async def delete(self, column: Column, value: Any) -> str:
+    async def delete(self, column: Column, value: Any) -> list[tuple[Any, ...]]:
         """Delete a row from a table."""
         async with self, self.connection() as connection:
             results = await connection.execute(
@@ -193,7 +198,7 @@ class PsqlpyDriver(QueryDriver):
         where_values: Optional[Sequence[Any]] = None,
     ) -> list[dict[str, Any]]:
         """Select a row from a table."""
-        parameters = self.__parser_query(where_columns, where_values)
+        parameters = self.__parser_query(where_columns or (), where_values)
         async with self, self.connection() as connection:
             rows = await connection.execute(
                 querystring=self.select_query.make_query(columns, where_columns),
@@ -216,7 +221,7 @@ class PsqlpyDriver(QueryDriver):
         self,
         from_date: Union[datetime, date],
         to_date: Optional[Union[datetime, date]] = None,
-    ) -> str:
+    ) -> list[tuple[Any, ...]]:
         """Delete a row from a table by date."""
         async with self, self.connection() as connection:
             results = await connection.execute(
@@ -237,10 +242,14 @@ class PsqlpyDriver(QueryDriver):
 
     async def on_shutdown(self) -> None:
         """On shutdown."""
+        # The pool opens on the first query, so a component that never ran
+        # one has nothing to close.
+        if self.pool is None:
+            return
         self.pool.close()
         self.pool = None
 
-    async def execute(self, query: str, *values: Any) -> str:
+    async def execute(self, query: str, *values: Any) -> list[dict[str, Any]]:
         """Execute a query."""
         async with self, self.connection() as connection:
             results = await connection.fetch(query, parameters=values)
@@ -309,7 +318,7 @@ class PsqlpyListenDriver(ListenDriver):
         if self._queue is not None:
             self._queue.put_nowait(int(payload))
 
-    async def __aiter__(self) -> AsyncIterator[Any]:
+    async def __aiter__(self) -> AsyncIterator[int]:
         """Iterate over the queue."""
         while True:
             message_id = await self._queue.get()

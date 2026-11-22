@@ -3,18 +3,31 @@ from asyncio import Queue as AsyncQueue
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncIterator, Optional, Sequence, Union
+from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union, cast
 from uuid import UUID
 
 from psycopg import AsyncConnection, AsyncCursor, AsyncRawCursor, Notify
 from psycopg.rows import DictRow, TupleRow, dict_row
 from psycopg_pool import AsyncConnectionPool
-from typing_extensions import Self
+from typing_extensions import LiteralString, Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
 from taskiq_postgresql.drivers._json import dumps
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+
+
+def sql(query: str) -> LiteralString:
+    """
+    Mark a query built by ``taskiq_postgresql.abc.query`` as trusted SQL.
+
+    psycopg's annotations accept only literal strings, to keep data out of
+    the query text. These queries are built from the table, column and channel
+    names given to the component at construction; values always travel as
+    bind parameters.
+    """
+    return cast("LiteralString", query)
+
 
 logger = logging.getLogger(__name__)
 
@@ -22,7 +35,7 @@ logger = logging.getLogger(__name__)
 class PsycopgDriver(QueryDriver):
     """Asyncpg backend."""
 
-    pool: AsyncConnectionPool = None
+    pool: Optional[AsyncConnectionPool] = None
 
     def __init__(
         self,
@@ -49,17 +62,17 @@ class PsycopgDriver(QueryDriver):
 
     def __parser_params(
         self,
-        columns: Sequence[Column],
-        values: Sequence[Any],
-    ) -> list[Any]:
+        columns: Optional[Sequence[Column]],
+        values: Optional[Sequence[Any]],
+    ) -> Sequence[Any]:
         """Parser query.
 
         Args:
-            columns (Sequence[Column]): Columns to parse.
-            values (Sequence[Any]): Values to parse.
+            columns (Sequence[Column] | None): Columns to parse.
+            values (Sequence[Any] | None): Values to parse.
 
         Returns:
-            list[Any]: Parsed values.
+            Sequence[Any]: Parsed values.
         """
         if not values:
             return []
@@ -79,7 +92,11 @@ class PsycopgDriver(QueryDriver):
         return new_values
 
     @asynccontextmanager
-    async def connection(self) -> AsyncIterator[AsyncConnection[TupleRow]]:
+    async def connection(self) -> AsyncGenerator[AsyncConnection[TupleRow], None]:
+        if self.pool is None:
+            raise DatabaseConnectionError(
+                "The pool is not open: enter `async with driver` first.",
+            )
         try:
             await self.pool.open()
             async with self.pool.connection() as connection:
@@ -109,11 +126,11 @@ class PsycopgDriver(QueryDriver):
     ) -> None:
         """Exit the context manager."""
 
-    async def create_table(self) -> str:
+    async def create_table(self) -> Optional[str]:
         """Create a table."""
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
-                self.create_table_query.make_query(),
+                sql(self.create_table_query.make_query()),
             )
 
             return cursor.statusmessage
@@ -123,7 +140,7 @@ class PsycopgDriver(QueryDriver):
         if self.index_columns is not None:
             async with self, self.connection() as connection:
                 await connection.execute(
-                    self.create_index_query.make_query(self.index_columns),
+                    sql(self.create_index_query.make_query(self.index_columns)),
                 )
 
     async def insert(
@@ -135,7 +152,7 @@ class PsycopgDriver(QueryDriver):
         """Insert a row into a table."""
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
-                self.insert_query.make_query(columns, returning),
+                sql(self.insert_query.make_query(columns, returning)),
                 params=self.__parser_params(columns, values),
             )
 
@@ -156,11 +173,13 @@ class PsycopgDriver(QueryDriver):
         """Insert or update a row into a table."""
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
-                self.insert_or_update_query.make_query(
-                    columns,
-                    returning,
-                    on_conflict_columns,
-                    on_conflict_update_columns=on_conflict_update_columns,
+                sql(
+                    self.insert_or_update_query.make_query(
+                        columns,
+                        returning,
+                        on_conflict_columns,
+                        on_conflict_update_columns=on_conflict_update_columns,
+                    ),
                 ),
                 params=self.__parser_params(columns, values),
             )
@@ -171,11 +190,11 @@ class PsycopgDriver(QueryDriver):
                     return next(iter(value))
             return None
 
-    async def delete(self, column: Column, value: Any) -> str:
+    async def delete(self, column: Column, value: Any) -> Any:
         """Delete a row from a table."""
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
-                self.delete_query.make_query(column),
+                sql(self.delete_query.make_query(column)),
                 params=self.__parser_params([column], [value]),
             )
 
@@ -195,7 +214,7 @@ class PsycopgDriver(QueryDriver):
         async with self, self.connection() as connection:
             cursor = connection.cursor(row_factory=dict_row)
             cursor = await cursor.execute(
-                self.delete_returning_query.make_query(where_column, returning),
+                sql(self.delete_returning_query.make_query(where_column, returning)),
                 params=self.__parser_params([where_column], [value]),
             )
             if cursor.rownumber is not None:
@@ -215,7 +234,7 @@ class PsycopgDriver(QueryDriver):
         async with self, self.connection() as connection:
             cursor = connection.cursor(row_factory=dict_row)
             cursor: AsyncCursor[DictRow] = await cursor.execute(
-                self.select_query.make_query(columns, where_columns),
+                sql(self.select_query.make_query(columns, where_columns)),
                 params=self.__parser_params(where_columns, where_values),
             )
 
@@ -227,7 +246,12 @@ class PsycopgDriver(QueryDriver):
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
-                self.select_query.make_query([Column("1", "")], [self.primary_key]),
+                sql(
+                    self.select_query.make_query(
+                        [Column("1", "")],
+                        [self.primary_key],
+                    ),
+                ),
                 params=self.__parser_params([self.primary_key], [id]),
             )
 
@@ -241,11 +265,11 @@ class PsycopgDriver(QueryDriver):
         self,
         from_date: Union[datetime, date],
         to_date: Optional[Union[datetime, date]] = None,
-    ) -> str:
+    ) -> Any:
         """Delete a row from a table by date."""
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
-                self.delete_by_date_query.make_query(self.created_at),
+                sql(self.delete_by_date_query.make_query(self.created_at)),
                 params=self.__parser_params(
                     [self.created_at, self.created_at],
                     [from_date, to_date],
@@ -268,14 +292,18 @@ class PsycopgDriver(QueryDriver):
 
     async def on_shutdown(self) -> None:
         """On shutdown."""
+        # The pool opens on the first query, so a component that never ran
+        # one has nothing to close.
+        if self.pool is None:
+            return
         await self.pool.close()
         self.pool = None
 
     async def execute(self, query: str, *values: Any) -> list[Any]:
         """Execute a query."""
         async with self, self.connection() as connection:
-            cursor: AsyncRawCursor[TupleRow] = await connection.execute(
-                query,
+            cursor: AsyncCursor[TupleRow] = await connection.execute(
+                sql(query),
                 params=values,
             )
 
@@ -300,14 +328,14 @@ class PsycopgListenDriver(ListenDriver):
     async def on_startup(self) -> None:
         """On startup."""
         try:
-            self.connection: AsyncConnection[DictRow] = await AsyncConnection.connect(
+            self.connection: AsyncConnection[TupleRow] = await AsyncConnection.connect(
                 self.connection_string,
                 **self.connection_kwargs,
                 autocommit=True,
                 cursor_factory=AsyncRawCursor,
             )
             async with self.connection.cursor() as cursor:
-                await cursor.execute(f"LISTEN {self.channel_name}")
+                await cursor.execute(sql(f"LISTEN {self.channel_name}"))
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
 
@@ -334,7 +362,7 @@ class PsycopgListenDriver(ListenDriver):
         if self._queue is not None:
             self._queue.put_nowait(int(notify.payload))
 
-    async def __aiter__(self) -> AsyncIterator[Any]:
+    async def __aiter__(self) -> AsyncIterator[Union[int, str]]:
         """Iterate over the queue."""
         async for notify in self.connection.notifies():
             yield notify.payload
