@@ -19,32 +19,45 @@ from tests.helpers import (
 
 _ReturnType = TypeVar("_ReturnType")
 
-# One pinned image per supported major. Each entry stays on one line:
-# scripts/check_pins.py matches them with a regex.
+# One pinned image per supported major, keyed by the major. The default is the
+# newest major, so adding a key moves the default with it.
 POSTGRES_IMAGES = {
-    "17": "postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317",  # noqa: E501
-    "18": "postgres:18.4@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636",  # noqa: E501
+    "17": (
+        "postgres:17.10"
+        "@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317"
+    ),
+    "18": (
+        "postgres:18.4"
+        "@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636"
+    ),
 }
-DEFAULT_POSTGRES_MAJOR = "18"
+DEFAULT_POSTGRES_MAJOR = max(POSTGRES_IMAGES, key=int)
 
 
-def postgres_image() -> str:
+def selected_postgres_major() -> str:
     """
-    Pinned image for the major named by ``TEST_POSTGRES_MAJOR``.
+    Major named by ``TEST_POSTGRES_MAJOR``.
 
     CI sets the variable to an empty string on the legs that keep the default,
     so unset and empty both mean the default major.
 
-    :raises pytest.UsageError: when the value is not a supported major.
-    :return: the pinned image reference.
+    :return: a key of ``POSTGRES_IMAGES``.
     """
-    major = os.environ.get("TEST_POSTGRES_MAJOR") or DEFAULT_POSTGRES_MAJOR
+    return os.environ.get("TEST_POSTGRES_MAJOR") or DEFAULT_POSTGRES_MAJOR
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """
+    Reject an unsupported ``TEST_POSTGRES_MAJOR`` once, before any test runs.
+
+    :raises pytest.UsageError: when the value is not a supported major.
+    """
+    major = selected_postgres_major()
     if major not in POSTGRES_IMAGES:
         raise pytest.UsageError(
             f"TEST_POSTGRES_MAJOR={major!r} is not supported; "
-            f"use one of {sorted(POSTGRES_IMAGES)}",
+            f"use one of {sorted(POSTGRES_IMAGES, key=int)}",
         )
-    return POSTGRES_IMAGES[major]
 
 
 @pytest.fixture(scope="session")
@@ -90,7 +103,7 @@ def postgresql_dsn() -> Generator[str, None, None]:
         return
 
     # The DSN is built from the credentials the container itself holds.
-    with PostgresContainer(postgres_image()) as container:
+    with PostgresContainer(POSTGRES_IMAGES[selected_postgres_major()]) as container:
         yield container.get_connection_url(driver=None)
 
 

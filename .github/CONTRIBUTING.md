@@ -57,8 +57,10 @@ uv run pre-commit install
 
 The test suite starts a throwaway PostgreSQL container by itself
 (testcontainers, image pinned by digest), so no setup is needed. It runs on
-PostgreSQL 18 by default; set `TEST_POSTGRES_MAJOR=17` to run on 17 (CI covers
-both). An unknown value fails at once, naming the supported majors.
+the newest pinned major (18) by default; set `TEST_POSTGRES_MAJOR=17` to run on
+17. An empty value means the default. An unsupported value stops the run once,
+before any test, with a single usage error (exit code 4) that names the
+supported majors. CI also runs a `test (py3.13, pg17)` leg on 17.
 
 To run the tests against a database you already have, set `POSTGRESQL_URL`
 (credentials come from your environment, never from the repository):
@@ -80,6 +82,14 @@ export POSTGRESQL_URL="postgresql://postgres@localhost:5432/postgres"
 you ran an earlier compose file (password authentication), run
 `docker compose down -v` once, or the passwordless DSN fails with
 `fe_sendauth: no password supplied`.
+
+The previous major is available behind a compose profile, on `127.0.0.1:5433`
+with its own volume:
+
+```bash
+docker compose --profile pg17 up -d --wait postgres17
+export POSTGRESQL_URL="postgresql://postgres@localhost:5433/postgres"
+```
 
 Moving from the PostgreSQL 17 compose file to this one needs the same
 `docker compose down -v`: the 18 image keeps its data under
@@ -213,10 +223,12 @@ async def process_task(
 - Dependabot waits 14 days before proposing a release, matching
   `exclude-newer = "14 days"` in `[tool.uv]`.
 - `tests/conftest.py` pins one Postgres image per supported major
-  (`POSTGRES_IMAGES`), and `docker-compose.yml` must use the image of its major.
-  `scripts/check_pins.py` fails when they differ or when a workflow names an
-  image or `TEST_POSTGRES_MAJOR` value conftest does not declare. A Dependabot
-  docker PR needs the matching manual bump in `tests/conftest.py`.
+  (`POSTGRES_IMAGES`; the newest key is the default), and `docker-compose.yml`
+  declares the same set of images (the 17 one under the `pg17` profile).
+  `scripts/check_pins.py` fails when the sets differ or when a workflow names an
+  image or a literal major conftest does not declare. A Dependabot docker PR
+  needs the matching manual bump in `tests/conftest.py`; Dependabot ignores
+  Postgres major bumps, which are added by hand in both files.
 
 ### Regenerating the build-constraint hashes
 
