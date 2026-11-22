@@ -45,11 +45,32 @@ Upgrading from 0.4.x:
   connection cannot start, for every driver (asyncpg, psqlpy and psycopg).
 - The drivers pair query columns and values with `zip(..., strict=True)`, so a
   count mismatch raises `ValueError` instead of silently dropping values.
+- The `driver` parameter of the three components is typed
+  `Literal["asyncpg", "psqlpy", "psycopg"]`, so type checkers reject
+  `"pg8000"`. It was listed before but no release implemented it: passing it
+  raised `ValueError` at construction, as it still does.
+- The asyncpg query driver's `connection()`, used outside `async with driver`,
+  raises `DatabaseConnectionError` like the psqlpy and psycopg drivers do,
+  instead of `AttributeError`.
 
 ### Fixed
 
 - A callable `dsn` works with `PostgresqlResultBackend` and
   `PostgresqlSchedulerSource`; it used to reach the driver uncalled.
+- `PostgresqlBroker.shutdown()` and `PostgresqlSchedulerSource.shutdown()`
+  raised `AttributeError`, for every driver, when the component had run no
+  query since `startup()` with `run_migrations=False`: for example a worker
+  that received no message, or a schedule source never asked for its
+  schedules. A query driver's `on_shutdown()` now does nothing when no query
+  opened its pool.
+- With the psycopg driver, a `NOTIFY` on the broker's channel whose payload is
+  not an integer raised `ValueError` inside psycopg, which ended the listen
+  driver's iteration (the broker logged it as an error and listened again).
+  The payload is now logged and skipped. The psycopg listen driver also put
+  every notified id on a queue that nothing read, so it grew by one entry per
+  message for the life of the worker; that queue is gone.
+- `InsertOrUpdateQuery.make_query(..., on_conflict_action="NOTHING")` raised
+  `TypeError`; it now names the conflict columns.
 
 ### Removed
 
