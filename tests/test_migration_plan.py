@@ -328,7 +328,23 @@ def test_a_column_of_another_type_is_an_advisory_problem() -> None:
     assert plan.pending == ()
     (problem,) = plan.problems
     assert (problem.code, problem.severity) == ("column_type", "advisory")
-    assert problem.detail.startswith("taskiq_messages.task_id is text, not uuid")
+    assert problem.detail.startswith("taskiq_messages.task_id is 'text', not uuid")
+
+
+def test_a_catalog_type_with_a_line_break_is_written_escaped() -> None:
+    broker = table_schema("broker")
+    complete = state_after(broker, 2)
+    hostile = "text\nERROR forged log line"
+    columns = {**complete.tables["taskiq_messages"].columns, "task_id": hostile}
+
+    plan = plan_migration(
+        [broker],
+        with_table(complete, "taskiq_messages", columns=columns),
+    )
+
+    (problem,) = plan.problems
+    assert "\n" not in problem.detail
+    assert repr(hostile) in problem.detail
 
 
 def test_pending_steps_come_by_table_name_then_by_step() -> None:

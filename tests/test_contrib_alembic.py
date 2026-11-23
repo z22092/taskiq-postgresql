@@ -512,9 +512,15 @@ def test_the_revision_takes_its_options() -> None:
     assert offline_sql(namespace["upgrade"]) == "".join(
         f"{statement};\n\n" for statement in step_statements(schemas, lock=False)
     )
-    assert offline_sql(namespace["downgrade"]) == (
-        "DROP TABLE IF EXISTS taskiq_results;\n\n"
-        "DROP TABLE IF EXISTS taskiq_messages;\n\n"
+    # The drops share one bound on lock waits, as the upgrade's steps have.
+    assert offline_sql(namespace["downgrade"]) == "".join(
+        f"{statement};\n\n"
+        for statement in bounded(
+            [
+                "DROP TABLE IF EXISTS taskiq_results",
+                "DROP TABLE IF EXISTS taskiq_messages",
+            ],
+        )
     )
     assert "Revision ID: taskiq_tables\nRevises: app_0042\n" in source
     # Alembic runs every revision in its own transaction: never BEGIN/COMMIT.
