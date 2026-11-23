@@ -4,7 +4,6 @@
     "allow": [
       "Bash(make)",
       "Bash(make help)",
-      "Bash(make lint)",
       "Bash(make typecheck)",
       "Bash(make test)",
       "Bash(make pins)",
