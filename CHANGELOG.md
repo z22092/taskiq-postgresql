@@ -106,10 +106,58 @@ Upgrading from 0.4.x:
   workers, which can then use `run_migrations=False` and a role that only reads
   and writes rows.
 - `taskiq_postgresql.migrations` describes the tables as data (`table_schema`,
-  `collect_schemas`) and renders the script (`render_sql`), for tools that
-  build their own migrations. Other packages can add output formats to
-  `generate --format` through the `taskiq_postgresql.migration_formats` entry
-  point group; the README has the contract.
+  `collect_schemas`) and renders the script (`render_sql`), or its statements
+  one by one (`migration_statements`, which stops after a given step with
+  `through=N`), for tools that build their own migrations. Other packages can
+  add output formats to `generate --format` through the
+  `taskiq_postgresql.migration_formats` entry point group; the README has the
+  contract.
+- `taskiq_postgresql.migrations` also compares a database with that
+  description. Each migration step declares the table, columns and indexes it
+  creates (`MigrationStep.objects`); `catalog_query` reads, in one read-only
+  query, what a database holds under those names; `plan_migration` turns that
+  into the steps still pending (`required` when a table or column is missing,
+  `advisory` when only an index is) and the problems no step fixes, such as an
+  invalid index or an index name another table took. It runs no DDL itself.
+- SQLAlchemy, SQLModel and Alembic integrations, each installed as an extra:
+  `pip install "taskiq-postgresql[sqlalchemy]"`, `[sqlmodel]` or `[alembic]`.
+  `taskiq_postgresql.contrib.sqlalchemy.add_taskiq_tables` adds the tables to
+  a `MetaData` (and `taskiq_metadata` returns a new one) with the columns,
+  defaults, primary key and indexes `run_migrations=True` creates, under the
+  same names, so `create_all` builds the same tables;
+  `taskiq_postgresql.contrib.sqlmodel.add_taskiq_tables` puts them on
+  `SQLModel.metadata`.
+- Alembic autogenerate writes the migration steps a database lacks. With
+  `taskiq_metadata(...)` from `taskiq_postgresql.contrib.alembic` in
+  `target_metadata` (or `add_taskiq_tables` on your own metadata and that
+  module imported in `env.py`), `alembic revision --autogenerate` writes each
+  missing step as `op.execute(...)` calls holding the step's SQL and the
+  advisory lock, so the revision never imports this package, and
+  `alembic check` fails while a step is missing from the revisions. Each
+  step's `downgrade()` leaves its columns and indexes in place. Generate
+  revisions against a database only Alembic migrates: where workers with
+  `run_migrations=True` already ran a step, autogenerate leaves it out. The
+  `alembic` extra allows Alembic 1.14 to 1.20, and both ends are tested. The
+  module also gives `exclude_taskiq_tables` for
+  `include_object` (without it, autogenerate proposes dropping tables that
+  `run_migrations=True` created), `upgrade_taskiq_tables(op, ..., through=N)`
+  for a hand-written revision when table names differ between environments,
+  and `taskiq postgresql generate --format alembic`, which writes a revision
+  file with every step. Like the script of `generate`, each step bounds its
+  lock waits, 10 seconds by default, so it fails and rolls the revision back
+  instead of stalling the broker on a live table; then it gives the
+  transaction back its own `lock_timeout`, so the revision's other
+  migrations wait as before. Set the seconds with
+  `context.configure(..., taskiq_postgresql_lock_timeout=N)` in `env.py`
+  (autogenerate writes the value into the revision),
+  `upgrade_taskiq_tables(..., lock_timeout=N)` or
+  `generate --format alembic --lock-timeout N`; `0` leaves the bound out. The
+  lock and the bound only work inside the revision's transaction, so
+  `upgrade_taskiq_tables` raises `RuntimeError` on an autocommit connection
+  (for example inside `autocommit_block()`) before it runs a statement. The
+  format and `TaskiqStepOp` refuse a table name that is not a plain SQL
+  identifier, a line break in a table name, or an unknown component kind, and
+  `downgrade=drop` bounds its `DROP TABLE` statements by the same lock timeout.
 - `PostgresqlBroker(health_check_interval=30.0, query_timeout=30.0)`. When the
   LISTEN connection stays silent for `health_check_interval` seconds (with
   psycopg, every `health_check_interval` seconds), the worker sends the same

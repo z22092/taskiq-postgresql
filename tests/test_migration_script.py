@@ -35,9 +35,11 @@ from taskiq_postgresql.migrations import (
     FormatOptions,
     IndexSchema,
     MigrationStep,
+    StepObjects,
     TableSchema,
     collect_components,
     collect_schemas,
+    migration_statements,
     render_sql,
     table_schema,
 )
@@ -324,14 +326,20 @@ def test_a_column_type_without_a_description_is_refused() -> None:
 
 def test_a_step_holds_any_statement_and_an_index_any_method() -> None:
     # The shapes a later step needs: ALTER TABLE, and a btree on several columns.
+    index = IndexSchema("jobs_not_before_idx", ("channel", "not_before"), "btree")
     step = MigrationStep(
         number=2,
         statements=("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS channel VARCHAR",),
+        objects=StepObjects(
+            creates_table=False,
+            columns=("channel",),
+            indexes=(index,),
+        ),
     )
-    index = IndexSchema("jobs_not_before_idx", ("channel", "not_before"), "btree")
 
     assert step.statements[0].startswith("ALTER TABLE")
     assert index.columns == ("channel", "not_before")
+    assert step.objects.indexes == (index,)
 
 
 def test_kind_arguments_are_checked() -> None:
@@ -590,6 +598,26 @@ def test_a_table_name_the_script_cannot_hold_is_refused(name: str) -> None:
 def test_rendering_nothing_is_refused() -> None:
     with pytest.raises(ValueError, match="at least one"):
         render_sql([])
+    with pytest.raises(ValueError, match="at least one"):
+        migration_statements([])
+
+
+@pytest.mark.parametrize("lock", [True, False], ids=["lock", "no-lock"])
+def test_the_statements_are_the_script_one_by_one(lock: bool) -> None:
+    schemas = [
+        table_schema("scheduler_source", table_name="b"),
+        table_schema("broker", table_name="a"),
+    ]
+
+    statements = migration_statements(schemas, lock=lock)
+
+    script = render_sql(schemas, transaction=False, lock=lock, lock_timeout=0)
+    # A statement may span lines (step 2's ALTER TABLE), so compare the text
+    # after the two header lines, not line by line.
+    assert script.split("\n", 2)[2] == "".join(
+        f"{statement};\n" for statement in statements
+    )
+    assert all(";" not in statement for statement in statements)
 
 
 def test_the_header_says_unknown_without_package_metadata(

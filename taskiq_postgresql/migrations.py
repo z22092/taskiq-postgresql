@@ -10,11 +10,17 @@ tools that model tables themselves, and as an ordered list of migration steps
 holding the exact SQL statements, for tools that run SQL. Neither needs the
 other parsed.
 
+Each step also declares the objects it guarantees, so a database can be
+compared with the description: ``catalog_query`` reads what exists, in one
+read-only query, and ``plan_migration`` tells which steps are still pending
+and what is wrong in a way no step fixes.
+
 Importing this module imports no driver library.
 """
 
 from __future__ import annotations
 
+import json
 import re
 import sys
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -64,22 +70,34 @@ __all__ = [
     "MIGRATION_FORMATS_GROUP",
     "TASK_ID_TYPES",
     "AmbiguousMigrationFormatError",
+    "CatalogState",
     "ColumnSchema",
     "ComponentKind",
     "FormatOptions",
     "IndexMethod",
     "IndexSchema",
+    "IndexState",
     "MigrationFormat",
     "MigrationFormatOptionError",
+    "MigrationPlan",
     "MigrationStep",
+    "PendingStep",
+    "ProblemCode",
+    "SchemaProblem",
+    "Severity",
+    "StepObjects",
     "TableSchema",
+    "TableState",
     "TaskIdType",
     "TypeName",
     "UnknownMigrationFormatError",
     "available_formats",
+    "catalog_query",
     "collect_components",
     "collect_schemas",
     "load_format",
+    "migration_statements",
+    "plan_migration",
     "render_sql",
     "sql_format",
     "table_schema",
@@ -101,6 +119,23 @@ TypeName = Literal["serial", "uuid", "varchar", "text", "bytea", "jsonb", "times
 IndexMethod = Literal["hash", "btree"]
 """The access method of an index."""
 
+Severity = Literal["required", "advisory"]
+"""
+How much a gap matters: without a ``required`` object (a table or a column)
+the components fail; without an ``advisory`` one (an index) they only slow
+down.
+"""
+
+ProblemCode = Literal[
+    "name_taken",
+    "missing_column",
+    "column_type",
+    "invalid_index",
+    "index_on_other_table",
+    "index_shape",
+]
+"""What is wrong with an object in a way no migration step fixes."""
+
 MIGRATION_FORMATS_GROUP: Final = "taskiq_postgresql.migration_formats"
 """The entry-point group that ``taskiq postgresql generate --format`` reads."""
 
@@ -110,6 +145,9 @@ DEFAULT_LOCK_TIMEOUT: Final = 10
 # The server keeps lock_timeout as an int of milliseconds and refuses a larger
 # value when the script runs.
 _MAX_LOCK_TIMEOUT: Final = 2_147_483
+# A custom setting (two-part name) that holds a transaction's own lock_timeout
+# while steps that share the transaction run with theirs.
+_SAVED_LOCK_TIMEOUT: Final = "taskiq_postgresql_step.lock_timeout"
 _DISTRIBUTION: Final = "taskiq-postgresql"
 
 # Keyed by the upper-cased SQL spelling; PostgreSQL type names ignore case.
@@ -170,6 +208,23 @@ class IndexSchema:
 
 
 @dataclass(frozen=True)
+class StepObjects:
+    """
+    The objects a migration step guarantees once it has run.
+
+    Attributes:
+        creates_table: Whether the step creates the table. Such a step cannot
+            add a column to a table that already exists.
+        columns: The columns the step creates or adds, by name.
+        indexes: The indexes the step creates.
+    """
+
+    creates_table: bool
+    columns: tuple[str, ...]
+    indexes: tuple[IndexSchema, ...]
+
+
+@dataclass(frozen=True)
 class MigrationStep:
     """
     One additive, idempotent step of a table's migration.
@@ -177,17 +232,20 @@ class MigrationStep:
     Steps run in ``number`` order and each one is idempotent, so the whole
     list brings a table of any earlier release up to date. Idempotent is not
     lock-free: on a table that already exists, ``ALTER TABLE`` and
-    ``CREATE INDEX`` lock it before they find that nothing is missing.
+    ``CREATE INDEX`` lock it before they find that nothing is missing. A
+    released step never changes: a later release adds a step instead.
 
     Attributes:
         number: Position of the step, from 1.
         statements: The SQL statements, without the trailing semicolon, in
             the order they run. They are the statements ``run_migrations=True``
             executes, byte for byte.
+        objects: What exists once the statements have run.
     """
 
     number: int
     statements: tuple[str, ...]
+    objects: StepObjects
 
 
 @dataclass(frozen=True)
@@ -378,35 +436,411 @@ def render_sql(
             from 0 to 2147483.
     """
     tables = list(schemas)
+    return _script_text(
+        [f"-- tables: {', '.join(table.name for table in tables)}"],
+        _lock_timeout_first(migration_statements(tables, lock=lock), lock_timeout),
+        transaction=transaction,
+    )
+
+
+def migration_statements(
+    schemas: Iterable[TableSchema],
+    *,
+    lock: bool = True,
+    through: Optional[int] = None,
+) -> list[str]:
+    """
+    Return the statements of the script, one by one, for a tool that runs one.
+
+    A driver that prepares every statement it sends, such as asyncpg, refuses
+    a script of several statements in one call. These are the statements of
+    ``render_sql(schemas, transaction=False, lock=lock, lock_timeout=0)``, in
+    the same order, without the header comment and the semicolons.
+
+    Args:
+        schemas: The tables, in the order their statements run.
+        lock: Start with the advisory locks, as ``render_sql`` does.
+        through: Stop after the step of this number, so the statements stay
+            the same when a later release adds steps. Every table must have
+            that step: a step it does not have yet would be picked up from
+            the release that adds it.
+
+    Returns:
+        The statements, in the order they run.
+
+    Raises:
+        ValueError: if ``schemas`` is empty, a table name cannot be written in
+            a script, or a table has no step ``through``.
+    """
+    tables = list(schemas)
     if not tables:
-        raise ValueError("render_sql() needs at least one table schema")
+        raise ValueError("a migration script needs at least one table schema")
     for table in tables:
         _check_table_name(table.name)
-    _check_lock_timeout(lock_timeout)
-    statements: list[str] = []
-    if lock_timeout:
-        # First, so that it also bounds the wait for the advisory lock.
-        statements.append(f"SET LOCAL lock_timeout = '{lock_timeout}s'")
-    if lock:
-        # Sorted, so two scripts that lock the same tables take the locks in
-        # the same order and cannot deadlock each other.
-        statements.extend(
-            _lock_statement(name) for name in sorted({table.name for table in tables})
-        )
-    statements.extend(
-        statement
-        for table in tables
-        for step in table.steps
-        for statement in step.statements
+    return _script_statements(
+        [(table.name, _steps_through(table, through)) for table in tables],
+        lock=lock,
     )
-    if transaction:
-        statements = ["BEGIN", *statements, "COMMIT"]
-    lines = [
-        f"-- taskiq-postgresql {_package_version()}",
-        f"-- tables: {', '.join(table.name for table in tables)}",
-        *(f"{statement};" for statement in statements),
-    ]
-    return "\n".join(lines) + "\n"
+
+
+# --- comparing a database with the description -------------------------------
+
+
+@dataclass(frozen=True)
+class IndexState:
+    """
+    What the catalog holds under the name of one of a table's indexes.
+
+    Attributes:
+        name: The index name, as the description writes it.
+        relkind: ``pg_class.relkind`` of the relation that has the name (``i``
+            for an index), or ``None`` if no relation has it.
+        on_table: Whether the relation is an index of the described table.
+        valid: ``pg_index.indisvalid``: ``False`` after a failed
+            ``CREATE INDEX CONCURRENTLY``, an index queries never use.
+        method: The access method, such as ``hash`` or ``btree``.
+        columns: The indexed columns, in index order; ``None`` stands for an
+            expression.
+        unique: Whether the index is unique.
+        partial: Whether the index has a ``WHERE`` clause.
+    """
+
+    name: str
+    relkind: Optional[str] = None
+    on_table: bool = False
+    valid: bool = False
+    method: Optional[str] = None
+    columns: tuple[Optional[str], ...] = ()
+    unique: bool = False
+    partial: bool = False
+
+    @property
+    def exists(self) -> bool:
+        """Whether a relation has the name."""
+        return self.relkind is not None
+
+
+@dataclass(frozen=True)
+class TableState:
+    """
+    What the catalog holds under a table's name, and under its index names.
+
+    Attributes:
+        name: The table name, as the description writes it.
+        relkind: ``pg_class.relkind`` of the relation that has the name (``r``
+            for a table, ``p`` for a partitioned one), or ``None`` if no
+            relation has it.
+        columns: Each column of that relation, by name, with its type as
+            ``format_type`` writes it, for example ``character varying(100)``.
+        indexes: One entry per index name the description has, by name.
+    """
+
+    name: str
+    relkind: Optional[str] = None
+    columns: Mapping[str, str] = field(default_factory=dict)
+    indexes: Mapping[str, IndexState] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class CatalogState:
+    """
+    What a database holds for the described tables.
+
+    It is the result of ``catalog_query``, read by ``from_json``.
+
+    Attributes:
+        tables: One entry per described table, by the name the description
+            writes.
+    """
+
+    tables: Mapping[str, TableState]
+
+    @classmethod
+    def from_json(cls, text: str) -> CatalogState:
+        """
+        Read the one value ``catalog_query`` returns.
+
+        Args:
+            text: The JSON text of the query's only column.
+
+        Returns:
+            The state.
+
+        Raises:
+            ValueError: if ``text`` is not what ``catalog_query`` returns.
+        """
+        try:
+            document = json.loads(text)
+            tables = {}
+            for table in document["tables"]:
+                indexes = {
+                    index["name"]: IndexState(
+                        name=index["name"],
+                        relkind=index["relkind"],
+                        on_table=bool(index["on_table"]),
+                        valid=bool(index["valid"]),
+                        method=index["method"],
+                        columns=tuple(index["columns"] or ()),
+                        unique=bool(index["unique"]),
+                        partial=bool(index["partial"]),
+                    )
+                    for index in table["indexes"]
+                }
+                tables[table["name"]] = TableState(
+                    name=table["name"],
+                    relkind=table["relkind"],
+                    columns=dict(table["columns"] or ()),
+                    indexes=indexes,
+                )
+        except (TypeError, KeyError, ValueError) as error:
+            raise ValueError(
+                f"not the result of catalog_query: {error!r}",
+            ) from error
+        return cls(tables=tables)
+
+
+@dataclass(frozen=True)
+class PendingStep:
+    """
+    A step that has not fully run on a table: some object it creates is absent.
+
+    Running it again is safe: every statement only adds what is missing.
+
+    Attributes:
+        table: The table name.
+        kind: The component that owns the table.
+        step: The step.
+        table_missing: Whether the table itself is absent.
+        missing_columns: The step's columns the table lacks.
+        missing_indexes: The step's indexes that no relation is named after.
+    """
+
+    table: str
+    kind: ComponentKind
+    step: MigrationStep
+    table_missing: bool
+    missing_columns: tuple[str, ...]
+    missing_indexes: tuple[str, ...]
+
+    @property
+    def severity(self) -> Severity:
+        """``required`` when the table or a column is missing, else ``advisory``."""
+        if self.table_missing or self.missing_columns:
+            return "required"
+        return "advisory"
+
+    @property
+    def notes(self) -> tuple[str, ...]:
+        """The locks the step takes on a table that already exists."""
+        if self.table_missing:
+            return ()
+        notes = []
+        if self.step.objects.columns and not self.step.objects.creates_table:
+            notes.append(
+                f"step {self.step.number} of {self.table}: ALTER TABLE takes an "
+                f"ACCESS EXCLUSIVE lock on {self.table} for a moment; every "
+                "query on the table waits for it",
+            )
+        if self.missing_indexes:
+            notes.append(
+                f"step {self.step.number} of {self.table}: CREATE INDEX takes a "
+                f"SHARE lock on {self.table}; writes wait until the index is "
+                "built",
+            )
+        return tuple(notes)
+
+    def statements(self, *, lock: bool = True) -> list[str]:
+        """
+        Return the statements that run the step.
+
+        Args:
+            lock: Start with the advisory lock ``run_migrations=True`` takes.
+
+        Returns:
+            The statements, without the trailing semicolon.
+        """
+        return _script_statements([(self.table, (self.step,))], lock=lock)
+
+
+@dataclass(frozen=True)
+class SchemaProblem:
+    """
+    Something wrong with a table that no step fixes: it needs a person.
+
+    ``IF NOT EXISTS`` skips an index whose name is taken whatever the index
+    looks like, and no step adds a column to a table it did not create.
+
+    Attributes:
+        table: The table name.
+        code: What is wrong.
+        severity: ``required`` when the components cannot work this way.
+        detail: What was found, and what to do about it.
+    """
+
+    table: str
+    code: ProblemCode
+    severity: Severity
+    detail: str
+
+
+@dataclass(frozen=True)
+class MigrationPlan:
+    """
+    How a database compares with the described tables.
+
+    Attributes:
+        pending: The steps to run, by table name, then by step number.
+        problems: What no step fixes.
+        notes: The locks the pending steps take on tables that exist.
+    """
+
+    pending: tuple[PendingStep, ...]
+    problems: tuple[SchemaProblem, ...]
+    notes: tuple[str, ...]
+
+    @property
+    def is_current(self) -> bool:
+        """Whether no step is pending. Problems do not count."""
+        return not self.pending
+
+    @property
+    def is_ready(self) -> bool:
+        """Whether nothing ``required`` is missing or wrong."""
+        return all(item.severity != "required" for item in self.pending) and all(
+            problem.severity != "required" for problem in self.problems
+        )
+
+    def statements(self, *, lock: bool = True) -> list[str]:
+        """
+        Return the statements of the pending steps, for a tool that runs one.
+
+        Args:
+            lock: Start with the advisory locks, as ``migration_statements``
+                does.
+
+        Returns:
+            The statements in the order they run; none when nothing is
+            pending.
+        """
+        grouped: dict[str, list[MigrationStep]] = {}
+        for item in self.pending:
+            grouped.setdefault(item.table, []).append(item.step)
+        return _script_statements(list(grouped.items()), lock=lock)
+
+    def render_sql(
+        self,
+        *,
+        transaction: bool = True,
+        lock: bool = True,
+        lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+    ) -> str:
+        """
+        Render the script that runs the pending steps.
+
+        The script is only right for the database the plan was computed
+        from, at that moment; every statement still only adds what is missing.
+
+        Args:
+            transaction: Wrap the script in ``BEGIN`` and ``COMMIT``.
+            lock: Take the advisory locks, as ``render_sql`` does.
+            lock_timeout: Seconds a statement waits for a lock, as for
+                ``render_sql``; ``0`` leaves the statement out.
+
+        Returns:
+            The script, as ``render_sql`` lays it out, or an empty string when
+            nothing is pending.
+
+        Raises:
+            ValueError: if ``lock_timeout`` is not a whole number of seconds
+                from 0 to 2147483.
+        """
+        statements = _lock_timeout_first(self.statements(lock=lock), lock_timeout)
+        if not self.pending:
+            return ""
+        pending = ", ".join(
+            f"{item.table} step {item.step.number}" for item in self.pending
+        )
+        return _script_text(
+            [f"-- pending: {pending}"],
+            statements,
+            transaction=transaction,
+        )
+
+
+def catalog_query(schemas: Iterable[TableSchema]) -> str:
+    """
+    Return the read-only query that reads what a database holds for the tables.
+
+    The query has no parameters: the names are written in it as literals, so
+    every driver runs it as it is. It returns one row with one text column,
+    ``catalog``, which ``CatalogState.from_json`` reads. Names resolve through
+    the ``search_path``, as the components' own SQL does, and the query reads
+    only the ``pg_catalog`` tables, which every role can read by default.
+
+    Args:
+        schemas: The tables.
+
+    Returns:
+        The query.
+
+    Raises:
+        ValueError: if ``schemas`` is empty or a table name cannot be written
+            in SQL.
+    """
+    tables = list(schemas)
+    if not tables:
+        raise ValueError("a catalog query needs at least one table schema")
+    for table in tables:
+        _check_table_name(table.name)
+    return (
+        "SELECT json_build_object('tables', json_build_array("
+        + ", ".join(_table_state_sql(table) for table in tables)
+        + "))::text AS catalog"
+    )
+
+
+def plan_migration(
+    schemas: Iterable[TableSchema],
+    state: CatalogState,
+) -> MigrationPlan:
+    """
+    Compare a database with the described tables.
+
+    A step is pending when an object it creates is absent: then running it
+    again completes it. An object that exists in another shape than the
+    description, or under a name another object took, is a problem instead,
+    because ``IF NOT EXISTS`` would skip it: nothing runs DDL for it.
+
+    Args:
+        schemas: The tables, as given to ``catalog_query``.
+        state: What ``catalog_query`` read, through ``CatalogState.from_json``.
+
+    Returns:
+        The plan.
+
+    Raises:
+        LookupError: if ``state`` holds no entry for a table, because the
+            query was built for other tables.
+    """
+    pending: list[PendingStep] = []
+    problems: list[SchemaProblem] = []
+    # By table name, so the steps take their locks in the order
+    # migration_statements takes them.
+    for schema in sorted(schemas, key=lambda table: table.name):
+        table = state.tables.get(schema.name)
+        if table is None:
+            raise LookupError(
+                f"the catalog state has no entry for the table {schema.name!r}; "
+                "build catalog_query from the same table schemas",
+            )
+        table_pending, table_problems = _compare_table(schema, table)
+        pending.extend(table_pending)
+        problems.extend(table_problems)
+    return MigrationPlan(
+        pending=tuple(pending),
+        problems=tuple(problems),
+        notes=tuple(note for item in pending for note in item.notes),
+    )
 
 
 @dataclass(frozen=True)
@@ -635,6 +1069,304 @@ def _lock_statement(table_name: str) -> str:
     )
 
 
+def _script_statements(
+    tables: Sequence[tuple[str, Sequence[MigrationStep]]],
+    *,
+    lock: bool,
+) -> list[str]:
+    statements: list[str] = []
+    if lock:
+        # Sorted, so two scripts that lock the same tables take the locks in
+        # the same order and cannot deadlock each other.
+        statements.extend(
+            _lock_statement(name) for name in sorted({name for name, _ in tables})
+        )
+    statements.extend(
+        statement
+        for _, steps in tables
+        for step in steps
+        for statement in step.statements
+    )
+    return statements
+
+
+def _steps_through(
+    table: TableSchema,
+    through: Optional[int],
+) -> tuple[MigrationStep, ...]:
+    if through is None:
+        return table.steps
+    numbers = [step.number for step in table.steps]
+    if through not in numbers:
+        raise ValueError(
+            f"the {table.kind} table {table.name!r} has steps "
+            f"{', '.join(map(str, numbers))}, not step {through}: name a step "
+            "every table has, once per table if they differ",
+        )
+    return tuple(step for step in table.steps if step.number <= through)
+
+
+def _script_text(
+    header: Sequence[str],
+    statements: Sequence[str],
+    *,
+    transaction: bool,
+) -> str:
+    if transaction:
+        statements = ["BEGIN", *statements, "COMMIT"]
+    lines = [
+        f"-- taskiq-postgresql {_package_version()}",
+        *header,
+        *(f"{statement};" for statement in statements),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _lock_timeout_first(statements: Sequence[str], lock_timeout: int) -> list[str]:
+    _check_lock_timeout(lock_timeout)
+    if not lock_timeout:
+        return list(statements)
+    # First, so that it also bounds the wait for the advisory lock.
+    return [f"SET LOCAL lock_timeout = '{lock_timeout}s'", *statements]
+
+
+def _scoped_lock_timeout(statements: Sequence[str], lock_timeout: int) -> list[str]:
+    """
+    Bound the lock waits of statements that share a transaction with others.
+
+    The statements run with ``lock_timeout``; those after them, such as the
+    rest of an Alembic revision, get back the value the transaction had.
+    ``SET LOCAL lock_timeout TO DEFAULT`` would not do that: ``DEFAULT`` is
+    "whatever value it would have had if no SET had been executed in the
+    current session" (https://www.postgresql.org/docs/current/sql-set.html),
+    so a value the session or the transaction set would be lost.
+    """
+    bounded = _lock_timeout_first(statements, lock_timeout)
+    if not lock_timeout:
+        return bounded
+    saved = _sql_literal(_SAVED_LOCK_TIMEOUT)
+    # missing_ok and NULLIF turn a value this transaction never saved (missing
+    # or empty) into NULL, which set_config reads as a reset, instead of an
+    # error.
+    restore = (
+        "SELECT set_config('lock_timeout', "
+        f"NULLIF(current_setting({saved}, true), ''), true)"
+    )
+    return [
+        f"SELECT set_config({saved}, current_setting('lock_timeout'), true)",
+        *bounded,
+        restore,
+    ]
+
+
+# The type format_type() reports for each TypeName. SERIAL is an integer
+# column with a sequence default.
+_CATALOG_TYPES: Final[Mapping[TypeName, str]] = {
+    "serial": "integer",
+    "uuid": "uuid",
+    "varchar": "character varying",
+    "text": "text",
+    "bytea": "bytea",
+    "jsonb": "jsonb",
+    "timestamptz": "timestamp with time zone",
+}
+# pg_class.relkind of a table and a partitioned table, and of an index and a
+# partitioned index.
+_TABLE_RELKINDS: Final = frozenset({"r", "p"})
+_INDEX_RELKINDS: Final = frozenset({"i", "I"})
+
+
+def _catalog_type(column: ColumnSchema) -> str:
+    spelling = _CATALOG_TYPES[column.type_name]
+    return spelling if column.length is None else f"{spelling}({column.length})"
+
+
+def _table_state_sql(table: TableSchema) -> str:
+    # Names go in as escaped literals: the query has no bind parameters, so
+    # every driver runs it the same way.
+    name = _sql_literal(table.name)
+    indexes = ", ".join(_index_state_sql(index.name) for index in table.indexes)
+    return (
+        "(SELECT json_build_object("  # noqa: S608
+        f"'name', {name}, "
+        "'relkind', c.relkind, "
+        "'columns', (SELECT json_agg(json_build_array(a.attname,"
+        " format_type(a.atttypid, a.atttypmod)) ORDER BY a.attnum)"
+        " FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0"
+        " AND NOT a.attisdropped), "
+        f"'indexes', json_build_array({indexes})) "
+        f"FROM (SELECT to_regclass({name}) AS oid) AS t "
+        "LEFT JOIN pg_class c ON c.oid = t.oid)"
+    )
+
+
+def _index_state_sql(index_name: str) -> str:
+    # Correlated with the table's pg_class row (c) of _table_state_sql.
+    name = _sql_literal(index_name)
+    return (
+        "(SELECT json_build_object("  # noqa: S608
+        f"'name', {name}, "
+        "'relkind', ic.relkind, "
+        "'on_table', i.indrelid IS NOT DISTINCT FROM c.oid, "
+        "'valid', i.indisvalid, "
+        "'method', am.amname, "
+        "'unique', i.indisunique, "
+        "'partial', i.indpred IS NOT NULL, "
+        "'columns', (SELECT json_agg(a.attname ORDER BY k.n)"
+        " FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, n)"
+        " LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid"
+        " AND a.attnum = k.attnum WHERE k.n <= i.indnkeyatts)) "
+        f"FROM (SELECT to_regclass({name}) AS oid) AS r "
+        "LEFT JOIN pg_class ic ON ic.oid = r.oid "
+        "LEFT JOIN pg_index i ON i.indexrelid = r.oid "
+        "LEFT JOIN pg_am am ON am.oid = ic.relam)"
+    )
+
+
+def _compare_table(
+    schema: TableSchema,
+    table: TableState,
+) -> tuple[list[PendingStep], list[SchemaProblem]]:
+    problems = [
+        problem
+        for index in schema.indexes
+        for problem in _index_problems(schema, index, table)
+    ]
+    if table.relkind is None:
+        pending = [
+            PendingStep(
+                table=schema.name,
+                kind=schema.kind,
+                step=step,
+                table_missing=True,
+                missing_columns=step.objects.columns,
+                missing_indexes=tuple(index.name for index in step.objects.indexes),
+            )
+            for step in schema.steps
+        ]
+        return pending, problems
+    if table.relkind not in _TABLE_RELKINDS:
+        problems.insert(
+            0,
+            SchemaProblem(
+                table=schema.name,
+                code="name_taken",
+                severity="required",
+                detail=(
+                    f"{schema.name} is a relation of kind {table.relkind!r}, not "
+                    "a table: rename it, or configure another table name"
+                ),
+            ),
+        )
+        return [], problems
+    pending = []
+    for step in schema.steps:
+        missing_columns = tuple(
+            name for name in step.objects.columns if name not in table.columns
+        )
+        missing_indexes = tuple(
+            index.name
+            for index in step.objects.indexes
+            if not _index_state(table, index.name).exists
+        )
+        if step.objects.creates_table:
+            # CREATE TABLE IF NOT EXISTS skips an existing table: running the
+            # step again would not bring a column back.
+            problems.extend(
+                SchemaProblem(
+                    table=schema.name,
+                    code="missing_column",
+                    severity="required",
+                    detail=(
+                        f"{schema.name} has no column {name}, which step "
+                        f"{step.number} creates with the table: add it by hand"
+                    ),
+                )
+                for name in missing_columns
+            )
+            missing_columns = ()
+        if missing_columns or missing_indexes:
+            pending.append(
+                PendingStep(
+                    table=schema.name,
+                    kind=schema.kind,
+                    step=step,
+                    table_missing=False,
+                    missing_columns=missing_columns,
+                    missing_indexes=missing_indexes,
+                ),
+            )
+    problems.extend(
+        SchemaProblem(
+            table=schema.name,
+            code="column_type",
+            severity="advisory",
+            detail=(
+                # !r: the type comes from the catalog, and a log line must not
+                # be split by what a database holds.
+                f"{schema.name}.{column.name} is {table.columns[column.name]!r}, "
+                f"not {_catalog_type(column)}: check the component's "
+                "configuration, such as field_for_task_id"
+            ),
+        )
+        for column in schema.columns
+        if column.name in table.columns
+        and table.columns[column.name] != _catalog_type(column)
+    )
+    return pending, problems
+
+
+def _index_state(table: TableState, name: str) -> IndexState:
+    return table.indexes.get(name) or IndexState(name=name)
+
+
+def _index_problems(
+    schema: TableSchema,
+    index: IndexSchema,
+    table: TableState,
+) -> list[SchemaProblem]:
+    found = _index_state(table, index.name)
+    if not found.exists:
+        return []
+
+    def problem(code: ProblemCode, detail: str) -> list[SchemaProblem]:
+        return [SchemaProblem(schema.name, code, "advisory", detail)]
+
+    if found.relkind not in _INDEX_RELKINDS:
+        return problem(
+            "name_taken",
+            f"{index.name} is a relation of kind {found.relkind!r}, not an "
+            f"index, so {schema.name} cannot get that index: rename the relation",
+        )
+    if not found.on_table:
+        return problem(
+            "index_on_other_table",
+            f"the index {index.name} belongs to another table, so "
+            f"{schema.name} cannot get an index of that name: rename or drop "
+            "the other index",
+        )
+    if not found.valid:
+        return problem(
+            "invalid_index",
+            f"the index {index.name} is invalid (a failed CREATE INDEX "
+            "CONCURRENTLY leaves one), and queries do not use it: drop it, "
+            "then run the migration again",
+        )
+    if (found.method, found.columns, found.unique, found.partial) != (
+        index.method,
+        index.columns,
+        False,
+        False,
+    ):
+        return problem(
+            "index_shape",
+            f"the index {index.name} is not the {index.method} index on "
+            f"({', '.join(index.columns)}) the description has: drop it, then "
+            "run the migration again",
+        )
+    return []
+
+
 def _column_schema(column: Column) -> ColumnSchema:
     spelling = " ".join(column.type.upper().split())
     length: Optional[int] = None
@@ -670,6 +1402,14 @@ def _schema(
 ) -> TableSchema:
     name = create_table.table_name
     _check_table_name(name)
+    created_indexes = tuple(
+        IndexSchema(
+            name=index_name(name, column),
+            columns=(column.name,),
+            method="hash",
+        )
+        for column in index_columns
+    )
     steps = [
         MigrationStep(
             number=1,
@@ -681,8 +1421,21 @@ def _schema(
                     for column in index_columns
                 ),
             ),
+            objects=StepObjects(
+                creates_table=True,
+                columns=tuple(column.name for column in create_table.columns),
+                indexes=created_indexes,
+            ),
         ),
     ]
+    added = tuple(
+        IndexSchema(
+            name=index.name,
+            columns=tuple(column.name for column in index.columns),
+            method="btree",
+        )
+        for index in added_indexes
+    )
     if added_columns or added_indexes:
         # What the driver runs after the CREATEs, so a table an older release
         # created gets it too.
@@ -690,6 +1443,11 @@ def _schema(
             MigrationStep(
                 number=2,
                 statements=_added_statements(add_columns, added_columns, added_indexes),
+                objects=StepObjects(
+                    creates_table=False,
+                    columns=tuple(column.name for column in added_columns),
+                    indexes=added,
+                ),
             ),
         )
     return TableSchema(
@@ -699,24 +1457,7 @@ def _schema(
         columns=tuple(
             _column_schema(column) for column in (*create_table.columns, *added_columns)
         ),
-        indexes=(
-            *(
-                IndexSchema(
-                    name=index_name(name, column),
-                    columns=(column.name,),
-                    method="hash",
-                )
-                for column in index_columns
-            ),
-            *(
-                IndexSchema(
-                    name=index.name,
-                    columns=tuple(column.name for column in index.columns),
-                    method="btree",
-                )
-                for index in added_indexes
-            ),
-        ),
+        indexes=(*created_indexes, *added),
         steps=tuple(steps),
     )
 

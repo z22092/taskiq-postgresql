@@ -23,7 +23,9 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `taskiq_postgresql/result_backend.py` | Result backend: upsert, select, delete of serialized results (pickle by default) |
 | `taskiq_postgresql/scheduler_source.py` | Schedule source: schedules stored as JSONB |
 | `taskiq_postgresql/abc/query.py` | SQL builders for the DDL and every row query |
-| `taskiq_postgresql/migrations.py` | The tables described as columns and indexes (`TableSchema`) and as the ordered statements `on_startup` runs (`MigrationStep`), built from the drivers' own builders; `render_sql` and the migration formats registered under the `taskiq_postgresql.migration_formats` entry-point group |
+| `taskiq_postgresql/migrations.py` | The tables described as columns and indexes (`TableSchema`) and as the ordered statements `on_startup` runs (`MigrationStep`, whose `objects` name what each step creates), built from the drivers' own builders; `render_sql`, `migration_statements` and the migration formats registered under the `taskiq_postgresql.migration_formats` entry-point group; the comparison engine: `catalog_query` (one read-only catalog query), `CatalogState`, `plan_migration` (a `MigrationPlan` of `PendingStep` and `SchemaProblem`) |
+| `taskiq_postgresql/contrib/sqlalchemy.py`, `contrib/sqlmodel.py` | Extras `sqlalchemy` and `sqlmodel`: `add_taskiq_tables` and `taskiq_metadata` build SQLAlchemy `Table` objects from `TableSchema` and record the descriptions under `MetaData.info[METADATA_INFO_KEY]` |
+| `taskiq_postgresql/contrib/alembic.py` | Extra `alembic`: the autogenerate comparator `compare_taskiq_steps` (registered on import) and its `TaskiqStepOp`/`TaskiqStepNoopOp`, `upgrade_taskiq_tables` for hand-written revisions, `exclude_taskiq_tables` and the `alembic` migration format (`alembic_format`); each step bounds its own lock waits (`LOCK_TIMEOUT_OPTION`) |
 | `taskiq_postgresql/cli.py` | `taskiq postgresql generate` (prints a migration script) and `taskiq postgresql migrate` (creates the tables once), a `taskiq_cli` entry point |
 | `taskiq_postgresql/abc/driver.py` | `QueryDriver` and `ListenDriver` interfaces |
 | `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces; `_params.py` (bind parameters) and `_health.py` (the `LISTEN` health check) are shared |
@@ -33,6 +35,8 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `tests/test_readme_examples.py` | Runs the README's examples and checks its tables |
 | `tests/test_listen_recovery.py`, `tests/silent_proxy.py` | Lost and silent connections (reopening `LISTEN`, bounded waits), through a TCP proxy that makes a connection go silent, refuse or drop |
 | `tests/unit/` | Tests that need no database (SQL text, parameter shaping, wiring) |
+| `tests/test_migration_plan.py`, `tests/golden/migration_steps.sql` | The comparison engine against real catalogs, and the released steps, which must never change |
+| `tests/test_contrib_*.py` | The SQLAlchemy, SQLModel and Alembic integrations; the Alembic ones carry the `alembic` mark (`pytest -m alembic`), which CI also runs on the oldest Alembic the extra allows |
 | `scripts/check_pins.py` | Checks that pins declared in several places agree |
 | `docs/` | Architecture, ADRs; `docs/spikes/` holds dated planning notes |
 
