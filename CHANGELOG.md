@@ -151,7 +151,13 @@ Upgrading from 0.4.x:
   `context.configure(..., taskiq_postgresql_lock_timeout=N)` in `env.py`
   (autogenerate writes the value into the revision),
   `upgrade_taskiq_tables(..., lock_timeout=N)` or
-  `generate --format alembic --lock-timeout N`; `0` leaves the bound out.
+  `generate --format alembic --lock-timeout N`; `0` leaves the bound out. The
+  lock and the bound only work inside the revision's transaction, so
+  `upgrade_taskiq_tables` raises `RuntimeError` on an autocommit connection
+  (for example inside `autocommit_block()`) before it runs a statement. The
+  format and `TaskiqStepOp` refuse a table name that is not a plain SQL
+  identifier, a line break in a table name, or an unknown component kind, and
+  `downgrade=drop` bounds its `DROP TABLE` statements by the same lock timeout.
 - `PostgresqlBroker(health_check_interval=30.0, query_timeout=30.0)`. When the
   LISTEN connection stays silent for `health_check_interval` seconds (with
   psycopg, every `health_check_interval` seconds), the worker sends the same

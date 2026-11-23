@@ -1302,7 +1302,9 @@ def _compare_table(
             code="column_type",
             severity="advisory",
             detail=(
-                f"{schema.name}.{column.name} is {table.columns[column.name]}, "
+                # !r: the type comes from the catalog, and a log line must not
+                # be split by what a database holds.
+                f"{schema.name}.{column.name} is {table.columns[column.name]!r}, "
                 f"not {_catalog_type(column)}: check the component's "
                 "configuration, such as field_for_task_id"
             ),

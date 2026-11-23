@@ -781,7 +781,10 @@ the transaction back the `lock_timeout` it had, so your own migrations in the
 same revision wait for locks as before. Set the number of seconds with
 `context.configure(..., taskiq_postgresql_lock_timeout=5)` in `env.py`, which
 autogenerate writes into each step of the revision; `0` leaves both statements
-out, and the transaction's own `lock_timeout` applies.
+out, and the transaction's own `lock_timeout` applies. The lock and the bound
+only work inside the revision's transaction: `upgrade_taskiq_tables` raises
+`RuntimeError` on an autocommit connection (`autocommit_block()`, or an
+`AUTOCOMMIT` isolation level) instead of running the steps unbounded.
 
 If the workers keep `run_migrations=True` and Alembic should leave the tables
 alone, keep them out of `target_metadata` and filter them out instead;
@@ -858,7 +861,9 @@ The format takes these options:
 - `down_revision`: the revision it follows, usually your current head. By
   default there is none: it is a first revision.
 - `downgrade`: `none` (the default) leaves the tables in place; `drop` makes
-  `downgrade()` drop them with `DROP TABLE IF EXISTS`.
+  `downgrade()` drop them with `DROP TABLE IF EXISTS`, bounded by the same lock
+  timeout as the steps. The table names must be plain SQL identifiers (letters,
+  digits, `_` and `$`, not starting with a digit): the format refuses others.
 
 The file has no `BEGIN` or `COMMIT`, because Alembic runs each revision in its
 own transaction, so `--no-transaction` changes nothing; `--no-lock` leaves
