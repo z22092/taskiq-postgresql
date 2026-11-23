@@ -31,7 +31,6 @@ from typing import (
     NamedTuple,
     Optional,
     Union,
-    cast,
     get_args,
 )
 
@@ -786,7 +785,7 @@ def _schema_of_kind(
             f"field_for_task_id must be one of {', '.join(TASK_ID_TYPES)}, "
             f"got {field_for_task_id!r}",
         )
-    component_kind = cast("ComponentKind", kind)
+    component_kind: ComponentKind = kind
     component_class = _component_classes()[component_kind]
     name = _default(component_class, "table_name") if table_name is None else table_name
     if component_kind == "scheduler_source":

@@ -207,6 +207,13 @@ Upgrading from 0.4.x:
 - A custom `QueryDriver` must implement `fetch_row(query, *values)`, which
   returns the first row of a query as a `dict`, or `None`. The broker builds
   its claim queries itself and runs them through it.
+- The `driver` parameter of the three components is typed
+  `Literal["asyncpg", "psqlpy", "psycopg"]`, so type checkers reject
+  `"pg8000"`. It was listed before but no release implemented it: passing it
+  raised `ValueError` at construction, as it still does.
+- The asyncpg query driver's `connection()`, used outside `async with driver`,
+  raises `DatabaseConnectionError` like the psqlpy and psycopg drivers do,
+  instead of `AttributeError`.
 
 ### Fixed
 
@@ -248,11 +255,24 @@ Upgrading from 0.4.x:
   asyncpg and psqlpy drivers its worker processes used to keep running until a
   message arrived (with asyncpg, until its connection pool's idle timer fired
   about five minutes later), and the main process waited for them.
+- `PostgresqlBroker.shutdown()` and `PostgresqlSchedulerSource.shutdown()`
+  raised `AttributeError`, for every driver, when the component had run no
+  query since `startup()` with `run_migrations=False`: for example a worker
+  that received no message, or a schedule source never asked for its
+  schedules. A query driver's `on_shutdown()` now does nothing when no query
+  opened its pool.
+- The warning for a NOTIFY payload that is not a message id holds at most
+  the first 64 characters of it, followed by its length when it is longer,
+  because any role that can connect can notify the channel. An integer
+  outside the range of the broker's `id` column (1 to 2147483647) is not a
+  message id either: it gets that warning, where its claim used to log an
+  error with the whole number and a traceback, or match no row.
+- `InsertOrUpdateQuery.make_query(..., on_conflict_action="NOTHING")` raised
+  `TypeError`; it now names the conflict columns.
 - `shutdown()` no longer hangs on a connection that stopped answering: the
   asyncpg pool and LISTEN connection are closed by force once `query_timeout`
-  runs out, and the whole of it takes at most about twice `query_timeout`. It
-  no longer raises `AttributeError` when no query had created the pool yet,
-  and a second call does nothing.
+  runs out, and the whole of it takes at most about twice `query_timeout`. A
+  second call does nothing.
 - With asyncpg and psycopg, a claim on a pooled connection that stopped
   answering no longer blocks `listen()`: it is given up after `query_timeout`
   seconds (asyncpg may take up to about twice that) and logged, and asyncpg
