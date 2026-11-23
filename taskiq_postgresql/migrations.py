@@ -75,6 +75,7 @@ __all__ = [
     "collect_components",
     "collect_schemas",
     "load_format",
+    "migration_statements",
     "render_sql",
     "sql_format",
     "table_schema",
@@ -344,8 +345,44 @@ def render_sql(
             in a script.
     """
     tables = list(schemas)
+    statements = migration_statements(tables, lock=lock)
+    if transaction:
+        statements = ["BEGIN", *statements, "COMMIT"]
+    lines = [
+        f"-- taskiq-postgresql {_package_version()}",
+        f"-- tables: {', '.join(table.name for table in tables)}",
+        *(f"{statement};" for statement in statements),
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def migration_statements(
+    schemas: Iterable[TableSchema],
+    *,
+    lock: bool = True,
+) -> list[str]:
+    """
+    Return the statements of the script, one by one, for a tool that runs one.
+
+    A driver that prepares every statement it sends, such as asyncpg, refuses
+    a script of several statements in one call. These are the statements of
+    ``render_sql(schemas, transaction=False, lock=lock)``, in the same order,
+    without the header comment and the semicolons.
+
+    Args:
+        schemas: The tables, in the order their statements run.
+        lock: Start with the advisory locks, as ``render_sql`` does.
+
+    Returns:
+        The statements, in the order they run.
+
+    Raises:
+        ValueError: if ``schemas`` is empty or a table name cannot be written
+            in a script.
+    """
+    tables = list(schemas)
     if not tables:
-        raise ValueError("render_sql() needs at least one table schema")
+        raise ValueError("a migration script needs at least one table schema")
     for table in tables:
         _check_table_name(table.name)
     statements: list[str] = []
@@ -361,14 +398,7 @@ def render_sql(
         for step in table.steps
         for statement in step.statements
     )
-    if transaction:
-        statements = ["BEGIN", *statements, "COMMIT"]
-    lines = [
-        f"-- taskiq-postgresql {_package_version()}",
-        f"-- tables: {', '.join(table.name for table in tables)}",
-        *(f"{statement};" for statement in statements),
-    ]
-    return "\n".join(lines) + "\n"
+    return statements
 
 
 @dataclass(frozen=True)
