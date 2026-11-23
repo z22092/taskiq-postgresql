@@ -14,10 +14,13 @@ psycopg drivers failed.
 
 ## Decision
 
-- The package calls the pydantic v2 API directly:
-  `ScheduledTask.model_validate_json` and `model_dump_json` in
-  `scheduler_source.py`, and `pydantic_core.to_json` for JSONB values in
-  `drivers/_asyncpg.py` and `drivers/_psycopg.py`. These are the calls the
+- The package calls the pydantic v2 API directly. `scheduler_source.py` writes
+  a schedule with `ScheduledTask.model_dump_json` and reads it back with
+  `json.loads` followed by `ScheduledTask.model_validate`, because the
+  `cron_offset` is normalized between the two steps. JSONB values for the
+  asyncpg and psycopg drivers are encoded by `encode_params` in
+  `drivers/_params.py`, which calls `dumps` in `drivers/_json.py`, a thin
+  wrapper over `pydantic_core.to_json`. The write calls are the ones the
   removed helpers made on v2, so the stored JSON does not change.
 - `pydantic>=2.5,<3` is a declared runtime dependency, matching taskiq 0.13's
   own floor, and the taskiq range is `>=0.11.7,<0.14`.

@@ -92,7 +92,10 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   their values travel as bind parameters (`$1`, `$2`, ...), never formatted
   into the SQL text. The exceptions are `LISTEN` (channel name) and `NOTIFY`,
   whose payload is the integer id the broker's own INSERT returned. Table,
-  column and channel names come from configuration and are emitted unquoted.
+  column names come from configuration and are emitted unquoted. Channel
+  names are unquoted in `NOTIFY` and in psycopg's and psqlpy's `LISTEN`, but
+  asyncpg sends `LISTEN "<channel>"` quoted, so a channel name with upper case
+  letters is lost on asyncpg and psqlpy: keep `channel_name` lower case.
 - **Schema.** Tables are created with `CREATE TABLE IF NOT EXISTS` when
   `run_migrations=True`, so existing deployments keep their tables. Changing a
   column is a schema change for them; `tests/unit/test_components.py` pins the

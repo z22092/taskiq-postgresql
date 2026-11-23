@@ -52,7 +52,12 @@ name to a class. `drivers/__init__.py` imports a driver module only when
 | Pool | `asyncpg.create_pool` | `psqlpy.ConnectionPool` | `psycopg_pool.AsyncConnectionPool` with `AsyncRawCursor`, so `$n` placeholders work |
 | JSONB values | dict -> JSON text (`pydantic_core.to_json`) | wrapped in `psqlpy.extra_types.JSONB` (JSON text is parsed first) | dict -> JSON text (`pydantic_core.to_json`) |
 | UUID values | `UUID` -> hex text | text -> `uuid.UUID` | `UUID` -> hex text |
-| Listen | `asyncpg.connect` + `add_listener` callback into a queue | pool `listener()` with a callback into a queue | autocommit connection, `LISTEN <channel>`, then `notifies()`; a payload that is not an integer is logged and skipped |
+| Listen | `asyncpg.connect` + `add_listener` callback into a queue | pool `listener()` with a callback into a queue | autocommit connection, `LISTEN <channel>`, then `notifies()` |
+
+Every listen driver reads the payload with `parse_message_id` in
+`drivers/_notify.py`: a payload that is not an integer is logged, cut to its
+first 64 characters because any role that can connect can notify the channel,
+and skipped.
 
 asyncpg and psycopg shape their bind parameters with the shared
 `encode_params` in `drivers/_params.py`; psqlpy has its own
@@ -63,12 +68,18 @@ anything reaches the server.
 ## SQL
 
 `taskiq_postgresql/abc/query.py` builds every DDL statement and row query.
-Values are always bind parameters (`$1`, `$2`, ...). Table, column and channel
-names come from the component's configuration and are written unquoted, so
-PostgreSQL folds them to lower case. Two statements are formatted outside the
-builders: `LISTEN <channel>` in the psycopg listen driver, and
-`NOTIFY <channel>, '<id>'` in the broker, whose payload is the integer id its
-own INSERT returned.
+Values are always bind parameters (`$1`, `$2`, ...). Table and column names
+come from the component's configuration and are written unquoted, so
+PostgreSQL folds them to lower case. Channel names are not handled the same by
+every driver (measured with `log_statement=all`): the broker sends
+`NOTIFY <channel>, '<id>'` unquoted, which folds the name; psycopg and psqlpy
+send `LISTEN <channel>` unquoted too, but asyncpg's `add_listener` sends
+`LISTEN "<channel>"` quoted, which keeps the case. A channel name with upper
+case letters therefore delivers on psycopg only; asyncpg and psqlpy never
+receive the message. Use a lower-case `channel_name`. Two statements are
+formatted outside the builders: `LISTEN <channel>` in the psycopg listen
+driver, and `NOTIFY <channel>, '<id>'` in the broker, whose payload is the
+integer id its own INSERT returned.
 
 ### Tables
 
@@ -105,7 +116,7 @@ All columns are `NOT NULL`; `created_at` and `updated_at` default to `NOW()`.
 | `is_result_ready` | `SelectQuery` | `SELECT 1 FROM ... WHERE task_id = $1` |
 | `get_result` | `SelectQuery`, then `DeleteQuery` unless `keep_results` | `SELECT result ... WHERE task_id = $1` |
 | `delete_by_date` | `DeleteByDateQuery` | `DELETE ... WHERE created_at BETWEEN $1 AND $2` |
-| `PostgresqlSchedulerSource.get_schedules` | `SelectQuery` | `SELECT schedule FROM ...` |
+| `PostgresqlSchedulerSource.get_schedules` | `SelectQuery` | `SELECT id, schedule FROM ...` |
 | `add_schedule` | `InsertQuery` | `INSERT (id, task_name, schedule) ...` |
 | `delete_schedule`, `post_send` (one-off schedules) | `DeleteQuery` | `DELETE ... WHERE id = $1` |
 
