@@ -23,6 +23,8 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `taskiq_postgresql/result_backend.py` | Result backend: upsert, select, delete of serialized results (pickle by default) |
 | `taskiq_postgresql/scheduler_source.py` | Schedule source: schedules stored as JSONB |
 | `taskiq_postgresql/abc/query.py` | SQL builders for the DDL and every row query |
+| `taskiq_postgresql/migrations.py` | The tables described as columns and indexes (`TableSchema`) and as the ordered statements `on_startup` runs (`MigrationStep`), built from the drivers' own builders; `render_sql` and the migration formats registered under the `taskiq_postgresql.migration_formats` entry-point group |
+| `taskiq_postgresql/cli.py` | `taskiq postgresql generate` (prints a migration script) and `taskiq postgresql migrate` (creates the tables once), a `taskiq_cli` entry point |
 | `taskiq_postgresql/abc/driver.py` | `QueryDriver` and `ListenDriver` interfaces |
 | `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces; `_params.py` (bind parameters) and `_health.py` (the `LISTEN` health check) are shared |
 | `taskiq_postgresql/utils/` | Driver lookup by name, DSN helpers, optional-import checks |
@@ -106,7 +108,10 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   an older release gets them too; DDL is additive only. Changing a column is a
   schema change for existing deployments; `tests/unit/test_components.py` and
   `tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql`
-  pin the current DDL. The migration's advisory lock key (`MigrationLockQuery` in
+  pin the current DDL. `migrations.py` builds its steps from the same
+  builders, and `tests/test_migration_script.py::test_the_steps_are_the_sql_run_migrations_executes`
+  checks that they are the statements the drivers build for `on_startup`.
+  The migration's advisory lock key (`MigrationLockQuery` in
   `abc/query.py`) is a contract between releases;
   `tests/test_migrations.py::test_migration_lock_key_is_pinned` pins it.
 - **Types.** `ty` checks `taskiq_postgresql/` at the Python 3.10 floor and must
