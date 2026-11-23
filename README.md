@@ -174,6 +174,8 @@ once, at startup, for all three components and all drivers; if it returns
 | `pool_kwargs` | `dict` or `None` | `None` | Accepted for compatibility, currently unused. Use `connection_kwargs`. |
 | `run_migrations` | `bool` | `False` | Create the table and index on startup, and add the `channel` and `not_before` columns with their index. |
 | `poll_interval` | `float` | `1.0` | Seconds between two sweeps of the table for due messages; see [Delivery](#delivery). A value that is not a finite number above zero raises `ValueError`. |
+| `health_check_interval` | `float` | `30.0` | Seconds the `LISTEN` connection may stay silent before the worker checks it; see [Lost connections](#lost-connections). A value that is not a finite number above zero raises `ValueError`. |
+| `query_timeout` | `float` | `30.0` | Seconds the worker waits for that check, for a claim (not with psqlpy) and for a close before it gives the connection up; see [Lost connections](#lost-connections). A value that is not a finite number above zero raises `ValueError`. |
 
 ### PostgresqlResultBackend
 
@@ -271,11 +273,48 @@ message reaches one worker only. Delivery is at most once: a claimed message is
 gone from the table, and a worker that stops before finishing the task does not
 give it back.
 
-If the `LISTEN` connection closes or fails, the worker keeps delivering through
-the sweep alone, so every message then waits for the next sweep. The connection
-is opened again only when the broker starts again. With asyncpg and psycopg the
-worker logs a warning when this happens; psqlpy gives no sign that its `LISTEN`
-connection ended, so with psqlpy nothing is logged.
+### Lost connections
+
+If the `LISTEN` connection closes or fails, the worker logs one warning, keeps
+delivering through the sweep and opens the connection again. It waits about
+0.5 s before the first attempt and twice as long after each failed one, up to
+30 s, logging a warning for each failure and an INFO line once `LISTEN` works
+again.
+
+A connection can also go silent without closing: a NAT or a load balancer that
+drops an idle flow sends no FIN or RST, so the client still sees an open socket
+that never gets an answer. When the `LISTEN` connection has been quiet for
+`health_check_interval` seconds, the worker sends the same `LISTEN` again, which
+changes nothing on the server, and reopens the connection if no answer comes
+within `query_timeout` seconds. With psycopg the check runs every
+`health_check_interval` seconds, even while notifications arrive. These checks
+also keep the flow alive in a NAT, and `pg_stat_activity` keeps showing the
+`LISTEN`. The server keeps the
+abandoned session, still listening, until its own TCP keepalive notices the
+dead client (`tcp_keepalives_idle`, which defaults to the operating system's
+two hours on Linux); set it, and `tcp_user_timeout`, on the server to free such
+sessions sooner.
+
+With asyncpg and psycopg, a claim that gets no answer within `query_timeout`
+seconds is given up and logged as an error, a connection that does not answer
+is dropped from the pool, and the sweep tries again. asyncpg first gives the
+server up to `query_timeout` more to cancel the query, so it may take about
+twice `query_timeout` to give a claim up. A pool gets over silent connections
+one claim at a time, so with several of them the sweep delivers again after
+each has timed out once. A claim given up after its `DELETE` was done loses
+that message, as any lost answer to a claim does under at-most-once delivery.
+
+`shutdown()` gives a connection that does not answer `query_timeout` seconds
+to close and then closes it by force, so with silent connections it may take up
+to about twice `query_timeout`.
+
+`query_timeout` does not bound psqlpy's claims. psqlpy can neither cancel a
+query on the server nor drop one pooled connection, so a claim it gave up would
+leave its `DELETE` queued, to run later and take a row nobody receives. A claim
+on a silent psqlpy connection, and `listen()` with it, waits until the
+operating system gives up on the socket, which by default takes about 15
+minutes on Linux. To shorten that, set psqlpy's `tcp_user_timeout_sec` and its
+`keepalives_*` settings in `connection_kwargs`.
 
 ## TLS
 

@@ -1,22 +1,89 @@
 import logging
-from asyncio import Queue as AsyncQueue
-from contextlib import asynccontextmanager
+import os
+import socket
+from asyncio import Future, ensure_future, gather, wait
+from asyncio import TimeoutError as AsyncTimeoutError
+from collections.abc import Awaitable
+from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
+from typing import (
+    Any,
+    AsyncGenerator,
+    AsyncIterator,
+    Optional,
+    Sequence,
+    TypeVar,
+    Union,
+)
 from uuid import UUID
 
-from psycopg import AsyncConnection, AsyncCursor, AsyncRawCursor, Notify
+from psycopg import AsyncConnection, AsyncCursor, AsyncRawCursor
+from psycopg import Error as PsycopgError
 from psycopg.rows import DictRow, TupleRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import AddedIndex, Column
+from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.drivers._json import dumps
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 logger = logging.getLogger(__name__)
+
+_T = TypeVar("_T")
+
+# Seconds a wait woken up by shutting its socket down gets to end.
+_WAKE_UP_WITHIN = 1.0
+
+
+async def _answered_within(
+    connection: AsyncConnection[Any],
+    answer: Awaitable[_T],
+    timeout: Optional[float],
+) -> _T:
+    """
+    Await ``answer`` from ``connection``, closing the connection after ``timeout``.
+
+    Cancelling the query instead makes psycopg try to cancel it on the server
+    and then wait for its result, with no deadline up to psycopg 3.3.4: on a
+    connection that never answers, forever. Shutting the socket down ends that
+    wait.
+
+    Raises:
+        asyncio.TimeoutError: if no answer came within ``timeout`` seconds.
+    """
+    if timeout is None:
+        return await answer
+    task = ensure_future(answer)
+    try:
+        done, _ = await wait({task}, timeout=timeout)
+    finally:
+        if not task.done():
+            await _give_up(connection, task)
+    if not done:
+        raise AsyncTimeoutError
+    return task.result()
+
+
+async def _give_up(connection: AsyncConnection[Any], task: Future[Any]) -> None:
+    """End ``task``'s wait for an answer on ``connection``, then close it."""
+    # Closing first would free the socket's fd while asyncio still reads it for
+    # the pending wait: a socket opened next can get the same fd, and the
+    # wait's cleanup would then stop asyncio reading that one. A shutdown,
+    # through a duplicate so the fd itself stays open, wakes the wait instead.
+    with (
+        suppress(OSError, PsycopgError),
+        socket.socket(fileno=os.dup(connection.pgconn.socket)) as duplicate,
+    ):
+        duplicate.shutdown(socket.SHUT_RDWR)
+    await wait({task}, timeout=_WAKE_UP_WITHIN)
+    await connection.close()
+    # Only left running if the shutdown failed; on a closed connection the
+    # cancellation ends it at once.
+    task.cancel()
+    await gather(task, return_exceptions=True)
 
 
 class PsycopgDriver(QueryDriver):
@@ -88,7 +155,9 @@ class PsycopgDriver(QueryDriver):
             await self.pool.open()
             async with self.pool.connection() as connection:
                 yield connection
-
+        except AsyncTimeoutError:
+            # A query that got no answer, see _answered_within().
+            raise
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
 
@@ -175,12 +244,26 @@ class PsycopgDriver(QueryDriver):
     async def fetch_row(self, query: str, *values: Any) -> Optional[dict[str, Any]]:
         """Return the first row of ``query``, see ``QueryDriver.fetch_row``."""
         async with self, self.connection() as connection:
-            cursor = connection.cursor(row_factory=dict_row)
-            cursor = await cursor.execute(query, params=values)
-            # A statement without a result set, such as one with no RETURNING.
-            if cursor.rownumber is None:
-                return None
-            return await cursor.fetchone()
+            return await _answered_within(
+                connection,
+                self._fetch_row(connection, query, values),
+                self.query_timeout,
+            )
+
+    @staticmethod
+    async def _fetch_row(
+        connection: AsyncConnection[TupleRow],
+        query: str,
+        values: Sequence[Any],
+    ) -> Optional[dict[str, Any]]:
+        cursor = connection.cursor(row_factory=dict_row)
+        cursor = await cursor.execute(query, params=values)
+        # A statement without a result set, such as one with no RETURNING.
+        row = None if cursor.rownumber is None else await cursor.fetchone()
+        # Here, within the caller's bound: the pool would commit on its way
+        # out too, but without a limit on the wait for the server's answer.
+        await connection.commit()
+        return row
 
     async def select(
         self,
@@ -276,9 +359,22 @@ class PsycopgDriver(QueryDriver):
                     )
 
     async def on_shutdown(self) -> None:
-        """On shutdown."""
-        await self.pool.close()
-        self.pool = None
+        """
+        Close the pool, if a query created it.
+
+        psycopg_pool bounds the close itself, by ``query_timeout`` when it is
+        set and 5 s otherwise, and discards a connection that broke.
+        """
+        pool = self.pool
+        if pool is None:
+            return
+        try:
+            if self.query_timeout is None:
+                await pool.close()
+            else:
+                await pool.close(timeout=self.query_timeout)
+        finally:
+            self.pool = None
 
     async def execute(self, query: str, *values: Any) -> list[Any]:
         """Execute a query."""
@@ -294,7 +390,7 @@ class PsycopgDriver(QueryDriver):
 
 
 class PsycopgListenDriver(ListenDriver):
-    """Asyncpg listen driver."""
+    """Psycopg listen driver."""
 
     def __init__(
         self,
@@ -304,51 +400,63 @@ class PsycopgListenDriver(ListenDriver):
     ) -> None:
         """Initialize the listen driver."""
         super().__init__(connection_string, channel_name, **connection_kwargs)
-        self._queue: AsyncQueue[str] = AsyncQueue()
+        self.connection: Optional[AsyncConnection[DictRow]] = None
+        self._listen_statement = f"LISTEN {channel_name}"
 
     async def on_startup(self) -> None:
-        """On startup."""
+        """Connect and LISTEN on the channel."""
         try:
-            self.connection: AsyncConnection[DictRow] = await AsyncConnection.connect(
+            connection = self.connection = await AsyncConnection.connect(
                 self.connection_string,
                 **self.connection_kwargs,
                 autocommit=True,
                 cursor_factory=AsyncRawCursor,
             )
-            async with self.connection.cursor() as cursor:
-                await cursor.execute(f"LISTEN {self.channel_name}")
+            await _answered_within(
+                connection,
+                connection.execute(self._listen_statement),
+                self.query_timeout,
+            )
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
 
-        self.connection.add_notify_handler(self._notification_handler)
-
     async def on_shutdown(self) -> None:
-        """On shutdown."""
-        await self.connection.close()
-
-    def _notification_handler(
-        self,
-        notify: Notify,
-    ) -> None:
-        """
-        Handle NOTIFY messages.
-
-        From asyncpg.connection.add_listener docstring:
-            A callable or a coroutine function receiving the following arguments:
-            **con_ref**: a Connection the callback is registered with;
-            **pid**: PID of the Postgres server that sent the notification;
-            **channel**: name of the channel the notification was sent to;
-            **payload**: the payload.
-        """
-        if self._queue is not None:
-            # Unparsed, see ListenDriver.__aiter__.
-            self._queue.put_nowait(notify.payload)
+        """Close the connection; psycopg does not wait on the socket to do it."""
+        connection = self.connection
+        if connection is None:
+            return
+        try:
+            await connection.close()
+        finally:
+            self.connection = None
 
     async def __aiter__(self) -> AsyncGenerator[str, None]:
-        """Iterate over the queue."""
-        async for notify in self.connection.notifies():
-            yield notify.payload
+        """
+        Yield each payload until the connection fails.
 
-        while not self.connection.closed:
-            payload = await self._queue.get()
-            yield payload
+        Reads in rounds of ``health_check_interval`` seconds and checks the
+        connection between two rounds. A NOTIFY that arrives during the check
+        waits in psycopg's backlog and comes out first in the next round, which
+        only works without a notify handler on the connection.
+
+        Raises:
+            OperationalError: when the server ends the connection.
+            DatabaseConnectionError: when the connection is not open, or does
+                not answer the health check.
+        """
+        connection = self.connection
+        if connection is None:
+            raise DatabaseConnectionError("the LISTEN connection is not open")
+        while True:
+            async for notify in connection.notifies(
+                timeout=self.health_check_interval,
+            ):
+                yield notify.payload
+            await check_listen(
+                _answered_within(
+                    connection,
+                    connection.execute(self._listen_statement),
+                    self.query_timeout,
+                ),
+                connection.close,
+            )
