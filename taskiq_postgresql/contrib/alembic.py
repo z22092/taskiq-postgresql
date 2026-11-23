@@ -18,6 +18,11 @@ module teaches Alembic's autogenerate the package's migration steps:
 - ``taskiq postgresql generate --format alembic``, which writes a revision
   file with every step in it.
 
+The steps share Alembic's transaction with the revision's other migrations,
+so they bound their own lock waits, as ``generate``'s script does
+(``DEFAULT_LOCK_TIMEOUT`` seconds unless configured, none with ``0``), and
+then give the transaction back the ``lock_timeout`` it had.
+
 The comparator registers itself globally on import, as Alembic's
 autogenerate hooks always have; it does nothing unless a metadata in
 ``target_metadata`` holds the descriptions ``taskiq_metadata`` and
@@ -52,6 +57,7 @@ from taskiq_postgresql.contrib.sqlalchemy import (
     taskiq_metadata,
 )
 from taskiq_postgresql.migrations import (
+    DEFAULT_LOCK_TIMEOUT,
     CatalogState,
     ComponentKind,
     FormatOptions,
@@ -59,6 +65,8 @@ from taskiq_postgresql.migrations import (
     MigrationStep,
     PendingStep,
     TableSchema,
+    _check_lock_timeout,
+    _scoped_lock_timeout,
     _script_statements,
     catalog_query,
     migration_statements,
@@ -73,6 +81,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DIFF_NAME",
+    "LOCK_TIMEOUT_OPTION",
     "TaskiqStepNoopOp",
     "TaskiqStepOp",
     "alembic_format",
@@ -86,6 +95,15 @@ log = logging.getLogger(__name__)
 
 DIFF_NAME: Final = "taskiq_postgresql_step"
 """The first item of a ``TaskiqStepOp``'s diff tuple, as ``alembic check`` shows it."""
+
+LOCK_TIMEOUT_OPTION: Final = "taskiq_postgresql_lock_timeout"
+"""
+The ``context.configure(...)`` keyword that sets the steps' lock timeout.
+
+Autogenerate writes it into each step of the revision: the seconds a
+statement of the step waits for a lock, ``DEFAULT_LOCK_TIMEOUT`` when it is
+not given, ``0`` for no bound of the step's own.
+"""
 
 _OPTIONS: Final = ("revision", "down_revision", "downgrade")
 _DOWNGRADES: Final = ("none", "drop")
@@ -129,13 +147,25 @@ class TaskiqStepOp(MigrateOperation):
     and never imports taskiq-postgresql. It is not registered as an
     ``op.<name>`` directive for the same reason.
 
+    The step bounds its own lock waits: it sets ``lock_timeout`` first, and
+    its last statement gives the transaction back the ``lock_timeout`` it
+    had, so the revision's other migrations wait for locks as before.
+
     Args:
         table: The table name.
         kind: The component that owns the table.
         step: The step.
         lock: Start with the advisory lock ``run_migrations=True`` takes, so
             starting workers wait for the revision's transaction.
+        lock_timeout: Seconds a statement of the step waits for a lock, the
+            advisory lock included, before it fails and Alembic's
+            transaction rolls back. ``0`` sets none: the transaction's own
+            ``lock_timeout`` applies.
         notes: The locks the step takes, written as comments.
+
+    Raises:
+        ValueError: if ``lock_timeout`` is not a whole number of seconds from
+            0 to 2147483.
     """
 
     def __init__(
@@ -145,31 +175,45 @@ class TaskiqStepOp(MigrateOperation):
         step: MigrationStep,
         *,
         lock: bool = True,
+        lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
         notes: Sequence[str] = (),
     ) -> None:
+        _check_lock_timeout(lock_timeout)
         self.table = table
         self.kind = kind
         self.step = step
         self.lock = lock
+        self.lock_timeout = lock_timeout
         self.notes = tuple(notes)
 
     @classmethod
-    def from_pending(cls, pending: PendingStep, *, lock: bool = True) -> TaskiqStepOp:
+    def from_pending(
+        cls,
+        pending: PendingStep,
+        *,
+        lock: bool = True,
+        lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+    ) -> TaskiqStepOp:
         """
         Build the operation of a step ``plan_migration`` found pending.
 
         Args:
             pending: The pending step.
             lock: As for the constructor.
+            lock_timeout: As for the constructor.
 
         Returns:
             The operation.
+
+        Raises:
+            ValueError: as the constructor does.
         """
         return cls(
             pending.table,
             pending.kind,
             pending.step,
             lock=lock,
+            lock_timeout=lock_timeout,
             notes=pending.notes,
         )
 
@@ -180,8 +224,11 @@ class TaskiqStepOp(MigrateOperation):
 
     @property
     def statements(self) -> list[str]:
-        """The statements the revision executes, the lock first."""
-        return _script_statements([(self.table, (self.step,))], lock=self.lock)
+        """The statements the revision executes, the lock timeout and lock first."""
+        return _scoped_lock_timeout(
+            _script_statements([(self.table, (self.step,))], lock=self.lock),
+            self.lock_timeout,
+        )
 
     def reverse(self) -> TaskiqStepNoopOp:
         """
@@ -261,6 +308,10 @@ def compare_taskiq_steps(
     operation, so a type change or a stray column still shows. Problems no
     step fixes, such as an invalid index, are logged as warnings.
 
+    Each step gets the lock timeout ``context.configure(...)`` sets under
+    ``LOCK_TIMEOUT_OPTION`` in ``env.py``, ``DEFAULT_LOCK_TIMEOUT`` without
+    it.
+
     It does nothing on a dialect other than PostgreSQL, when the default
     schema is not compared, or when no metadata of ``target_metadata`` holds
     descriptions under ``METADATA_INFO_KEY``. ``include_name`` and
@@ -270,6 +321,10 @@ def compare_taskiq_steps(
         autogen_context: Alembic's autogenerate context.
         upgrade_ops: The operations of the revision being generated.
         schemas: The schema names being compared; ``None`` is the default.
+
+    Raises:
+        ValueError: if the configured lock timeout is not a whole number of
+            seconds from 0 to 2147483.
     """
     dialect = autogen_context.dialect
     connection = autogen_context.connection
@@ -278,6 +333,10 @@ def compare_taskiq_steps(
     tables = _described_tables(autogen_context)
     if not tables or connection is None:
         return
+    # Checked before the catalog is read, so a wrong value fails every run,
+    # not only the ones that find a step missing.
+    lock_timeout = autogen_context.opts.get(LOCK_TIMEOUT_OPTION, DEFAULT_LOCK_TIMEOUT)
+    _check_lock_timeout(lock_timeout)
     found = connection.execute(text(_escape_colons(catalog_query(tables)))).scalar()
     plan = plan_migration(tables, CatalogState.from_json(found))
     for problem in plan.problems:
@@ -290,7 +349,10 @@ def compare_taskiq_steps(
     }
     upgrade_ops.ops.extend(
         operation
-        for operation in map(TaskiqStepOp.from_pending, plan.pending)
+        for operation in (
+            TaskiqStepOp.from_pending(pending, lock_timeout=lock_timeout)
+            for pending in plan.pending
+        )
         if operation.to_diff_tuple() not in present
     )
 
@@ -364,6 +426,7 @@ def upgrade_taskiq_tables(
     *targets: object,
     through: int,
     app_dir: Optional[str] = None,
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
 ) -> None:
     """
     Run the migration steps from a hand-written revision's ``upgrade()``.
@@ -376,6 +439,10 @@ def upgrade_taskiq_tables(
     statement only adds what is missing. With ``alembic upgrade --sql`` the
     statements are printed instead.
 
+    The statements bound their own lock waits: ``lock_timeout`` is set
+    before them, and the transaction gets back the value it had after them,
+    so the revision's other migrations wait for locks as before.
+
     Use it where an autogenerated revision would write the wrong table name:
     when the name comes from settings that differ between environments.
 
@@ -386,16 +453,24 @@ def upgrade_taskiq_tables(
         through: The last step to run. Every table must have it: name the
             tables of different step counts in separate calls.
         app_dir: As for ``taskiq_metadata``.
+        lock_timeout: Seconds a statement waits for a lock, the advisory lock
+            included, before it fails and Alembic's transaction rolls back.
+            ``0`` sets none: the transaction's own ``lock_timeout`` applies.
 
     Raises:
         TypeError: as ``taskiq_metadata`` does.
-        ValueError: if a table has no step ``through``, or as
-            ``taskiq_metadata`` does.
+        ValueError: if a table has no step ``through``, ``lock_timeout`` is
+            not a whole number of seconds from 0 to 2147483, or as
+            ``taskiq_metadata`` does. Nothing runs then.
         LookupError: as ``taskiq_metadata`` does.
         ImportError: as ``taskiq_metadata`` does.
         AttributeError: as ``taskiq_metadata`` does.
     """
-    for statement in migration_statements(_schemas(targets, app_dir), through=through):
+    statements = _scoped_lock_timeout(
+        migration_statements(_schemas(targets, app_dir), through=through),
+        lock_timeout,
+    )
+    for statement in statements:
         op.execute(_escape_colons(statement))
 
 
@@ -407,7 +482,8 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
     database: each step of each table, its SQL written out, without ``BEGIN``
     and ``COMMIT`` (Alembic runs each revision in a transaction of its own,
     so ``options.transaction`` changes nothing). ``options.lock`` keeps or
-    leaves out the advisory locks.
+    leaves out the advisory locks, and ``options.lock_timeout`` is each
+    step's own bound on lock waits (see ``TaskiqStepOp``).
 
     Options (``--option KEY=VALUE``):
 
@@ -442,7 +518,13 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
             f"downgrade must be 'none' or 'drop', got {downgrade!r}",
         )
     steps = [
-        TaskiqStepOp(schema.name, schema.kind, step, lock=options.lock)
+        TaskiqStepOp(
+            schema.name,
+            schema.kind,
+            step,
+            lock=options.lock,
+            lock_timeout=options.lock_timeout,
+        )
         for schema in sorted(schemas, key=lambda table: table.name)
         for step in schema.steps
     ]
@@ -556,10 +638,15 @@ def _prefix(autogen_context: AutogenContext) -> str:
 
 def _step_lines(step: TaskiqStepOp, prefix: str) -> list[str]:
     title = f"step {step.number} of the {step.kind} table {step.table}"
+    bound = (
+        f"# Lock waits end after {step.lock_timeout} s; the last statement "
+        "restores the transaction's lock timeout."
+    )
     return [
         f"# taskiq-postgresql {title}: the SQL run_migrations=True runs,",
         "# and each statement only adds what is missing.",
         *(f"# {note}." for note in step.notes),
+        *([bound] if step.lock_timeout else []),
         *(_execute_line(prefix, statement) for statement in step.statements),
     ]
 

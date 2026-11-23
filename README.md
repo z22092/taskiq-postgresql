@@ -559,19 +559,20 @@ exists, startup only checks for them.
 
 ### Alembic, Django and Flyway
 
-These tools run each migration in a transaction of their own, so give them the
-script without `BEGIN` and `COMMIT`. The lock and the lock timeout stay, and
-last until their transaction ends. For Flyway, write the script as a versioned
-migration, with the next free version number:
+Django and Flyway run each migration in a transaction of their own, so give
+them the script without `BEGIN` and `COMMIT`. The lock and the lock timeout
+stay, and last until their transaction ends. For Flyway, write the script as a
+versioned migration, with the next free version number:
 
 ```bash
 taskiq postgresql generate app:scheduler --no-transaction > db/migration/V2__taskiq_tables.sql
 ```
 
-For Alembic, install the `alembic` extra: [Alembic](#alembic) shows how
-autogenerate writes the steps a database lacks, a helper for a revision of
-your own, and a format that writes the revision file. In
-Django, pass `render_sql(..., transaction=False)` from
+For Alembic, install the `alembic` extra instead of copying the script:
+[Alembic](#alembic) shows how autogenerate writes the steps a database lacks,
+each with a lock timeout that ends with the step, a helper for a revision of
+your own, and a format that writes the revision file. In Django, pass
+`render_sql(..., transaction=False)` from
 `taskiq_postgresql.migrations` to `migrations.RunSQL` in a migration of your
 own; describing the tables by component kind (`table_schema("broker")` and so
 on) keeps the migration from importing your application. A Flyway file holds
@@ -771,6 +772,17 @@ that is the end of `alembic upgrade`; pass
 `context.configure(..., transaction_per_migration=True)` to commit after each
 revision instead.
 
+Each step also bounds its own lock waits, as the script of `generate` does. It
+starts with `SET LOCAL lock_timeout = '10s'`, so a statement that waits longer
+for a lock (the advisory lock, or `ALTER TABLE` on a table that a worker's
+open transaction has read) fails and Alembic rolls the revision back, instead
+of making every query on the table wait behind it. Its last statement gives
+the transaction back the `lock_timeout` it had, so your own migrations in the
+same revision wait for locks as before. Set the number of seconds with
+`context.configure(..., taskiq_postgresql_lock_timeout=5)` in `env.py`, which
+autogenerate writes into each step of the revision; `0` leaves both statements
+out, and the transaction's own `lock_timeout` applies.
+
 If the workers keep `run_migrations=True` and Alembic should leave the tables
 alone, keep them out of `target_metadata` and filter them out instead;
 otherwise autogenerate proposes `op.drop_table` for each of them:
@@ -827,8 +839,9 @@ def downgrade() -> None:
     pass
 ```
 
-Pass `field_for_task_id` too if you changed it. `alembic upgrade --sql` prints
-the statements instead of running them.
+Pass `field_for_task_id` too if you changed it, and `lock_timeout=` to change
+the 10 seconds each call bounds its lock waits by (`0` for no bound of its
+own). `alembic upgrade --sql` prints the statements instead of running them.
 
 Without autogenerate, `generate --format alembic` writes a revision file with
 every step of each table, as autogenerate writes it for an empty database:
@@ -849,8 +862,8 @@ The format takes these options:
 
 The file has no `BEGIN` or `COMMIT`, because Alembic runs each revision in its
 own transaction, so `--no-transaction` changes nothing; `--no-lock` leaves
-out the locks. Any other option, or a value the format does not accept, exits
-with 2.
+out the locks, and `--lock-timeout` sets each step's bound on lock waits as
+above. Any other option, or a value the format does not accept, exits with 2.
 
 ## Compatibility
 

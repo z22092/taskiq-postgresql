@@ -143,7 +143,15 @@ Upgrading from 0.4.x:
   `run_migrations=True` created), `upgrade_taskiq_tables(op, ..., through=N)`
   for a hand-written revision when table names differ between environments,
   and `taskiq postgresql generate --format alembic`, which writes a revision
-  file with every step.
+  file with every step. Like the script of `generate`, each step bounds its
+  lock waits, 10 seconds by default, so it fails and rolls the revision back
+  instead of stalling the broker on a live table; then it gives the
+  transaction back its own `lock_timeout`, so the revision's other
+  migrations wait as before. Set the seconds with
+  `context.configure(..., taskiq_postgresql_lock_timeout=N)` in `env.py`
+  (autogenerate writes the value into the revision),
+  `upgrade_taskiq_tables(..., lock_timeout=N)` or
+  `generate --format alembic --lock-timeout N`; `0` leaves the bound out.
 - `PostgresqlBroker(health_check_interval=30.0, query_timeout=30.0)`. When the
   LISTEN connection stays silent for `health_check_interval` seconds (with
   psycopg, every `health_check_interval` seconds), the worker sends the same

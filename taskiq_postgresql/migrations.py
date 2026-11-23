@@ -145,6 +145,9 @@ DEFAULT_LOCK_TIMEOUT: Final = 10
 # The server keeps lock_timeout as an int of milliseconds and refuses a larger
 # value when the script runs.
 _MAX_LOCK_TIMEOUT: Final = 2_147_483
+# A custom setting (two-part name) that holds a transaction's own lock_timeout
+# while steps that share the transaction run with theirs.
+_SAVED_LOCK_TIMEOUT: Final = "taskiq_postgresql_step.lock_timeout"
 _DISTRIBUTION: Final = "taskiq-postgresql"
 
 # Keyed by the upper-cased SQL spelling; PostgreSQL type names ignore case.
@@ -433,14 +436,9 @@ def render_sql(
             from 0 to 2147483.
     """
     tables = list(schemas)
-    statements = migration_statements(tables, lock=lock)
-    _check_lock_timeout(lock_timeout)
-    if lock_timeout:
-        # First, so that it also bounds the wait for the advisory lock.
-        statements.insert(0, f"SET LOCAL lock_timeout = '{lock_timeout}s'")
     return _script_text(
         [f"-- tables: {', '.join(table.name for table in tables)}"],
-        statements,
+        _lock_timeout_first(migration_statements(tables, lock=lock), lock_timeout),
         transaction=transaction,
     )
 
@@ -729,7 +727,13 @@ class MigrationPlan:
             grouped.setdefault(item.table, []).append(item.step)
         return _script_statements(list(grouped.items()), lock=lock)
 
-    def render_sql(self, *, transaction: bool = True, lock: bool = True) -> str:
+    def render_sql(
+        self,
+        *,
+        transaction: bool = True,
+        lock: bool = True,
+        lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+    ) -> str:
         """
         Render the script that runs the pending steps.
 
@@ -739,11 +743,18 @@ class MigrationPlan:
         Args:
             transaction: Wrap the script in ``BEGIN`` and ``COMMIT``.
             lock: Take the advisory locks, as ``render_sql`` does.
+            lock_timeout: Seconds a statement waits for a lock, as for
+                ``render_sql``; ``0`` leaves the statement out.
 
         Returns:
             The script, as ``render_sql`` lays it out, or an empty string when
             nothing is pending.
+
+        Raises:
+            ValueError: if ``lock_timeout`` is not a whole number of seconds
+                from 0 to 2147483.
         """
+        statements = _lock_timeout_first(self.statements(lock=lock), lock_timeout)
         if not self.pending:
             return ""
         pending = ", ".join(
@@ -751,7 +762,7 @@ class MigrationPlan:
         )
         return _script_text(
             [f"-- pending: {pending}"],
-            self.statements(lock=lock),
+            statements,
             transaction=transaction,
         )
 
@@ -1109,6 +1120,43 @@ def _script_text(
         *(f"{statement};" for statement in statements),
     ]
     return "\n".join(lines) + "\n"
+
+
+def _lock_timeout_first(statements: Sequence[str], lock_timeout: int) -> list[str]:
+    _check_lock_timeout(lock_timeout)
+    if not lock_timeout:
+        return list(statements)
+    # First, so that it also bounds the wait for the advisory lock.
+    return [f"SET LOCAL lock_timeout = '{lock_timeout}s'", *statements]
+
+
+def _scoped_lock_timeout(statements: Sequence[str], lock_timeout: int) -> list[str]:
+    """
+    Bound the lock waits of statements that share a transaction with others.
+
+    The statements run with ``lock_timeout``; those after them, such as the
+    rest of an Alembic revision, get back the value the transaction had.
+    ``SET LOCAL lock_timeout TO DEFAULT`` would not do that: ``DEFAULT`` is
+    "whatever value it would have had if no SET had been executed in the
+    current session" (https://www.postgresql.org/docs/current/sql-set.html),
+    so a value the session or the transaction set would be lost.
+    """
+    bounded = _lock_timeout_first(statements, lock_timeout)
+    if not lock_timeout:
+        return bounded
+    saved = _sql_literal(_SAVED_LOCK_TIMEOUT)
+    # missing_ok and NULLIF turn a value this transaction never saved (missing
+    # or empty) into NULL, which set_config reads as a reset, instead of an
+    # error.
+    restore = (
+        "SELECT set_config('lock_timeout', "
+        f"NULLIF(current_setting({saved}, true), ''), true)"
+    )
+    return [
+        f"SELECT set_config({saved}, current_setting('lock_timeout'), true)",
+        *bounded,
+        restore,
+    ]
 
 
 # The type format_type() reports for each TypeName. SERIAL is an integer
