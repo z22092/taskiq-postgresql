@@ -37,10 +37,25 @@ driver for `LISTEN`.
   and returns the first row as a `dict`, or `None`; the broker runs its claims
   through it. Every query method enters `async with driver`, which creates the
   connection pool on first use; `on_shutdown` closes it, and does nothing when
-  no query ever created it.
+  no query ever created it or a previous call closed it. The `query_timeout`
+  attribute (seconds; `None`, the default, waits for as long as it takes) is
+  set by the broker on its own driver. asyncpg and psycopg bound `fetch_row`
+  and `on_shutdown` by it, and `fetch_row` raises `asyncio.TimeoutError` when
+  it runs out. psqlpy does not bound its claims, since it can neither cancel
+  a query on the server nor drop one pooled connection; its close returns at
+  once.
 - `ListenDriver` owns the connection that listens on the channel (for psqlpy,
   a pool listener). Iterating it (`async for`) yields the payload of each
-  `NOTIFY` unparsed, as the `str` the server sent.
+  `NOTIFY` unparsed, as the `str` the server sent, and ends or raises when
+  the connection is lost. The broker reopens a lost connection by calling
+  `on_shutdown()` and then `on_startup()`, so both must work any number of
+  times. The broker also sets its `health_check_interval` and `query_timeout`
+  attributes (`None` by default: no check, no bound). The bundled drivers
+  then check a connection that stayed silent for `health_check_interval`
+  seconds (psycopg: every `health_check_interval` seconds) by sending the same
+  `LISTEN` again (`check_listen` in `drivers/_health.py`); with no answer
+  within `query_timeout`, they close the connection and the iterator raises
+  `DatabaseConnectionError`.
 
 `utils/get_db_driver.py` and `utils/get_db_listen_driver.py` map the `driver`
 name to a class. `drivers/__init__.py` imports a driver module only when
@@ -55,9 +70,10 @@ name to a class. `drivers/__init__.py` imports a driver module only when
 | Pool | `asyncpg.create_pool` | `psqlpy.ConnectionPool` | `psycopg_pool.AsyncConnectionPool` with `AsyncRawCursor`, so `$n` placeholders work |
 | JSONB values | dict -> JSON text (`pydantic_core.to_json`) | wrapped in `psqlpy.extra_types.JSONB` (JSON text is parsed first) | dict -> JSON text (`pydantic_core.to_json`) |
 | UUID values | `UUID` -> hex text | text -> `uuid.UUID` | `UUID` -> hex text |
-| Listen | `asyncpg.connect` + `add_listener` callback into a queue; a termination listener ends the iteration when the connection closes | pool `listener()` with a callback into a queue | autocommit connection, `LISTEN <channel>`, then `notifies()` alone, with no notify handler |
+| Listen | `asyncpg.connect` + `add_listener` callback into a queue; a termination listener ends the iteration when the connection closes | pool `listener()`; `add_callback` with a no-op registers the channel, and a task iterates the listener into a queue, then queues the error that ended it | autocommit connection, `LISTEN <channel>`, then `notifies(timeout=health_check_interval)` in rounds, with no notify handler |
+| Bounded waits (`query_timeout`) | `pool.acquire(timeout=...)`, `fetchrow(timeout=...)`; a close that runs out aborts the connections (`terminate()`) | the LISTEN health check and its close only | `_answered_within` shuts the socket down and closes the connection when a query runs out; `pool.close(timeout=...)` |
 
-The broker is the only place a payload is parsed: `_queue_notified_ids` in
+The broker is the only place a payload is parsed: `_read_notified_ids` in
 `broker.py` reads the message id with `_parse_message_id`. A payload that is
 not an integer is logged, cut to its first 64 characters (`_payload_excerpt`)
 because any role that can connect can notify the channel, and skipped.
@@ -80,9 +96,11 @@ send `LISTEN <channel>` unquoted too, but asyncpg's `add_listener` sends
 `LISTEN "<channel>"` quoted, which keeps the case. A channel name with upper
 case letters therefore delivers on psycopg only; asyncpg and psqlpy never
 receive the message. Use a lower-case `channel_name`. Two statements are
-formatted outside the builders: `LISTEN <channel>` in the psycopg listen
-driver, and `NOTIFY <channel>, '<id>'` in the broker, whose payload is the
-integer id its own INSERT returned.
+formatted outside the builders: `LISTEN` in the listen drivers (psycopg's
+`LISTEN <channel>` that subscribes, and in all three the health check, which
+repeats the statement that registered the channel, quoting included), and
+`NOTIFY <channel>, '<id>'` in the broker, whose payload is the integer id its
+own INSERT returned.
 
 ### Tables
 
@@ -168,11 +186,19 @@ sequenceDiagram
 3. Each claim is one `DELETE ... RETURNING`; PostgreSQL gives the row to one
    worker, and the others get no row and move on. The message is yielded as an
    `AckableMessage` whose `ack` is a no-op, because the row is already gone.
-4. When reading `LISTEN` ends or fails, `listen()` logs a warning (asyncpg and
-   psycopg; psqlpy's listener gives no sign that its connection ended) and
-   delivers by the sweep alone; only `startup()` opens the connection again.
-   `shutdown()` sets an `Event` that ends `listen()`, so its sweep does not
-   reopen the pool `shutdown()` closes.
+4. When reading `LISTEN` ends or fails (the connection was lost, or failed
+   its health check), `listen()` logs a warning, keeps delivering by the sweep
+   and reopens the connection through the listen driver's `on_shutdown()` and
+   `on_startup()` (`_reopen_listen`). The wait before an attempt is drawn
+   between half and all of a ceiling that starts at 0.5 s and doubles after
+   each failed attempt, up to 30 s (`_ReopenWaits`); a reopened connection
+   that drops within 30 s counts as one more failure. Each failed attempt logs
+   a warning, a reopened connection an INFO line.
+5. `shutdown()` sets an `Event` that ends `listen()` and cancels the tasks
+   that read `LISTEN`, so neither the sweep nor a reopen brings back what it
+   closes. It closes both drivers side by side, each bounded by twice
+   `query_timeout`, so a silent pool and a silent `LISTEN` connection cost one
+   wait, not two.
 
 ## Error handling
 
@@ -185,17 +211,24 @@ sequenceDiagram
   - asyncpg raises it when the pool cannot be created;
   - psqlpy and psycopg raise it for any error while a pooled connection is
     held, query errors included, because their `connection()` context wraps
-    the whole block;
+    the whole block (psycopg lets `asyncio.TimeoutError` through);
+  - a listen driver's iterator raises it when its connection fails the
+    health check, and psqlpy's when the server ends the connection;
   - every driver raises it from `connection()` when called outside
     `async with driver`, before any pool exists;
   - a component built with a callable DSN raises it when used before
     `startup()`, since its drivers have no connection string yet.
 - `ResultIsMissingError`: `get_result` finds no row for the task id.
+- `asyncio.TimeoutError`: asyncpg's and psycopg's `fetch_row` got no answer
+  within `query_timeout`; asyncpg's `connection()` found no free pooled
+  connection within it, so `kick()` raises it when the pool stays exhausted.
 - `TypeError`: a component is built without a usable DSN, or its DSN
   callable returns no usable DSN at `startup()`.
 - `ValueError`: an unknown driver name, a column/value count mismatch, an
   upsert without update columns, a `delay` label that is not a finite number
-  of seconds, or a `poll_interval` that is not one above zero.
-- `PostgresqlBroker.listen` logs a failed claim and tries again at the next
-  sweep; when reading `LISTEN` fails, it logs a warning and keeps delivering
-  by the sweep.
+  of seconds, or a `poll_interval`, `health_check_interval` or
+  `query_timeout` that is not one above zero.
+- `PostgresqlBroker.listen` logs a failed claim, a claim with no answer within
+  `query_timeout` as one error line without a traceback, and tries again at
+  the next sweep; when reading `LISTEN` fails, it logs a warning, keeps
+  delivering by the sweep and reopens the connection.

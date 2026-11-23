@@ -19,16 +19,17 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 
 | Path | What it holds |
 |---|---|
-| `taskiq_postgresql/broker.py` | Broker: INSERT, plus `NOTIFY` when due at once, on kick; `LISTEN` and a periodic sweep, each claiming with `DELETE ... RETURNING`, on listen |
+| `taskiq_postgresql/broker.py` | Broker: INSERT, plus `NOTIFY` when due at once, on kick; `LISTEN` and a periodic sweep, each claiming with `DELETE ... RETURNING`, on listen; reopens a lost `LISTEN` connection |
 | `taskiq_postgresql/result_backend.py` | Result backend: upsert, select, delete of serialized results (pickle by default) |
 | `taskiq_postgresql/scheduler_source.py` | Schedule source: schedules stored as JSONB |
 | `taskiq_postgresql/abc/query.py` | SQL builders for the DDL and every row query |
 | `taskiq_postgresql/abc/driver.py` | `QueryDriver` and `ListenDriver` interfaces |
-| `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces |
+| `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces; `_params.py` (bind parameters) and `_health.py` (the `LISTEN` health check) are shared |
 | `taskiq_postgresql/utils/` | Driver lookup by name, DSN helpers, optional-import checks |
 | `tests/` | Integration tests against a real PostgreSQL |
 | `tests/conftest.py`, `tests/helpers.py` | Fixtures (`postgresql_dsn`, drivers, teardown) and shared helpers: teardown, scratch databases, DSN and port utilities |
 | `tests/test_readme_examples.py` | Runs the README's examples and checks its tables |
+| `tests/test_listen_recovery.py`, `tests/silent_proxy.py` | Lost and silent connections (reopening `LISTEN`, bounded waits), through a TCP proxy that makes a connection go silent, refuse or drop |
 | `tests/unit/` | Tests that need no database (SQL text, parameter shaping, wiring) |
 | `scripts/check_pins.py` | Checks that pins declared in several places agree |
 | `docs/` | Architecture, ADRs; `docs/spikes/` holds dated planning notes |

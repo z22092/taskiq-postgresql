@@ -52,6 +52,15 @@ class _ConnectionStringHolder:
 class QueryDriver(_ConnectionStringHolder, ABC):
     """Base class for all PostgreSQL backends."""
 
+    #: Seconds a driver should let ``fetch_row()`` and ``on_shutdown()`` wait
+    #: on a connection that does not answer before giving the connection up;
+    #: ``None`` waits for as long as it takes. The broker sets it on its own
+    #: driver. The asyncpg and psycopg drivers bound both by it; psqlpy only
+    #: its close, since it can neither cancel a query on the server nor drop
+    #: one pooled connection, and a claim given up would leave its DELETE to
+    #: run later with nobody to take the row.
+    query_timeout: Optional[float] = None
+
     def __init__(
         self,
         connection_string: str,
@@ -147,6 +156,11 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         Returns:
             The first row it returns, by column name, or None if it returns
             none.
+
+        Raises:
+            asyncio.TimeoutError: if ``query_timeout`` is set and the query
+                got no answer within it, which gives the query up. psqlpy's
+                driver never raises it, see ``query_timeout``.
         """
 
     @abstractmethod
@@ -187,7 +201,14 @@ class QueryDriver(_ConnectionStringHolder, ABC):
 
     @abstractmethod
     async def on_shutdown(self) -> None:
-        """On shutdown."""
+        """
+        Close the pool.
+
+        A driver should stop waiting on connections that do not answer once
+        ``query_timeout`` runs out and abort them, as the bundled ones do. The
+        broker cancels the close after twice ``query_timeout``, which leaves a
+        driver that bounds its own close the time to abort.
+        """
 
     @abstractmethod
     async def execute(self, query: str, *values: Any) -> Any:
@@ -195,7 +216,26 @@ class QueryDriver(_ConnectionStringHolder, ABC):
 
 
 class ListenDriver(_ConnectionStringHolder, ABC):
-    """Base class for all PostgreSQL broker drivers."""
+    """
+    Base class for all PostgreSQL broker drivers.
+
+    The broker reopens the connection when the iterator ends or raises, by
+    calling ``on_shutdown()`` and then ``on_startup()`` again, so both must
+    work any number of times and ``on_shutdown()`` must not fail on a
+    connection that is already gone. To reopen, the broker gives
+    ``on_startup()`` ``query_timeout`` seconds; it gives every
+    ``on_shutdown()`` twice that, see ``QueryDriver.on_shutdown``.
+    """
+
+    #: Seconds of silence on the LISTEN connection after which a driver should
+    #: check it with a round trip, and end its iterator with an error if the
+    #: check fails, so that the broker reopens the connection. ``None`` never
+    #: checks. The bundled drivers send the same LISTEN again.
+    health_check_interval: Optional[float] = None
+    #: Seconds a driver should wait for that check, and for a close, before it
+    #: gives the connection up, as the bundled drivers do. ``None`` waits for
+    #: as long as it takes.
+    query_timeout: Optional[float] = None
 
     def __init__(
         self,
