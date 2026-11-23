@@ -77,8 +77,9 @@ Upgrading from 0.4.x:
   waited for a second: asyncpg waited with no timeout, psycopg until its pool
   timeout.
 - `taskiq worker` stops on SIGINT or SIGTERM while no message arrives. With the
-  asyncpg and psqlpy drivers its worker processes used to hang until one did,
-  and the main process waited for them.
+  asyncpg and psqlpy drivers its worker processes used to keep running until a
+  message arrived (with asyncpg, until its connection pool's idle timer fired
+  about five minutes later), and the main process waited for them.
 
 ### Removed
 
