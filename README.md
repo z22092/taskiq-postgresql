@@ -170,12 +170,14 @@ once, at startup, for all three components and all drivers; if it returns
 | `field_for_task_id` | `"VarChar"`, `"Text"` or `"Uuid"` | `"Uuid"` | SQL type of the `task_id` column. |
 | `channel_name` | `str` | `"taskiq"` | `LISTEN`/`NOTIFY` channel, also stored with each message: a worker's sweep takes only the messages of its own channel. Use a different one per queue that shares a database. |
 | `table_name` | `str` | `"taskiq_messages"` | Table that holds pending messages. |
-| `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. `"pg8000"` is in the type annotation but raises `ValueError`. |
+| `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. |
 | `max_retry_attempts` | `int` | `5` | Accepted for compatibility, currently unused. |
 | `connection_kwargs` | `dict` or `None` | `None` | Keyword arguments for the driver's pool and for its `LISTEN` connection, so each option must be valid for both. |
 | `pool_kwargs` | `dict` or `None` | `None` | Accepted for compatibility, currently unused. Use `connection_kwargs`. |
 | `run_migrations` | `bool` | `False` | Create the table and index on startup, and add the `channel` and `not_before` columns with their index. |
 | `poll_interval` | `float` | `1.0` | Seconds between two sweeps of the table for due messages; see [Delivery](#delivery). A value that is not a finite number above zero raises `ValueError`. |
+| `health_check_interval` | `float` | `30.0` | Seconds the `LISTEN` connection may stay silent before the worker checks it; see [Lost connections](#lost-connections). A value that is not a finite number above zero raises `ValueError`. |
+| `query_timeout` | `float` | `30.0` | Seconds the worker waits for that check, for a claim (not with psqlpy) and for a close before it gives the connection up; see [Lost connections](#lost-connections). A value that is not a finite number above zero raises `ValueError`. |
 
 ### PostgresqlResultBackend
 
@@ -273,11 +275,48 @@ message reaches one worker only. Delivery is at most once: a claimed message is
 gone from the table, and a worker that stops before finishing the task does not
 give it back.
 
-If the `LISTEN` connection closes or fails, the worker keeps delivering through
-the sweep alone, so every message then waits for the next sweep. The connection
-is opened again only when the broker starts again. With asyncpg and psycopg the
-worker logs a warning when this happens; psqlpy gives no sign that its `LISTEN`
-connection ended, so with psqlpy nothing is logged.
+### Lost connections
+
+If the `LISTEN` connection closes or fails, the worker logs one warning, keeps
+delivering through the sweep and opens the connection again. It waits about
+0.5 s before the first attempt and twice as long after each failed one, up to
+30 s, logging a warning for each failure and an INFO line once `LISTEN` works
+again.
+
+A connection can also go silent without closing: a NAT or a load balancer that
+drops an idle flow sends no FIN or RST, so the client still sees an open socket
+that never gets an answer. When the `LISTEN` connection has been quiet for
+`health_check_interval` seconds, the worker sends the same `LISTEN` again, which
+changes nothing on the server, and reopens the connection if no answer comes
+within `query_timeout` seconds. With psycopg the check runs every
+`health_check_interval` seconds, even while notifications arrive. These checks
+also keep the flow alive in a NAT, and `pg_stat_activity` keeps showing the
+`LISTEN`. The server keeps the
+abandoned session, still listening, until its own TCP keepalive notices the
+dead client (`tcp_keepalives_idle`, which defaults to the operating system's
+two hours on Linux); set it, and `tcp_user_timeout`, on the server to free such
+sessions sooner.
+
+With asyncpg and psycopg, a claim that gets no answer within `query_timeout`
+seconds is given up and logged as an error, a connection that does not answer
+is dropped from the pool, and the sweep tries again. asyncpg first gives the
+server up to `query_timeout` more to cancel the query, so it may take about
+twice `query_timeout` to give a claim up. A pool gets over silent connections
+one claim at a time, so with several of them the sweep delivers again after
+each has timed out once. A claim given up after its `DELETE` was done loses
+that message, as any lost answer to a claim does under at-most-once delivery.
+
+`shutdown()` gives a connection that does not answer `query_timeout` seconds
+to close and then closes it by force, so with silent connections it may take up
+to about twice `query_timeout`.
+
+`query_timeout` does not bound psqlpy's claims. psqlpy can neither cancel a
+query on the server nor drop one pooled connection, so a claim it gave up would
+leave its `DELETE` queued, to run later and take a row nobody receives. A claim
+on a silent psqlpy connection, and `listen()` with it, waits until the
+operating system gives up on the socket, which by default takes about 15
+minutes on Linux. To shorten that, set psqlpy's `tcp_user_timeout_sec` and its
+`keepalives_*` settings in `connection_kwargs`.
 
 ## TLS
 
@@ -453,14 +492,30 @@ psql "$POSTGRESQL_URL" -v ON_ERROR_STOP=1 -f taskiq_tables.sql
 
 Only the script goes to standard output; messages go to standard error. The
 script starts with a comment that names the package version and the tables,
-then runs in one transaction: it takes, per table, the advisory lock
-`run_migrations=True` takes, then creates each table and index with
-`IF NOT EXISTS` and adds the broker's `channel` and `not_before` columns and
-their index the same way, which also upgrades a broker table created by 0.4.x.
-So it is safe to run again, and safe while workers with
-`run_migrations=True` are starting. The statements are the ones in
+then runs in one transaction: it sets a lock timeout for that transaction,
+takes, per table, the advisory lock `run_migrations=True` takes, then creates
+each table and index with `IF NOT EXISTS` and adds the broker's `channel` and
+`not_before` columns and their index the same way, which also upgrades a
+broker table created by 0.4.x. The statements are the ones in
 [Database schema](#database-schema), with your table names and
 `field_for_task_id`.
+
+The script is idempotent: a second run changes nothing, and the advisory lock
+lets it run while workers with `run_migrations=True` are starting. It is not
+lock-free. On a live database it locks the tables even when nothing is
+missing: `CREATE INDEX` waits for every open transaction that wrote to the
+table, and `ALTER TABLE` for every open transaction that used it, before they
+find that the index or the column exists, and every later query on the
+table, the producers' `INSERT` included, waits behind the `ALTER TABLE`. So
+the script starts with `SET LOCAL lock_timeout = '10s'`: a statement that
+waits that long for a lock, the advisory lock included, fails, and the whole
+script rolls back instead of stalling the broker. Run it again once the long
+transaction has ended. `--lock-timeout SECONDS` sets another limit;
+`--lock-timeout 0` leaves the statement out, so the session's own
+`lock_timeout` applies (PostgreSQL's default, 0, waits for ever).
+`taskiq postgresql migrate` checks first and runs no DDL when every table,
+column and index exists, so it takes no table lock on a database that is
+already up to date.
 
 To generate without importing the application, for example where its settings
 are not available, name one component per call. `--table-name` and
@@ -471,6 +526,9 @@ taskiq postgresql generate --component broker --table-name taskiq_messages --fie
 ```
 
 `--no-transaction` leaves out `BEGIN` and `COMMIT`, and `--no-lock` the lock.
+Without `BEGIN`, `SET LOCAL lock_timeout` is the first statement and lasts
+until the transaction that runs the script ends; outside a transaction
+PostgreSQL ignores it with a warning.
 `--format` picks another output format, when a package has installed one (see
 [Writing a migration format](#writing-a-migration-format)), and
 `--option KEY=VALUE` passes options to it.
@@ -502,9 +560,9 @@ exists, startup only checks for them.
 ### Alembic, Django and Flyway
 
 These tools run each migration in a transaction of their own, so give them the
-script without `BEGIN` and `COMMIT`. The lock stays, and holds until their
-transaction commits. For Flyway, write the script as a versioned migration,
-with the next free version number:
+script without `BEGIN` and `COMMIT`. The lock and the lock timeout stay, and
+last until their transaction ends. For Flyway, write the script as a versioned
+migration, with the next free version number:
 
 ```bash
 taskiq postgresql generate app:scheduler --no-transaction > db/migration/V2__taskiq_tables.sql
@@ -569,20 +627,26 @@ The contract:
   `columns` (`ColumnSchema`: `name`, `sql_type`, `type_name`, `length`,
   `nullable`, `default`, `primary_key`), `indexes` (`IndexSchema`: `name`,
   `columns`, `method`) and `steps` (`MigrationStep`: `number`, the SQL
-  `statements` in the order they run, each safe to run again, and `objects`,
-  a `StepObjects` with `creates_table` and the `columns` and `indexes` the
-  step creates). The columns and indexes are the table's shape after every
-  step. Read the structure instead of
-  parsing SQL; to emit SQL, reuse `render_sql` or the steps' statements as they
-  are.
+  `statements` in the order they run, each idempotent, and `objects`, a
+  `StepObjects` with `creates_table` and the `columns` and `indexes` the step
+  creates). The columns and indexes are the table's shape after every step,
+  except that `indexes` leaves out the primary key's own index, which
+  `CREATE TABLE` creates and PostgreSQL names (`taskiq_messages_pkey` for
+  `taskiq_messages`). Read the structure instead of parsing SQL; to emit SQL,
+  reuse `render_sql` or the steps' statements as they are.
 - `options` is a `FormatOptions`: `transaction` and `lock` (`False` with
-  `--no-transaction` and `--no-lock`), and `extra`, the `--option KEY=VALUE`
-  pairs. Raise `MigrationFormatOptionError` for an option the format does not
-  accept; `generate` then exits with 2.
+  `--no-transaction` and `--no-lock`), `lock_timeout` (the seconds of
+  `--lock-timeout`, 10 by default, 0 for none), and `extra`, the
+  `--option KEY=VALUE` pairs. Raise `MigrationFormatOptionError` for an option
+  the format does not accept; `generate` then exits with 2.
 - When the format needs an optional dependency, import it at module level and
   put it in an extra named after the format. If the import fails, `generate`
   tells the user to run `pip install '<your-package>[<format>]'`. Listing the
   formats loads none of them.
+- Pick a name no other package uses. When several installed packages register
+  one name, `generate` refuses it, exits with 2 and names the packages. A name
+  this package registers, such as `sql`, always loads this package's own
+  format, so no other package can replace it.
 
 All these names are importable from `taskiq_postgresql.migrations`.
 

@@ -17,6 +17,7 @@ import pytest
 from taskiq_postgresql import migrations
 from taskiq_postgresql.migrations import (
     MIGRATION_FORMATS_GROUP,
+    AmbiguousMigrationFormatError,
     FormatOptions,
     MigrationFormatOptionError,
     TableSchema,
@@ -60,6 +61,21 @@ def register(monkeypatch: pytest.MonkeyPatch, *added: object) -> None:
     monkeypatch.setattr(migrations, "_entry_points", lambda: [*installed, *added])
 
 
+def register_first(monkeypatch: pytest.MonkeyPatch, *added: object) -> None:
+    """
+    Make the registry see ``added`` before the installed entry points.
+
+    The order of entry points follows ``sys.path``, so a package installed
+    earlier on the path is listed first.
+    """
+    installed = list(migrations._entry_points())
+    monkeypatch.setattr(migrations, "_entry_points", lambda: [*added, *installed])
+
+
+def never_loaded() -> Any:
+    raise AssertionError("this entry point must not be loaded")
+
+
 def test_the_sql_format_is_registered_by_the_package() -> None:
     (entry_point,) = entry_points(group=MIGRATION_FORMATS_GROUP, name="sql")
 
@@ -79,6 +95,11 @@ def test_the_sql_format_renders_the_script_with_the_options() -> None:
         schemas,
         FormatOptions(transaction=False, lock=False),
     ) == render_sql(schemas, transaction=False, lock=False)
+    assert sql_format(schemas, FormatOptions(lock_timeout=0)) == render_sql(
+        schemas,
+        lock_timeout=0,
+    )
+    assert "lock_timeout = '3s'" in sql_format(schemas, FormatOptions(lock_timeout=3))
 
 
 def test_the_sql_format_refuses_extra_options() -> None:
@@ -106,6 +127,42 @@ def test_a_third_party_format_is_found_through_its_entry_point(
         [table_schema("broker")],
         FormatOptions(extra={"k": "v"}),
     ) == ("TASKIQ_MESSAGES [('k', 'v')]\n")
+
+
+def test_a_name_two_packages_register_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    register(
+        monkeypatch,
+        FakeEntryPoint("tables", never_loaded, dist=FakeDistribution("bolt-tables")),
+        FakeEntryPoint("tables", never_loaded, dist=FakeDistribution("acme-tables")),
+    )
+
+    with pytest.raises(AmbiguousMigrationFormatError) as ambiguous:
+        load_format("tables")
+
+    assert ambiguous.value.format_name == "tables"
+    # Sorted, so the message does not depend on the order of sys.path.
+    assert ambiguous.value.distributions == ("acme-tables", "bolt-tables")
+    assert str(ambiguous.value) == (
+        "migration format 'tables' is registered by several installed packages: "
+        "acme-tables, bolt-tables; uninstall all but one of them"
+    )
+    assert isinstance(ambiguous.value, LookupError)
+    # The name is listed once.
+    assert available_formats().count("tables") == 1
+
+
+def test_the_package_s_own_format_wins_over_the_same_name_elsewhere(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Listed first, as a package earlier on sys.path would be.
+    register_first(
+        monkeypatch,
+        FakeEntryPoint("sql", never_loaded, dist=FakeDistribution("acme-sql")),
+    )
+
+    assert load_format("sql") is sql_format
 
 
 def test_listing_the_formats_loads_none_of_them(

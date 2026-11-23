@@ -1,23 +1,68 @@
 import json
 from asyncio import Queue as AsyncQueue
-from contextlib import asynccontextmanager
+from asyncio import Task, create_task, gather, wait_for
+from asyncio import TimeoutError as AsyncTimeoutError
+from contextlib import asynccontextmanager, suppress
 from datetime import date, datetime
+from functools import partial
 from types import TracebackType
-from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
+from typing import Any, AsyncGenerator, Optional, Sequence, Union
 from uuid import UUID
 
-from psqlpy import Connection, ConnectionPool
+from psqlpy import Connection, ConnectionPool, Listener
 from psqlpy.extra_types import JSONB
+from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import AddedIndex, Column
+from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+
+
+def encode_psqlpy_params(
+    columns: Sequence[Column],
+    values: Optional[Sequence[Any]],
+) -> list[Any]:
+    """
+    Shape bind parameters for psqlpy.
+
+    A value bound to a ``JSONB`` column is wrapped in psqlpy's ``JSONB`` (JSON
+    text is parsed first) and a value bound to a ``UUID`` column becomes a
+    ``uuid.UUID``; every other value is passed through unchanged. psqlpy does
+    not convert these on its own, so the shaping has to happen before the call.
+
+    Args:
+        columns: the columns the values are bound to, in order.
+        values: the values to bind, or ``None``.
+
+    Returns:
+        The values to send with the query; an empty list when ``values`` is
+        ``None``.
+
+    Raises:
+        ValueError: if ``columns`` and ``values`` differ in length.
+    """
+    if values is None:
+        return []
+
+    new_values = [*values]
+
+    for index, (column, value) in enumerate(zip(columns, values, strict=True)):
+        if column.type.upper() == "JSONB":
+            if isinstance(value, str):
+                value = json.loads(value)  # noqa: PLW2901
+            new_values[index] = JSONB(value)
+
+        if column.type.upper() == "UUID":
+            new_values[index] = UUID(value)
+
+    return new_values
 
 
 class PsqlpyDriver(QueryDriver):
     """Asyncpg backend."""
 
-    pool: ConnectionPool = None
+    pool: Optional[ConnectionPool] = None
 
     def __init__(
         self,
@@ -46,37 +91,34 @@ class PsqlpyDriver(QueryDriver):
             **connection_kwargs,
         )
 
-    def __parser_query(
-        self,
-        columns: Sequence[Column],
-        values: Sequence[Any],
-    ) -> list[Any]:
-        """Parser query."""
-        if values is None:
-            return []
-
-        new_values = [*values]
-
-        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
-            if column.type.upper() == "JSONB":
-                if isinstance(value, str):
-                    value = json.loads(value)  # noqa: PLW2901
-                new_values[index] = JSONB(value)
-
-            if column.type.upper() == "UUID":
-                new_values[index] = UUID(value)
-
-        return new_values
-
     @asynccontextmanager
-    async def connection(self) -> AsyncIterator[Connection]:
+    async def connection(self) -> AsyncGenerator[Connection, None]:
+        """
+        Borrow a connection from the pool for the duration of the block.
+
+        Every error raised inside the block is re-raised as
+        ``DatabaseConnectionError``, so callers handle one exception type
+        whatever the driver. The pool only exists after ``async with driver``,
+        so refusing here keeps a stray call from opening a pool nobody closes.
+
+        Yields:
+            A pooled psqlpy connection, released when the block ends.
+
+        Raises:
+            DatabaseConnectionError: if the pool is not open, or for any error
+                raised while the connection is held.
+        """
+        if self.pool is None:
+            raise DatabaseConnectionError(
+                "The pool is not open: enter `async with driver` first.",
+            )
         try:
             async with self.pool.acquire() as connection:
                 yield connection
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
 
-    async def __aenter__(self) -> Connection:
+    async def __aenter__(self) -> Self:
         """Enter the context manager."""
         if self.pool is None:
             self.pool = ConnectionPool(
@@ -104,12 +146,12 @@ class PsqlpyDriver(QueryDriver):
             if returning:
                 return await connection.fetch_val(
                     self.insert_query.make_query(columns, returning),
-                    self.__parser_query(columns, values),
+                    encode_psqlpy_params(columns, values),
                 )
 
             await connection.execute(
                 self.insert_query.make_query(columns, returning),
-                self.__parser_query(columns, values),
+                encode_psqlpy_params(columns, values),
             )
 
             return None
@@ -132,7 +174,7 @@ class PsqlpyDriver(QueryDriver):
                         on_conflict_columns,
                         on_conflict_update_columns=on_conflict_update_columns,
                     ),
-                    self.__parser_query(columns, values),
+                    encode_psqlpy_params(columns, values),
                 )
 
             await connection.execute(
@@ -142,17 +184,17 @@ class PsqlpyDriver(QueryDriver):
                     on_conflict_columns,
                     on_conflict_update_columns=on_conflict_update_columns,
                 ),
-                self.__parser_query(columns, values),
+                encode_psqlpy_params(columns, values),
             )
 
             return None
 
-    async def delete(self, column: Column, value: Any) -> str:
+    async def delete(self, column: Column, value: Any) -> list[tuple[Any, ...]]:
         """Delete a row from a table."""
         async with self, self.connection() as connection:
             results = await connection.execute(
                 self.delete_query.make_query(column),
-                self.__parser_query([column], [value]),
+                encode_psqlpy_params([column], [value]),
             )
             return results.result(as_tuple=True)
 
@@ -170,7 +212,7 @@ class PsqlpyDriver(QueryDriver):
         where_values: Optional[Sequence[Any]] = None,
     ) -> list[dict[str, Any]]:
         """Select a row from a table."""
-        parameters = self.__parser_query(where_columns, where_values)
+        parameters = encode_psqlpy_params(where_columns or (), where_values)
         async with self, self.connection() as connection:
             rows = await connection.execute(
                 querystring=self.select_query.make_query(columns, where_columns),
@@ -184,7 +226,7 @@ class PsqlpyDriver(QueryDriver):
         async with self, self.connection() as connection:
             results = await connection.fetch(
                 self.select_query.make_query([Column("1", "")], [self.primary_key]),
-                self.__parser_query([self.primary_key], [id]),
+                encode_psqlpy_params([self.primary_key], [id]),
             )
             v = results.result()
             return len(v) == 1
@@ -193,7 +235,7 @@ class PsqlpyDriver(QueryDriver):
         self,
         from_date: Union[datetime, date],
         to_date: Optional[Union[datetime, date]] = None,
-    ) -> str:
+    ) -> list[tuple[Any, ...]]:
         """Delete a row from a table by date."""
         async with self, self.connection() as connection:
             results = await connection.execute(
@@ -241,19 +283,29 @@ class PsqlpyDriver(QueryDriver):
                     )
 
     async def on_shutdown(self) -> None:
-        """On shutdown."""
-        self.pool.close()
-        self.pool = None
+        """Close the pool, if a query created it."""
+        pool, self.pool = self.pool, None
+        if pool is not None:
+            pool.close()
 
-    async def execute(self, query: str, *values: Any) -> str:
+    async def execute(self, query: str, *values: Any) -> list[dict[str, Any]]:
         """Execute a query."""
         async with self, self.connection() as connection:
             results = await connection.fetch(query, parameters=values)
             return results.result()
 
 
+async def _ignore_notify(*_: Any) -> None:
+    """Callback that registers the channel; the payloads are read by iterating."""
+
+
+async def _close(pool: ConnectionPool) -> None:
+    """Close ``pool``, which psqlpy does at once, without a round trip."""
+    pool.close()
+
+
 class PsqlpyListenDriver(ListenDriver):
-    """Asyncpg listen driver."""
+    """Psqlpy listen driver."""
 
     def __init__(
         self,
@@ -263,60 +315,111 @@ class PsqlpyListenDriver(ListenDriver):
     ) -> None:
         """Initialize the listen driver."""
         super().__init__(connection_string, channel_name, **connection_kwargs)
-        self._queue: AsyncQueue[str] = AsyncQueue()
+        self.connection: Optional[ConnectionPool] = None
+        self.listener: Optional[Listener] = None
+        # Unquoted, as psqlpy's own LISTEN for add_callback().
+        self._listen_statement = f"LISTEN {channel_name}"
+        # A payload, or the error that ended the listener.
+        self._queue: AsyncQueue[Union[str, BaseException]] = AsyncQueue()
+        self._reader: Optional[Task[None]] = None
 
     async def on_startup(self) -> None:
-        """On startup."""
+        """Open a pool and its listener, and start reading the listener."""
+        # A new queue, so nothing from a previous connection is read again.
+        self._queue = AsyncQueue()
         try:
-            self.connection = ConnectionPool(
+            pool = self.connection = ConnectionPool(
                 self.connection_string,
                 **self.connection_kwargs,
             )
-            self.listener = self.connection.listener()
-
-            await self.listener.add_callback(
-                self.channel_name,
-                self._notification_handler,
-            )
-
-            await self.listener.startup()
+            listener = self.listener = pool.listener()
+            await listener.add_callback(self.channel_name, _ignore_notify)
+            await listener.startup()
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
+        self._reader = create_task(self._read(listener, self._queue))
 
-        self.listener.listen()
-
-    async def on_shutdown(self) -> None:
-        """On shutdown."""
-        await self.listener.clear_channel_callbacks(
-            self.channel_name,
-        )
-        await self.listener.shutdown()
-
-        self.connection.close()
-
-    async def _notification_handler(
-        self,
-        connection: object,
-        payload: str,
-        channel: str,
-        process_id: int,
+    @staticmethod
+    async def _read(
+        listener: Listener,
+        queue: "AsyncQueue[Union[str, BaseException]]",
     ) -> None:
         """
-        Handle NOTIFY messages.
+        Move each payload of ``listener`` to ``queue``, then the error that ended it.
 
-        From asyncpg.connection.add_listener docstring:
-            A callable or a coroutine function receiving the following arguments:
-            **con_ref**: a Connection the callback is registered with;
-            **pid**: PID of the Postgres server that sent the notification;
-            **channel**: name of the channel the notification was sent to;
-            **payload**: the payload.
+        Iterating, unlike the background listen(), raises when the server ends
+        the connection. The iteration runs in a task of its own so that the
+        health check never cancels psqlpy's pending read.
         """
-        if self._queue is not None:
-            # Unparsed, see ListenDriver.__aiter__.
-            self._queue.put_nowait(payload)
+        try:
+            async for message in listener:
+                queue.put_nowait(message.payload)
+        except Exception as error:
+            queue.put_nowait(error)
+        else:
+            queue.put_nowait(DatabaseConnectionError("the LISTEN connection ended"))
+
+    async def on_shutdown(self) -> None:
+        """
+        Stop reading, then shut the listener down and close its pool.
+
+        Each step runs even if the one before failed on a dead connection, or
+        was cancelled.
+        """
+        reader, self._reader = self._reader, None
+        listener, pool = self.listener, self.connection
+        if reader is not None:
+            reader.cancel()
+            await gather(reader, return_exceptions=True)
+        if reader is not None or listener is not None:
+            # Ends a running iteration of this connection, the way a closed
+            # connection ends the other drivers' iterators. Not when nothing
+            # was open: no iteration can be running then.
+            self._queue.put_nowait(
+                DatabaseConnectionError("the LISTEN connection was shut down"),
+            )
+        try:
+            if listener is not None:
+                with suppress(Exception):
+                    await wait_for(listener.shutdown(), self.query_timeout)
+        finally:
+            if pool is not None:
+                pool.close()
+            self.listener = None
+            self.connection = None
 
     async def __aiter__(self) -> AsyncGenerator[str, None]:
-        """Iterate over the queue."""
+        """
+        Yield each payload until the listener fails.
+
+        Raises:
+            DatabaseConnectionError: when the listener is not open, when the
+                server ends the connection, or when it does not answer the
+                health check run after ``health_check_interval`` seconds
+                without a NOTIFY.
+        """
+        listener, pool = self.listener, self.connection
+        if listener is None or pool is None:
+            raise DatabaseConnectionError("the LISTEN connection is not open")
+        queue = self._queue
         while True:
-            payload = await self._queue.get()
-            yield payload
+            try:
+                item = await wait_for(queue.get(), self.health_check_interval)
+            except AsyncTimeoutError:
+                # On the listener's own connection, the one that registered
+                # the channel.
+                await check_listen(
+                    wait_for(
+                        listener.connection.execute(self._listen_statement),
+                        self.query_timeout,
+                    ),
+                    partial(_close, pool),
+                )
+                continue
+            if isinstance(item, DatabaseConnectionError):
+                # An end this driver queued itself, already worded.
+                raise item
+            if isinstance(item, BaseException):
+                msg = f"the LISTEN connection ended: {item!r}"
+                raise DatabaseConnectionError(msg) from item
+            yield item

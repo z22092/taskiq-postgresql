@@ -10,7 +10,7 @@ if TYPE_CHECKING:
 
 def get_db_driver(
     driver: Literal["asyncpg", "psqlpy", "psycopg"],
-) -> Type[Union["AsyncpgDriver", "PsqlpyDriver", "PsycopgDriver"]]:  # type: ignore
+) -> Type[Union["AsyncpgDriver", "PsqlpyDriver", "PsycopgDriver"]]:
     """Get the database driver."""
     try:
         if driver == "asyncpg":

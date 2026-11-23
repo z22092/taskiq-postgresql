@@ -118,6 +118,15 @@ def _parser(
         action="store_false",
         help="leave out the advisory lock that run_migrations=True also takes",
     )
+    output.add_argument(
+        "--lock-timeout",
+        type=int,
+        default=migrations.DEFAULT_LOCK_TIMEOUT,
+        metavar="SECONDS",
+        help="seconds a statement waits for a lock before the script fails "
+        "(SET LOCAL lock_timeout); 0 leaves it out; default: "
+        f"{migrations.DEFAULT_LOCK_TIMEOUT}",
+    )
     migrate = commands.add_parser(
         "migrate",
         help="create the tables now, as run_migrations=True does",
@@ -172,20 +181,27 @@ def _generate(
     ):
         parser.error("--table-name and --field-for-task-id need --component")
     try:
+        options = migrations.FormatOptions(
+            transaction=namespace.transaction,
+            lock=namespace.lock,
+            lock_timeout=namespace.lock_timeout,
+            extra=dict(namespace.option),
+        )
+    except ValueError as error:
+        parser.error(f"--lock-timeout: {error}")
+    try:
         render = migrations.load_format(namespace.format)
-    except migrations.UnknownMigrationFormatError as error:
+    except (
+        migrations.UnknownMigrationFormatError,
+        migrations.AmbiguousMigrationFormatError,
+    ) as error:
         parser.error(str(error))
-    except ImportError as error:
+    except Exception as error:  # a format's module and entry point are not ours
         return _fail(error)
     try:
         schemas = _schemas(namespace, parser, migrations)
     except Exception as error:  # the application's own import errors too
         return _fail(error)
-    options = migrations.FormatOptions(
-        transaction=namespace.transaction,
-        lock=namespace.lock,
-        extra=dict(namespace.option),
-    )
     try:
         script = render(schemas, options)
     except migrations.MigrationFormatOptionError as error:

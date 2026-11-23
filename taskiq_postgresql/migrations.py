@@ -37,7 +37,6 @@ from typing import (
     NamedTuple,
     Optional,
     Union,
-    cast,
     get_args,
 )
 
@@ -67,8 +66,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "COMPONENT_KINDS",
+    "DEFAULT_LOCK_TIMEOUT",
     "MIGRATION_FORMATS_GROUP",
     "TASK_ID_TYPES",
+    "AmbiguousMigrationFormatError",
     "CatalogState",
     "ColumnSchema",
     "ComponentKind",
@@ -137,6 +138,14 @@ ProblemCode = Literal[
 
 MIGRATION_FORMATS_GROUP: Final = "taskiq_postgresql.migration_formats"
 """The entry-point group that ``taskiq postgresql generate --format`` reads."""
+
+DEFAULT_LOCK_TIMEOUT: Final = 10
+"""Seconds a script's statement waits for a lock before the script fails."""
+
+# The server keeps lock_timeout as an int of milliseconds and refuses a larger
+# value when the script runs.
+_MAX_LOCK_TIMEOUT: Final = 2_147_483
+_DISTRIBUTION: Final = "taskiq-postgresql"
 
 # Keyed by the upper-cased SQL spelling; PostgreSQL type names ignore case.
 _TYPE_NAMES: Final[Mapping[str, TypeName]] = {
@@ -217,9 +226,11 @@ class MigrationStep:
     """
     One additive, idempotent step of a table's migration.
 
-    Steps run in ``number`` order and each one is safe to run again, so the
-    whole list brings a table of any earlier release up to date. A released
-    step never changes: a later release adds a step instead.
+    Steps run in ``number`` order and each one is idempotent, so the whole
+    list brings a table of any earlier release up to date. Idempotent is not
+    lock-free: on a table that already exists, ``ALTER TABLE`` and
+    ``CREATE INDEX`` lock it before they find that nothing is missing. A
+    released step never changes: a later release adds a step instead.
 
     Attributes:
         number: Position of the step, from 1.
@@ -243,7 +254,9 @@ class TableSchema:
         kind: The component that owns the table.
         name: Table name, as configured on the component.
         columns: Every column, in table order, after all steps.
-        indexes: Every index after all steps, besides the primary key's.
+        indexes: Every index after all steps, except the primary key's own
+            index, which ``CREATE TABLE`` creates and PostgreSQL names
+            (``taskiq_messages_pkey`` for ``taskiq_messages``).
         steps: The migration steps, in the order they run.
     """
 
@@ -380,13 +393,20 @@ def render_sql(
     *,
     transaction: bool = True,
     lock: bool = True,
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
 ) -> str:
     """
     Render the SQL script that creates the tables, or completes them.
 
     The script runs every step of every table, with ``IF NOT EXISTS``, so it
-    is safe to run again and on a database an earlier release migrated. The
-    output is the same for the same tables, options and package version.
+    is idempotent: it completes a database an earlier release migrated, and a
+    second run changes nothing. It still locks the tables when nothing is
+    missing, because ``ALTER TABLE`` and ``CREATE INDEX`` lock a table before
+    they find that the column or index exists. On a live database
+    ``ALTER TABLE`` waits for every open transaction that used the table,
+    and every later query on the table waits behind it; ``lock_timeout``
+    bounds that wait. The output is the same for the same tables, options and
+    package version.
 
     Args:
         schemas: The tables, in the order their statements run.
@@ -396,19 +416,31 @@ def render_sql(
         lock: Take, per table, the advisory lock ``run_migrations=True``
             takes, so the script and starting workers create the tables one
             after the other. The lock lasts until the transaction ends.
+        lock_timeout: Seconds a statement waits for a lock, the advisory lock
+            included, before it fails and the transaction rolls back. The
+            first statement sets it with ``SET LOCAL lock_timeout``, which
+            lasts until the transaction ends (the caller's transaction with
+            ``transaction=False``). ``0`` leaves the statement out, so the
+            session's own ``lock_timeout`` applies.
 
     Returns:
         The script: a header comment, then each statement, starting on a new
         line and ending with a semicolon. A statement may span several lines.
 
     Raises:
-        ValueError: if ``schemas`` is empty or a table name cannot be written
-            in a script.
+        ValueError: if ``schemas`` is empty, a table name cannot be written
+            in a script, or ``lock_timeout`` is not a whole number of seconds
+            from 0 to 2147483.
     """
     tables = list(schemas)
+    statements = migration_statements(tables, lock=lock)
+    _check_lock_timeout(lock_timeout)
+    if lock_timeout:
+        # First, so that it also bounds the wait for the advisory lock.
+        statements.insert(0, f"SET LOCAL lock_timeout = '{lock_timeout}s'")
     return _script_text(
         [f"-- tables: {', '.join(table.name for table in tables)}"],
-        migration_statements(tables, lock=lock),
+        statements,
         transaction=transaction,
     )
 
@@ -424,8 +456,8 @@ def migration_statements(
 
     A driver that prepares every statement it sends, such as asyncpg, refuses
     a script of several statements in one call. These are the statements of
-    ``render_sql(schemas, transaction=False, lock=lock)``, in the same order,
-    without the header comment and the semicolons.
+    ``render_sql(schemas, transaction=False, lock=lock, lock_timeout=0)``, in
+    the same order, without the header comment and the semicolons.
 
     Args:
         schemas: The tables, in the order their statements run.
@@ -809,12 +841,24 @@ class FormatOptions:
         transaction: ``False`` with ``--no-transaction``: the target tool runs
             the migration in its own transaction.
         lock: ``False`` with ``--no-lock``: leave out the advisory lock.
+        lock_timeout: Seconds a statement waits for a lock before the
+            migration fails, from ``--lock-timeout``; ``0`` sets none. See
+            ``render_sql``.
         extra: Format-specific options, from repeated ``--option KEY=VALUE``.
+
+    Raises:
+        ValueError: if ``lock_timeout`` is not a whole number of seconds from
+            0 to 2147483.
     """
 
     transaction: bool = True
     lock: bool = True
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT
     extra: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Refuse a ``lock_timeout`` no format could write."""
+        _check_lock_timeout(self.lock_timeout)
 
 
 MigrationFormat = Callable[[Sequence[TableSchema], FormatOptions], str]
@@ -833,6 +877,19 @@ class UnknownMigrationFormatError(LookupError):
         )
 
 
+class AmbiguousMigrationFormatError(LookupError):
+    """Several installed packages, none of them this one, register the format."""
+
+    def __init__(self, format_name: str, distributions: Iterable[str]) -> None:
+        self.format_name = format_name
+        self.distributions = tuple(distributions)
+        super().__init__(
+            f"migration format {format_name!r} is registered by several "
+            f"installed packages: {', '.join(self.distributions)}; uninstall "
+            "all but one of them",
+        )
+
+
 class MigrationFormatOptionError(ValueError):
     """A migration format got an ``--option`` it does not accept."""
 
@@ -843,7 +900,8 @@ def sql_format(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
 
     Args:
         schemas: The tables.
-        options: ``transaction`` and ``lock`` go to ``render_sql``.
+        options: ``transaction``, ``lock`` and ``lock_timeout`` go to
+            ``render_sql``.
 
     Returns:
         The SQL script.
@@ -856,7 +914,12 @@ def sql_format(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
         raise MigrationFormatOptionError(
             f"the sql format takes no --option; got {', '.join(sorted(options.extra))}",
         )
-    return render_sql(schemas, transaction=options.transaction, lock=options.lock)
+    return render_sql(
+        schemas,
+        transaction=options.transaction,
+        lock=options.lock,
+        lock_timeout=options.lock_timeout,
+    )
 
 
 def available_formats() -> list[str]:
@@ -873,6 +936,10 @@ def load_format(name: str) -> MigrationFormat:
     """
     Load a migration format registered under ``MIGRATION_FORMATS_GROUP``.
 
+    A format this package registers, such as ``sql``, is always the one
+    loaded, whatever else registers its name. Any other name must be
+    registered by one installed package only.
+
     Args:
         name: The entry-point name, for example ``"sql"``.
 
@@ -882,15 +949,30 @@ def load_format(name: str) -> MigrationFormat:
     Raises:
         UnknownMigrationFormatError: if no installed package registers ``name``;
             the error lists the available formats.
+        AmbiguousMigrationFormatError: if several installed packages, none of
+            them this one, register ``name``; the error names them.
         ImportError: if the format cannot be imported, usually because its
             optional dependency is missing; the message says what to install.
         TypeError: if the entry point does not name a callable.
     """
-    for entry_point in _entry_points():
-        if entry_point.name == name:
-            break
-    else:
+    found = [entry_point for entry_point in _entry_points() if entry_point.name == name]
+    if not found:
         raise UnknownMigrationFormatError(name, available_formats())
+    own = [
+        entry_point
+        for entry_point in found
+        if _distribution_name(entry_point) == _DISTRIBUTION
+    ]
+    # Otherwise the order of sys.path would choose, and an installed package
+    # could replace a format without anyone noticing.
+    if not own and len(found) > 1:
+        raise AmbiguousMigrationFormatError(
+            name,
+            sorted(
+                _distribution_name(entry_point) or "<unknown>" for entry_point in found
+            ),
+        )
+    entry_point = (own or found)[0]
     try:
         loaded = entry_point.load()
     except ImportError as error:
@@ -908,9 +990,15 @@ def _entry_points() -> Iterable[Any]:
     return entry_points(group=MIGRATION_FORMATS_GROUP)
 
 
-def _install_hint(entry_point: Any, error: ImportError) -> str:
+def _distribution_name(entry_point: Any) -> Optional[str]:
+    # An EntryPoint built by hand, rather than read from an installed
+    # package, has no distribution.
     distribution = getattr(entry_point, "dist", None)
-    package = distribution.name if distribution is not None else "taskiq-postgresql"
+    return None if distribution is None else distribution.name
+
+
+def _install_hint(entry_point: Any, error: ImportError) -> str:
+    package = _distribution_name(entry_point) or _DISTRIBUTION
     # A format's optional dependencies go in an extra named after the format,
     # unless the entry point names its extras.
     extra = ",".join(getattr(entry_point, "extras", None) or [entry_point.name])
@@ -922,7 +1010,7 @@ def _install_hint(entry_point: Any, error: ImportError) -> str:
 
 def _package_version() -> str:
     try:
-        return version("taskiq-postgresql")
+        return version(_DISTRIBUTION)
     except PackageNotFoundError:
         # A source tree that was never installed has no metadata.
         return "unknown"
@@ -935,6 +1023,19 @@ def _check_table_name(name: str) -> None:
         raise ValueError(
             f"table name {name!r} cannot be written in a SQL script: it is "
             "empty or holds a line break or a NUL",
+        )
+
+
+def _check_lock_timeout(seconds: int) -> None:
+    # A bool is an int, and True would read as one second.
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, int)
+        or not 0 <= seconds <= _MAX_LOCK_TIMEOUT
+    ):
+        raise ValueError(
+            "lock_timeout must be a whole number of seconds from 0 to "
+            f"{_MAX_LOCK_TIMEOUT}, got {seconds!r}",
         )
 
 
@@ -1375,7 +1476,7 @@ def _schema_of_kind(
             f"field_for_task_id must be one of {', '.join(TASK_ID_TYPES)}, "
             f"got {field_for_task_id!r}",
         )
-    component_kind = cast("ComponentKind", kind)
+    component_kind: ComponentKind = kind
     component_class = _component_classes()[component_kind]
     name = _default(component_class, "table_name") if table_name is None else table_name
     if component_kind == "scheduler_source":

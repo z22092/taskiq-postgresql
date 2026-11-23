@@ -14,8 +14,9 @@ import random
 import string
 import subprocess
 import sys
-from importlib.metadata import entry_points, version
+from importlib.metadata import EntryPoint, entry_points, version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator, Optional
 from urllib.parse import urlsplit
 
@@ -101,6 +102,7 @@ GOLDEN_BROKER = (
     "-- taskiq-postgresql {version}\n"
     "-- tables: taskiq_messages\n"
     "BEGIN;\n"
+    "SET LOCAL lock_timeout = '10s';\n"
     "SELECT pg_advisory_xact_lock(hashtext('taskiq_postgresql'), "
     "hashtext('taskiq_messages'));\n"
     "CREATE TABLE IF NOT EXISTS taskiq_messages (id SERIAL NOT NULL PRIMARY KEY, "
@@ -121,6 +123,7 @@ GOLDEN_BROKER = (
 GOLDEN_RESULTS = (
     "-- taskiq-postgresql {version}\n"
     "-- tables: jobs_results\n"
+    "SET LOCAL lock_timeout = '10s';\n"
     "CREATE TABLE IF NOT EXISTS jobs_results (task_id Text NOT NULL PRIMARY KEY, "
     "result BYTEA NOT NULL, "
     "created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());\n"
@@ -433,6 +436,21 @@ def test_importing_the_command_loads_no_driver_and_no_migration_code() -> None:
             "the sql format takes no --option",
         ),
         (["generate", "--component", "broker", "--format", "nope"], "'nope'"),
+        (
+            ["generate", "--component", "broker", "--lock-timeout", "-1"],
+            (
+                "--lock-timeout: lock_timeout must be a whole number of seconds "
+                "from 0 to 2147483, got -1"
+            ),
+        ),
+        (
+            ["generate", "--component", "broker", "--lock-timeout", "2147484"],
+            "from 0 to 2147483, got 2147484",
+        ),
+        (
+            ["generate", "--component", "broker", "--lock-timeout", "1.5"],
+            "--lock-timeout: invalid int value: '1.5'",
+        ),
         (["migrate"], "TARGET"),
     ],
     ids=[
@@ -447,6 +465,9 @@ def test_importing_the_command_loads_no_driver_and_no_migration_code() -> None:
         "option-without-value",
         "option-the-format-refuses",
         "unknown-format",
+        "negative-lock-timeout",
+        "lock-timeout-above-the-server-maximum",
+        "lock-timeout-not-whole-seconds",
         "migrate-without-target",
     ],
 )
@@ -467,7 +488,46 @@ def test_help_exits_with_0(capsys: pytest.CaptureFixture[str]) -> None:
 
     assert code == 0
     assert "--no-transaction" in out
+    assert "--lock-timeout SECONDS" in out
     assert "Exit status: 0" in out
+
+
+@pytest.mark.parametrize(
+    ("args", "lock_timeout"),
+    [([], 10), (["--lock-timeout", "3"], 3), (["--lock-timeout", "0"], 0)],
+    ids=["default", "three-seconds", "zero-leaves-it-out"],
+)
+@pytest.mark.parametrize(
+    "transaction",
+    [True, False],
+    ids=["transaction", "no-transaction"],
+)
+def test_generate_sets_the_lock_timeout(
+    args: list[str],
+    lock_timeout: int,
+    transaction: bool,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    wrapping = [] if transaction else ["--no-transaction"]
+
+    code, out, err = run_in_process(
+        ["generate", "--component", "broker", *wrapping, *args],
+        capsys,
+    )
+
+    assert (code, err) == (0, "")
+    assert out == render_sql(
+        [table_schema("broker")],
+        transaction=transaction,
+        lock_timeout=lock_timeout,
+    )
+    # The first statement after the header and BEGIN, before any lock.
+    first_statement = out.splitlines()[3 if transaction else 2]
+    if lock_timeout:
+        assert first_statement == f"SET LOCAL lock_timeout = '{lock_timeout}s';"
+        assert out.count("lock_timeout") == 1
+    else:
+        assert "lock_timeout" not in out
 
 
 # --- in process: the commands ------------------------------------------------
@@ -553,7 +613,11 @@ def test_generate_hands_the_options_to_a_third_party_format(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     def shout(schemas: list[TableSchema], options: FormatOptions) -> str:
-        assert (options.transaction, options.lock) == (False, False)
+        assert (options.transaction, options.lock, options.lock_timeout) == (
+            False,
+            False,
+            7,
+        )
         return f"{schemas[0].name} {dict(options.extra)}\n"
 
     class ShoutEntryPoint:
@@ -578,12 +642,94 @@ def test_generate_hands_the_options_to_a_third_party_format(
             "id=a=b",
             "--no-transaction",
             "--no-lock",
+            "--lock-timeout",
+            "7",
         ],
         capsys,
     )
 
     assert code == 0
     assert out == "taskiq_messages {'author': 'me', 'id': 'a=b'}\n"
+
+
+def test_a_format_two_packages_register_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class RegisteredEntryPoint:
+        name = "tables"
+
+        def __init__(self, package: str) -> None:
+            self.dist = SimpleNamespace(name=package)
+
+        def load(self) -> Any:
+            """Fail the test: an ambiguous format must not be loaded."""
+            raise AssertionError("loaded an ambiguous format")
+
+    monkeypatch.setattr(
+        migrations,
+        "_entry_points",
+        lambda: [
+            RegisteredEntryPoint("acme-tables"),
+            RegisteredEntryPoint("bolt-tables"),
+        ],
+    )
+
+    code, out, err = run_in_process(
+        ["generate", "--component", "broker", "--format", "tables"],
+        capsys,
+    )
+
+    assert (code, out) == (2, "")
+    assert (
+        "migration format 'tables' is registered by several installed packages: "
+        "acme-tables, bolt-tables; uninstall all but one of them"
+    ) in err
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (
+            "taskiq_postgresql.migrations:MIGRATION_FORMATS_GROUP",
+            "TypeError: the migration format 'broken' names str, not a callable",
+        ),
+        (
+            "taskiq_postgresql.migrations:no_such_format",
+            (
+                "AttributeError: module 'taskiq_postgresql.migrations' has no "
+                "attribute 'no_such_format'"
+            ),
+        ),
+    ],
+    ids=["not-callable", "missing-attribute"],
+)
+def test_an_entry_point_that_names_no_format_fails_with_1(
+    value: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        migrations,
+        "_entry_points",
+        lambda: [
+            EntryPoint(
+                name="broken",
+                value=value,
+                group=migrations.MIGRATION_FORMATS_GROUP,
+            ),
+        ],
+    )
+
+    code, out, err = run_in_process(
+        ["generate", "--component", "broker", "--format", "broken"],
+        capsys,
+    )
+
+    # One line, as for the other errors in the user's setup: no traceback.
+    assert (code, out) == (1, "")
+    assert err == f"taskiq postgresql: error: {message}\n"
 
 
 def test_a_format_that_cannot_load_fails_with_1(
@@ -639,7 +785,8 @@ def test_migrate_in_process_creates_the_tables_and_closes_its_pools(
         False,
     ]
     assert [component.driver.pool for component in components] == [None, None, None]
-    assert not hasattr(app.broker.listen_driver, "connection")
+    # No LISTEN connection was opened: the listen driver starts with None.
+    assert getattr(app.broker.listen_driver, "connection", None) is None
 
 
 def test_migrate_fails_with_1_when_the_database_is_unreachable(

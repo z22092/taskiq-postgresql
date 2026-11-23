@@ -43,18 +43,27 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         table_name: str = "taskiq_results",
         field_for_task_id: Literal["VarChar", "Text", "Uuid"] = "Uuid",
         serializer: Optional[TaskiqSerializer] = None,
-        driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
+        driver: Literal["asyncpg", "psqlpy", "psycopg"] = "asyncpg",
         run_migrations: bool = False,
         **connect_kwargs: Any,
     ) -> None:
         """
         Construct new result backend.
 
-        :param dsn: connection string to PostgreSQL, or callable returning one.
-            A callable is resolved once, by startup().
-        :param keep_results: flag to not remove results from Redis after reading.
-        :param connect_kwargs: additional arguments for nats `ConnectionPool` class.
-        :raises TypeError: if ``dsn`` is ``None``, empty or blank.
+        Args:
+            dsn: connection string to PostgreSQL, or callable returning one.
+                A callable is resolved once, by startup().
+            keep_results: flag to not remove results from Redis after reading.
+            table_name: name of the table that stores the results.
+            field_for_task_id: SQL type of the ``task_id`` column.
+            serializer: serializer of the results; ``PickleSerializer`` when
+                ``None``.
+            driver: driver to use.
+            run_migrations: create the table and its index on startup.
+            connect_kwargs: additional arguments for nats `ConnectionPool` class.
+
+        Raises:
+            TypeError: if ``dsn`` is ``None``, empty or blank.
         """
         dsn = require_dsn(dsn, type(self).__name__)
         self._dsn: Final[Dsn] = dsn
@@ -88,8 +97,9 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         """
         Get the DSN string, calling the DSN callable if one was given.
 
-        :raises TypeError: if the DSN callable returns ``None`` or an empty
-            string.
+        Raises:
+            TypeError: if the DSN callable returns ``None`` or an empty
+                string.
         """
         return resolve_dsn(self._dsn, type(self).__name__)
 
@@ -100,8 +110,9 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         Construct new connection pool
         and create new table for results if not exists.
 
-        :raises TypeError: if the DSN callable returns ``None`` or an empty
-            string.
+        Raises:
+            TypeError: if the DSN callable returns ``None`` or an empty
+                string.
         """
         self.driver.connection_string = self.dsn
         await self.driver.on_startup()
@@ -160,10 +171,15 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         """
         Retrieve result from the task.
 
-        :param task_id: task's id.
-        :param with_logs: if True it will download task's logs.
-        :raises ResultIsMissingError: if there is no result when trying to get it.
-        :return: TaskiqResult.
+        Args:
+            task_id: task's id.
+            with_logs: if True it will download task's logs.
+
+        Returns:
+            TaskiqResult.
+
+        Raises:
+            ResultIsMissingError: if there is no result when trying to get it.
         """
         data = await self.driver.select(
             [

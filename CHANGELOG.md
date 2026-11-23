@@ -95,7 +95,12 @@ Upgrading from 0.4.x:
   Alembic, Django or Flyway (`--no-transaction`). It reads the components from your application
   (`app:broker`, `app:scheduler`, as `taskiq worker` does) or, without
   importing it, from `--component`. The script takes the same advisory lock as
-  `run_migrations=True` and is safe to run again.
+  `run_migrations=True` and is idempotent. It still locks the tables when
+  nothing is missing, so on a live database it starts with
+  `SET LOCAL lock_timeout = '10s'` and fails after that long without a lock
+  instead of stalling the broker; `--lock-timeout SECONDS` changes the limit
+  and `--lock-timeout 0` leaves it out. `migrate` runs no DDL when everything
+  exists.
 - `taskiq postgresql migrate` creates the tables once, with the code
   `run_migrations=True` runs, whatever the components set. Run it before the
   workers, which can then use `run_migrations=False` and a role that only reads
@@ -139,6 +144,21 @@ Upgrading from 0.4.x:
   for a hand-written revision when table names differ between environments,
   and `taskiq postgresql generate --format alembic`, which writes a revision
   file with every step.
+- `PostgresqlBroker(health_check_interval=30.0, query_timeout=30.0)`. When the
+  LISTEN connection stays silent for `health_check_interval` seconds (with
+  psycopg, every `health_check_interval` seconds), the worker sends the same
+  LISTEN again and reopens the connection if no answer comes within
+  `query_timeout` seconds; a NAT or a load balancer can drop a
+  connection without either side being told. `query_timeout` also bounds each
+  claim with asyncpg and psycopg, and each close in `shutdown()`. It does not
+  bound psqlpy's claims: psqlpy can neither cancel a query on the server nor
+  drop one pooled connection, so a claim given up would leave its `DELETE` to
+  run later; with psqlpy, set `tcp_user_timeout_sec` and the `keepalives_*`
+  settings in `connection_kwargs` instead. Both refuse what `poll_interval`
+  refuses. `QueryDriver.query_timeout` and `ListenDriver.health_check_interval`
+  / `ListenDriver.query_timeout` carry them to the drivers and default to
+  `None` (no check, no bound). A custom driver gets the reopening of LISTEN,
+  but no health check and no bound unless it reads these attributes.
 
 ### Changed
 
@@ -177,14 +197,41 @@ Upgrading from 0.4.x:
   is claimed only once it is due, and only if its row belongs to the broker's
   channel or to none. Delivery stays at most once: a claimed row is deleted
   before the task runs.
-- When reading the LISTEN connection ends or fails, `listen()` keeps
-  delivering through the sweep alone for the rest of that call; the
-  connection is opened again only when the broker starts again. With asyncpg
-  and psycopg it logs one warning when that happens. psqlpy's listener gives
-  no sign that its connection ended, so with psqlpy nothing is logged, and the
-  sweep still delivers. A failed claim is logged and tried again at the next
-  sweep. `listen()` returns as soon as `shutdown()` starts, so its sweep does
-  not reopen the pool `shutdown()` closes.
+- When reading the LISTEN connection ends or fails, `listen()` logs one
+  warning, keeps delivering through the sweep and reopens the connection
+  through the listen driver's `on_shutdown()` and `on_startup()`, waiting
+  0.5 s and then twice as long after each failed attempt, up to 30 s. Each
+  failed attempt logs a warning and a reopened connection an INFO line. A
+  custom listen driver gets this as long as both methods can run again. All
+  three drivers now notice a dropped connection, psqlpy included: its listen
+  driver reads the listener by iterating, which raises when the server ends
+  the connection, instead of through a background callback. A failed claim is
+  logged and tried again at the next sweep. `listen()` returns as soon as
+  `shutdown()` starts, and `shutdown()` stops a reopen in progress, so neither
+  the sweep nor a reopen brings back what `shutdown()` closes.
+- The psycopg listen driver reads notifications only through `notifies()`; it
+  no longer registers a notify handler that queued every payload a second
+  time and never drained it.
+- The asyncpg listen driver no longer sends UNLISTEN before closing: closing
+  ends the LISTEN on the server.
+- The warning logged when LISTEN stops now ends with "while it is reopened"
+  instead of "the LISTEN connection is not reopened until the worker
+  restarts"; each failed reopen logs "Could not reopen the LISTEN connection
+  of channel ...", and a claim with no answer "Claiming ... got no answer
+  within ... s".
+- With asyncpg, the broker's pool now gives up after `query_timeout` seconds
+  waiting for a free connection, so `kick()` raises `asyncio.TimeoutError`
+  instead of waiting for good when the pool stays exhausted that long.
+- Custom drivers: the broker calls a listen driver's `on_shutdown()` and then
+  `on_startup()` to reopen LISTEN, so both must work any number of times and
+  `on_shutdown()` must not fail on a connection that is already gone. A reopen
+  gives `on_startup()` `query_timeout` seconds, and the broker gives each
+  driver's `on_shutdown()` twice that before it stops waiting, so a driver
+  should bound its own close by `query_timeout`, as the bundled ones do. The
+  asyncpg and psycopg query drivers bound `fetch_row()` by `query_timeout`
+  themselves and raise `asyncio.TimeoutError`; the broker no longer cancels it
+  from outside, which would leave psycopg 3.3.4 and older waiting on a silent
+  socket and psqlpy running the claim after it was given up.
 - With `run_migrations=True`, the startup check that skips the DDL also
   requires the broker's `channel` and `not_before` columns and their index.
 - The listen drivers (`ListenDriver` subclasses) yield each NOTIFY payload as
@@ -194,6 +241,13 @@ Upgrading from 0.4.x:
 - A custom `QueryDriver` must implement `fetch_row(query, *values)`, which
   returns the first row of a query as a `dict`, or `None`. The broker builds
   its claim queries itself and runs them through it.
+- The `driver` parameter of the three components is typed
+  `Literal["asyncpg", "psqlpy", "psycopg"]`, so type checkers reject
+  `"pg8000"`. It was listed before but no release implemented it: passing it
+  raised `ValueError` at construction, as it still does.
+- The asyncpg query driver's `connection()`, used outside `async with driver`,
+  raises `DatabaseConnectionError` like the psqlpy and psycopg drivers do,
+  instead of `AttributeError`.
 
 ### Fixed
 
@@ -235,6 +289,29 @@ Upgrading from 0.4.x:
   asyncpg and psqlpy drivers its worker processes used to keep running until a
   message arrived (with asyncpg, until its connection pool's idle timer fired
   about five minutes later), and the main process waited for them.
+- `PostgresqlBroker.shutdown()` and `PostgresqlSchedulerSource.shutdown()`
+  raised `AttributeError`, for every driver, when the component had run no
+  query since `startup()` with `run_migrations=False`: for example a worker
+  that received no message, or a schedule source never asked for its
+  schedules. A query driver's `on_shutdown()` now does nothing when no query
+  opened its pool.
+- The warning for a NOTIFY payload that is not a message id holds at most
+  the first 64 characters of it, followed by its length when it is longer,
+  because any role that can connect can notify the channel. An integer
+  outside the range of the broker's `id` column (1 to 2147483647) is not a
+  message id either: it gets that warning, where its claim used to log an
+  error with the whole number and a traceback, or match no row.
+- `InsertOrUpdateQuery.make_query(..., on_conflict_action="NOTHING")` raised
+  `TypeError`; it now names the conflict columns.
+- `shutdown()` no longer hangs on a connection that stopped answering: the
+  asyncpg pool and LISTEN connection are closed by force once `query_timeout`
+  runs out, and the whole of it takes at most about twice `query_timeout`. A
+  second call does nothing.
+- With asyncpg and psycopg, a claim on a pooled connection that stopped
+  answering no longer blocks `listen()`: it is given up after `query_timeout`
+  seconds (asyncpg may take up to about twice that) and logged, and asyncpg
+  now drops that connection from the pool instead of waiting on it until the
+  operating system gives up on the socket.
 
 ### Removed
 

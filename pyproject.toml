@@ -114,6 +114,7 @@ audit = [
 lint = [
     "ruff==0.17.4",
     "pre-commit==4.7.0; python_version >= \"3.11\"",
+    "ty==0.0.99",
 ]
 
 [tool.uv]
@@ -142,6 +143,19 @@ addopts = ["--strict-markers", "--strict-config"]
 markers = [
     "alembic: the Alembic integration; CI also runs these on the oldest Alembic the extra allows",
 ]
+
+# Applies whenever pytest runs with --cov (CI's test job does): a change that
+# takes line coverage below fail_under fails; raise it when coverage rises.
+# The total is compared at the report's precision, and the default of 0
+# decimals would round 93.6% up to 94 and pass, so the report keeps two.
+[tool.coverage.report]
+fail_under = 94
+precision = 2
+
+# scripts/ stays out: check_pins.py imports tomllib, which ty rejects at the
+# Python 3.10 floor although the script only ever runs on 3.13.
+[tool.ty.src]
+include = ["taskiq_postgresql"]
 
 [tool.ruff.format]
 exclude = [".venv/"]

@@ -201,19 +201,26 @@ def _table(schema: TableSchema, metadata: MetaData) -> Table:
 
 
 def _column(column: ColumnSchema) -> Column[Any]:
+    return Column(
+        column.name,
+        _column_type(column),
+        nullable=column.nullable,
+        server_default=None if column.default is None else text(column.default),
+        autoincrement=column.type_name == "serial",
+    )
+
+
+def _column_type(column: ColumnSchema) -> TypeEngine[Any]:
+    # A function of its own for the return type: each factory of _TYPES gives
+    # its own TypeEngine subclass, and Column() cannot pick one type parameter
+    # from their union.
     make_type = _TYPES.get(column.type_name)
     if make_type is None:
         raise ValueError(
             f"column {column.name!r} has the type {column.type_name!r}, which "
             "taskiq_postgresql.contrib.sqlalchemy has no SQLAlchemy type for",
         )
-    return Column(
-        column.name,
-        make_type(column),
-        nullable=column.nullable,
-        server_default=None if column.default is None else text(column.default),
-        autoincrement=column.type_name == "serial",
-    )
+    return make_type(column)
 
 
 def _name(name: str) -> str:

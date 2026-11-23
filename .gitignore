@@ -6,6 +6,12 @@ dist/
 wheels/
 *.egg-info
 
+# Coverage data and reports (pytest --cov)
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
 # Virtual environments
 .venv
 .vscode
