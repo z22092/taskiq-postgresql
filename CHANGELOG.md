@@ -92,7 +92,10 @@ Upgrading from 0.4.x:
 - With the psycopg driver, a `NOTIFY` on the broker's channel whose payload is
   not an integer raised `ValueError` inside psycopg, which ended the listen
   driver's iteration (the broker logged it as an error and listened again).
-  The payload is now logged and skipped. The psycopg listen driver also put
+  The payload is now logged and skipped, on every driver (asyncpg and psqlpy
+  raised the same `ValueError` inside their notification callback), and the
+  log line holds only the first 64 characters of it, because any role that can
+  connect can notify the channel. The psycopg listen driver also put
   every notified id on a queue that nothing read, so it grew by one entry per
   message for the life of the worker; that queue is gone.
 - `InsertOrUpdateQuery.make_query(..., on_conflict_action="NOTHING")` raised

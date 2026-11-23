@@ -1,4 +1,3 @@
-import logging
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
@@ -11,6 +10,7 @@ from typing_extensions import LiteralString, Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
+from taskiq_postgresql.drivers._notify import parse_message_id
 from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
@@ -23,11 +23,15 @@ def sql(query: str) -> LiteralString:
     the query text. These queries are built from the table, column and channel
     names given to the component at construction; values always travel as
     bind parameters.
+
+    Args:
+        query: the SQL text, built by the query builders or by the broker's
+            own ``NOTIFY``.
+
+    Returns:
+        The same string, typed so the type checker accepts it.
     """
     return cast("LiteralString", query)
-
-
-logger = logging.getLogger(__name__)
 
 
 class PsycopgDriver(QueryDriver):
@@ -60,6 +64,22 @@ class PsycopgDriver(QueryDriver):
 
     @asynccontextmanager
     async def connection(self) -> AsyncGenerator[AsyncConnection[TupleRow], None]:
+        """
+        Borrow a connection from the pool for the duration of the block.
+
+        The pool is created closed and opened here on first use, so building a
+        driver never connects. Every error raised inside the block is
+        re-raised as ``DatabaseConnectionError``, so callers handle one
+        exception type whatever the driver.
+
+        Yields:
+            A pooled psycopg connection, returned when the block ends.
+
+        Raises:
+            DatabaseConnectionError: if the pool object does not exist yet
+                (enter ``async with driver`` first), or for any error raised
+                while the connection is held.
+        """
         if self.pool is None:
             raise DatabaseConnectionError(
                 "The pool is not open: enter `async with driver` first.",
@@ -311,13 +331,7 @@ class PsycopgListenDriver(ListenDriver):
         # notifies() alone: psycopg runs a registered notify handler on the
         # same notifications, and a handler that raised would stop this loop.
         async for notify in self.connection.notifies():
-            try:
-                message_id = int(notify.payload)
-            except ValueError:
-                logger.warning(
-                    "Invalid NOTIFY payload %r on channel %s",
-                    notify.payload,
-                    self.channel_name,
-                )
+            message_id = parse_message_id(notify.payload, self.channel_name)
+            if message_id is None:
                 continue
             yield message_id

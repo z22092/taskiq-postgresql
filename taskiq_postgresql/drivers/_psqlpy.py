@@ -12,6 +12,7 @@ from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
+from taskiq_postgresql.drivers._notify import parse_message_id
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 
@@ -24,7 +25,16 @@ def encode_psqlpy_params(
 
     A value bound to a ``JSONB`` column is wrapped in psqlpy's ``JSONB`` (JSON
     text is parsed first) and a value bound to a ``UUID`` column becomes a
-    ``uuid.UUID``; every other value is passed through unchanged.
+    ``uuid.UUID``; every other value is passed through unchanged. psqlpy does
+    not convert these on its own, so the shaping has to happen before the call.
+
+    Args:
+        columns: the columns the values are bound to, in order.
+        values: the values to bind, or ``None``.
+
+    Returns:
+        The values to send with the query; an empty list when ``values`` is
+        ``None``.
 
     Raises:
         ValueError: if ``columns`` and ``values`` differ in length.
@@ -76,6 +86,21 @@ class PsqlpyDriver(QueryDriver):
 
     @asynccontextmanager
     async def connection(self) -> AsyncGenerator[Connection, None]:
+        """
+        Borrow a connection from the pool for the duration of the block.
+
+        Every error raised inside the block is re-raised as
+        ``DatabaseConnectionError``, so callers handle one exception type
+        whatever the driver. The pool only exists after ``async with driver``,
+        so refusing here keeps a stray call from opening a pool nobody closes.
+
+        Yields:
+            A pooled psqlpy connection, released when the block ends.
+
+        Raises:
+            DatabaseConnectionError: if the pool is not open, or for any error
+                raised while the connection is held.
+        """
         if self.pool is None:
             raise DatabaseConnectionError(
                 "The pool is not open: enter `async with driver` first.",
@@ -321,8 +346,9 @@ class PsqlpyListenDriver(ListenDriver):
             **channel**: name of the channel the notification was sent to;
             **payload**: the payload.
         """
-        if self._queue is not None:
-            self._queue.put_nowait(int(payload))
+        message_id = parse_message_id(payload, self.channel_name)
+        if message_id is not None:
+            self._queue.put_nowait(message_id)
 
     async def __aiter__(self) -> AsyncIterator[int]:
         """Iterate over the queue."""

@@ -9,6 +9,7 @@ from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import Column
+from taskiq_postgresql.drivers._notify import parse_message_id
 from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
@@ -43,6 +44,19 @@ class AsyncpgDriver(QueryDriver):
 
     @asynccontextmanager
     async def connection(self) -> AsyncGenerator[Connection, None]:
+        """
+        Borrow a connection from the pool for the duration of the block.
+
+        The pool only exists after ``async with driver``, so the query methods
+        enter that first; refusing here keeps a stray call from opening a pool
+        nobody closes.
+
+        Yields:
+            A pooled asyncpg connection, released when the block ends.
+
+        Raises:
+            DatabaseConnectionError: if the pool is not open.
+        """
         if self.pool is None:
             raise DatabaseConnectionError(
                 "The pool is not open: enter `async with driver` first.",
@@ -258,8 +272,9 @@ class AsyncpgListenDriver(ListenDriver):
             **channel**: name of the channel the notification was sent to;
             **payload**: the payload.
         """
-        if self._queue is not None:
-            self._queue.put_nowait(int(payload))
+        message_id = parse_message_id(payload, self.channel_name)
+        if message_id is not None:
+            self._queue.put_nowait(message_id)
 
     async def __aiter__(self) -> AsyncIterator[int]:
         """Iterate over the queue."""
