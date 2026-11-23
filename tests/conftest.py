@@ -2,6 +2,7 @@ import os
 import random
 import signal
 import string
+import time
 from types import FrameType
 from typing import AsyncGenerator, Generator, Optional, TypeVar
 from urllib.parse import urlsplit
@@ -48,15 +49,33 @@ def selected_postgres_major() -> str:
     return os.environ.get("TEST_POSTGRES_MAJOR") or DEFAULT_POSTGRES_MAJOR
 
 
-def _interrupt_on_sigterm(signum: int, frame: Optional[FrameType]) -> None:
-    """
-    Raise ``KeyboardInterrupt`` on the first SIGTERM and ignore the rest.
+# make and uv both pass a SIGTERM on, so one stop can reach pytest two or
+# three times within moments.
+SIGTERM_COPIES_WITHIN = 1.0
 
-    ``make`` and ``uv`` both pass the signal on, so pytest can receive it two
-    or three times; a second interrupt would cut the teardown short.
+
+class _InterruptOnSigterm:
     """
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    raise KeyboardInterrupt
+    Raise ``KeyboardInterrupt`` on the first SIGTERM; end the process on a later one.
+
+    The copies of the first SIGTERM that ``make`` and ``uv`` pass on are
+    ignored, since a second interrupt would cut the teardown short. A SIGTERM
+    after them means the interrupt did not stop the run (a background task
+    can catch it), so it gets the default action, which ends the process.
+    """
+
+    def __init__(self) -> None:
+        self.first_at: Optional[float] = None
+
+    def __call__(self, signum: int, frame: Optional[FrameType]) -> None:
+        now = time.monotonic()
+        if self.first_at is None:
+            self.first_at = now
+            raise KeyboardInterrupt
+        if now - self.first_at < SIGTERM_COPIES_WITHIN:
+            return
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.raise_signal(signal.SIGTERM)
 
 
 def pytest_configure(config: pytest.Config) -> None:
@@ -76,7 +95,7 @@ def pytest_configure(config: pytest.Config) -> None:
             f"TEST_POSTGRES_MAJOR={major!r} is not supported; "
             f"use one of {sorted(POSTGRES_IMAGES, key=int)}",
         )
-    signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
+    signal.signal(signal.SIGTERM, _InterruptOnSigterm())
 
 
 @pytest.fixture(scope="session")
