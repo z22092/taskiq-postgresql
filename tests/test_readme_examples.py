@@ -6,7 +6,9 @@ table that disagrees with the signatures, is a bug a user hits first. The
 quickstart scripts (marked ``# app.py``, ``# kick.py`` and ``# schedule.py`` on
 their first line) run as separate processes, with the README's own ``taskiq``
 commands, once per installed driver. Every other Python block is executed as
-written.
+written, except the Alembic example, which runs against a stand-in for
+``alembic.op``. The shell lines of the Migrations section run as written too,
+with the quickstart's ``app.py``.
 
 Every test that touches a database does so in a database of its own, created
 and dropped here, because the README examples use the default table names and
@@ -21,6 +23,7 @@ import os
 import queue
 import random
 import re
+import secrets
 import signal
 import ssl
 import string
@@ -28,21 +31,33 @@ import subprocess
 import sys
 import threading
 import time
+import types
+import uuid
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
-from taskiq import TaskiqResult
+from taskiq import BrokerMessage, ScheduledTask, TaskiqResult
 from taskiq.abc.serializer import TaskiqSerializer
 from taskiq.serializers import JSONSerializer, MSGPackSerializer
 
-from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
+from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend, migrations
+from taskiq_postgresql.cli import PostgresqlCMD
+from taskiq_postgresql.migrations import render_sql, table_schema
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
-from tests.helpers import create_database, drop_database, in_database
+from tests.helpers import (
+    address_of,
+    create_database,
+    drop_database,
+    in_database,
+    run_script,
+)
+from tests.test_migrations import scram_verifier
 
 README = Path(__file__).resolve().parent.parent / "README.md"
 SCRIPTS = ("app.py", "kick.py", "schedule.py")
@@ -52,6 +67,14 @@ STARTUP_TIMEOUT = 30
 SCRIPT_TIMEOUT = 60
 SHUTDOWN_TIMEOUT = 5
 SCHEDULER_ALIVE_SECONDS = 2
+# The README sections the migration tests read, by the slug of their heading.
+SCHEMA_SECTION = "database-schema"
+GENERATE_SECTION = "generate-the-sql"
+MIGRATE_SECTION = "apply-it-with-migrate"
+TOOLS_SECTION = "alembic-django-and-flyway"
+FORMAT_SECTION = "writing-a-migration-format"
+DEFAULT_TABLES = {"taskiq_messages", "taskiq_results", "taskiq_schedulers"}
+README_ROLE = "taskiq_worker"
 
 # One pass over headings and fences, so a block knows its section and a "# ..."
 # comment inside a fence is never read as a heading.
@@ -108,17 +131,39 @@ def _scripts() -> dict[str, str]:
 
 
 def _other_blocks() -> list[Block]:
-    return [block for block in _blocks("python") if block.id not in SCRIPTS]
+    # The Alembic example imports alembic, which only its own test stands in for.
+    return [
+        block
+        for block in _blocks("python")
+        if block.id not in SCRIPTS and block.section != TOOLS_SECTION
+    ]
 
 
-def _commands() -> list[list[str]]:
-    """Return the ``taskiq`` commands the README's shell blocks show."""
+def _commands(section: str) -> list[list[str]]:
+    """Return the ``taskiq`` commands the shell blocks of ``section`` show."""
     return [
         line.split()
         for block in _blocks("bash")
+        if block.section == section
         for line in block.source.splitlines()
         if line.startswith("taskiq ")
     ]
+
+
+def _shell_lines(*sections: str) -> list[str]:
+    """Return every non-empty line of the shell blocks in ``sections``."""
+    return [
+        line
+        for block in _blocks("bash")
+        if block.section in sections
+        for line in block.source.splitlines()
+        if line.strip()
+    ]
+
+
+def _block(language: str, section: str) -> Block:
+    (block,) = [block for block in _blocks(language) if block.section == section]
+    return block
 
 
 def _readme_text() -> str:
@@ -399,20 +444,23 @@ def _normalized_sql(statement: str) -> str:
 
 
 def test_when_the_schema_blocks_are_read__then_they_match_the_generated_sql() -> None:
-    """The README's DDL is what ``run_migrations=True`` executes."""
+    """
+    The README's DDL is what ``taskiq postgresql generate`` prints.
+
+    ``tests/test_migration_script.py`` pins those statements to the ones
+    ``run_migrations=True`` executes.
+    """
     expected = {}
-    for component in (
-        PostgresqlBroker(dsn="unused"),
-        PostgresqlResultBackend(dsn="unused"),
-        PostgresqlSchedulerSource(dsn="unused"),
-    ):
-        driver = component.driver
-        expected[driver.table_name] = _normalized_sql(
-            f"{driver.create_table_query.make_query()};"
-            f"{driver.create_index_query.make_query(driver.index_columns)}",
+    for kind in migrations.COMPONENT_KINDS:
+        schema = table_schema(kind)
+        script = render_sql([schema], transaction=False, lock=False)
+        expected[schema.name] = _normalized_sql(
+            "".join(line for line in script.splitlines() if not line.startswith("--")),
         )
     documented = {}
     for block in _blocks("sql"):
+        if block.section != SCHEMA_SECTION:
+            continue
         table = re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", block.source)
         assert table, block.source
         documented[table.group(1)] = _normalized_sql(block.source)
@@ -567,7 +615,7 @@ def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_sto
     for name, source in scripts.items():
         (tmp_path / name).write_text(source, encoding="utf-8")
     env = _environment(scratch_dsn)
-    worker_command, scheduler_command = _commands()
+    worker_command, scheduler_command = _commands("quickstart")
     assert worker_command == ["taskiq", "worker", "app:broker"]
     assert scheduler_command == ["taskiq", "scheduler", "app:scheduler"]
 
@@ -618,3 +666,244 @@ def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_sto
             await source.shutdown()
 
     assert asyncio.run(stored_schedules()) == ["app:add"]
+
+
+# --- Migrations ---------------------------------------------------------------
+
+# What the README's psql line does, which the tests do through the driver.
+PSQL_LINE = re.compile(r'psql "\$POSTGRESQL_URL" -v ON_ERROR_STOP=1 -f (?P<file>\S+)')
+
+
+def _default_schemas() -> list[migrations.TableSchema]:
+    """The tables of the quickstart's ``app:scheduler``, in its order."""
+    return [table_schema(kind) for kind in migrations.COMPONENT_KINDS]
+
+
+def _write_app(directory: Path, driver: str) -> None:
+    """Write the quickstart's ``app.py`` with ``driver`` in place of asyncpg."""
+    source = _scripts()["app.py"]
+    assert source.count('driver="asyncpg"') == 3  # noqa: PLR2004
+    (directory / "app.py").write_text(
+        source.replace('driver="asyncpg"', f'driver="{driver}"'),
+        encoding="utf-8",
+    )
+
+
+async def _tables(dsn: str) -> set[str]:
+    connection = await asyncpg.connect(dsn)
+    try:
+        rows = await connection.fetch(
+            "SELECT tablename FROM pg_tables WHERE schemaname = current_schema()",
+        )
+    finally:
+        await connection.close()
+    return {row["tablename"] for row in rows}
+
+
+async def _drop_tables(dsn: str, tables: set[str]) -> None:
+    connection = await asyncpg.connect(dsn)
+    try:
+        await connection.execute(f"DROP TABLE {', '.join(sorted(tables))}")
+    finally:
+        await connection.close()
+
+
+@pytest.mark.timeout(180)
+def test_when_the_migration_commands_run__then_they_create_the_tables(
+    driver: str,
+    scratch_dsn: str,
+    tmp_path: Path,
+) -> None:
+    _write_app(tmp_path, driver)
+    env = _environment(scratch_dsn)
+    ran: Counter[str] = Counter()
+    printed: list[str] = []
+    for line in _shell_lines(GENERATE_SECTION, MIGRATE_SECTION, TOOLS_SECTION):
+        psql = PSQL_LINE.fullmatch(line)
+        if psql is not None:
+            script = (tmp_path / psql["file"]).read_text(encoding="utf-8")
+            asyncio.run(run_script(scratch_dsn, driver, script))
+            assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
+            ran["psql"] += 1
+            continue
+        assert line.startswith("taskiq postgresql "), f"no runner for {line!r}"
+        command, _, target = line.partition(" > ")
+        subcommand = command.split()[2]
+        if subcommand == "migrate":
+            # So that only migrate can have created them.
+            asyncio.run(_drop_tables(scratch_dsn, DEFAULT_TABLES))
+        result = subprocess.run(  # noqa: S603
+            _taskiq(command.split()),
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=SCRIPT_TIMEOUT,
+            check=False,
+        )
+        _assert_exited_cleanly(result, driver)
+        ran[subcommand] += 1
+        if target:
+            output = tmp_path / target
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(result.stdout, encoding="utf-8")
+        elif subcommand == "generate":
+            printed.append(result.stdout)
+
+    assert ran == Counter({"generate": 3, "psql": 1, "migrate": 1})
+    assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
+    assert (tmp_path / "taskiq_tables.sql").read_text(encoding="utf-8") == (
+        render_sql(_default_schemas())
+    )
+    assert printed == [render_sql([table_schema("broker")])]
+    assert (tmp_path / "db/migration/V2__taskiq_tables.sql").read_text(
+        encoding="utf-8",
+    ) == render_sql(_default_schemas(), transaction=False)
+
+
+async def _use_the_components(dsn: str, driver: str) -> None:
+    """Start the three components on ``dsn`` and write a row with each."""
+    for run_migrations in (False, True):
+        broker = PostgresqlBroker(dsn=dsn, driver=driver, run_migrations=run_migrations)  # type: ignore[arg-type]
+        backend: PostgresqlResultBackend[int] = PostgresqlResultBackend(
+            dsn=dsn,
+            driver=driver,  # type: ignore[arg-type]
+            run_migrations=run_migrations,
+        )
+        source = PostgresqlSchedulerSource(
+            dsn=dsn,
+            driver=driver,  # type: ignore[arg-type]
+            run_migrations=run_migrations,
+        )
+        await broker.startup()
+        await backend.startup()
+        await source.startup()
+        try:
+            await broker.kick(
+                BrokerMessage(
+                    task_id=uuid.uuid4().hex,
+                    task_name="readme:task",
+                    message=b"message",
+                    labels={},
+                ),
+            )
+            await backend.set_result(
+                uuid.uuid4().hex,
+                TaskiqResult(
+                    is_err=False,
+                    log=None,
+                    return_value=1,
+                    execution_time=0.1,
+                ),
+            )
+            await source.add_schedule(
+                ScheduledTask(
+                    task_name="readme:task",
+                    labels={},
+                    args=[],
+                    kwargs={},
+                    cron="* * * * *",
+                ),
+            )
+        finally:
+            await broker.shutdown()
+            # The result backend's shutdown() leaves its pool open.
+            await backend.driver.on_shutdown()
+            await source.shutdown()
+
+
+async def _as_a_dml_only_role(dsn: str, driver: str, grants: str) -> None:
+    role = "readme_" + "".join(random.choices(string.ascii_lowercase, k=10))
+    password = secrets.token_hex(16)
+    admin = await asyncpg.connect(dsn)
+    try:
+        await admin.execute(
+            f"CREATE ROLE {role} LOGIN PASSWORD '{scram_verifier(password)}'",
+        )
+        try:
+            await admin.execute(grants.replace(README_ROLE, role))
+            assert not await admin.fetchval(
+                "SELECT has_schema_privilege($1, current_schema(), 'CREATE')",
+                role,
+            )
+            parts = urlsplit(dsn)
+            await _use_the_components(
+                parts._replace(
+                    netloc=f"{role}:{password}@{address_of(parts)}",
+                ).geturl(),
+                driver,
+            )
+        finally:
+            await admin.execute(f"DROP OWNED BY {role}")
+            await admin.execute(f"DROP ROLE {role}")
+    finally:
+        await admin.close()
+
+
+def test_when_the_grants_are_applied__then_a_dml_only_role_runs_the_components(
+    driver: str,
+    scratch_dsn: str,
+) -> None:
+    grants = _block("sql", MIGRATE_SECTION).source
+    assert grants.count(README_ROLE) == 3  # noqa: PLR2004
+    asyncio.run(run_script(scratch_dsn, driver, render_sql(_default_schemas())))
+
+    asyncio.run(_as_a_dml_only_role(scratch_dsn, driver, grants))
+
+
+def test_when_the_alembic_example_runs__then_its_sql_creates_the_tables(
+    driver: str,
+    scratch_dsn: str,
+    ca_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executed: list[str] = []
+    alembic = types.ModuleType("alembic")
+    alembic.op = types.SimpleNamespace(execute=executed.append)  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "alembic", alembic)
+
+    _run_block(_block("python", TOOLS_SECTION), ca_file)["upgrade"]()
+
+    (sql,) = executed
+    assert sql == render_sql(_default_schemas(), transaction=False)
+    # Alembic runs it inside the migration's own transaction.
+    asyncio.run(run_script(scratch_dsn, driver, f"BEGIN;\n{sql}COMMIT;\n"))
+    assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
+
+
+def test_when_the_format_example_is_installed__then_generate_prints_it(
+    ca_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    header, entry = _block("toml", FORMAT_SECTION).source.strip().splitlines()
+    assert header == (f'[project.entry-points."{migrations.MIGRATION_FORMATS_GROUP}"]')
+    name, _, value = (part.strip() for part in entry.partition("="))
+    target = re.fullmatch(r'"[\w.]+:(?P<function>\w+)"', value)
+    assert target is not None, entry
+    render = _run_block(_block("python", FORMAT_SECTION), ca_file)[target["function"]]
+
+    class ExampleEntryPoint:
+        """Stands for the entry point the TOML block registers."""
+
+        def __init__(self) -> None:
+            self.name = name
+
+        def load(self) -> Any:
+            """Return the example's format."""
+            return render
+
+    monkeypatch.setattr(migrations, "_entry_points", lambda: [ExampleEntryPoint()])
+    command = ["generate", "--component", "result_backend", "--format", name]
+
+    assert PostgresqlCMD().exec([*command, "--option", "title=Results"]) == 0
+    assert capsys.readouterr().out == (
+        "# Results\n"
+        "## taskiq_results (result_backend)\n"
+        "- `task_id`: uuid, not null\n"
+        "- `result`: bytea, not null\n"
+        "- `created_at`: timestamptz, not null\n"
+        "- index `taskiq_results_task_id_idx`: hash on task_id\n"
+    )
+    assert PostgresqlCMD().exec([*command, "--option", "color=red"]) == 2  # noqa: PLR2004
+    assert "unknown options: color" in capsys.readouterr().err

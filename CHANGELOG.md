@@ -26,6 +26,22 @@ Upgrading from 0.4.x:
   removed, and reads a numeric `cron_offset` (written under pydantic v1) as
   seconds, which taskiq 0.13 would reject.
 - `pydantic>=2.5,<3` as a runtime dependency, the floor taskiq 0.13 requires.
+- `taskiq postgresql generate` prints the SQL script that creates the tables
+  and indexes, with your table names and `field_for_task_id`, so you can run
+  it yourself (`psql -f`) or add it to Alembic, Django or Flyway
+  (`--no-transaction`). It reads the components from your application
+  (`app:broker`, `app:scheduler`, as `taskiq worker` does) or, without
+  importing it, from `--component`. The script takes the same advisory lock as
+  `run_migrations=True` and is safe to run again.
+- `taskiq postgresql migrate` creates the tables once, with the code
+  `run_migrations=True` runs, whatever the components set. Run it before the
+  workers, which can then use `run_migrations=False` and a role that only reads
+  and writes rows.
+- `taskiq_postgresql.migrations` describes the tables as data (`table_schema`,
+  `collect_schemas`) and renders the script (`render_sql`), for tools that
+  build their own migrations. Other packages can add output formats to
+  `generate --format` through the `taskiq_postgresql.migration_formats` entry
+  point group; the README has the contract.
 
 ### Changed
 
