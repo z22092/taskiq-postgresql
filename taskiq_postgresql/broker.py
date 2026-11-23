@@ -3,7 +3,7 @@ from __future__ import annotations
 import math
 from asyncio import Queue as AsyncQueue
 from asyncio import Task, get_running_loop
-from contextlib import suppress
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, TypeVar
@@ -22,12 +22,45 @@ from taskiq_postgresql.utils import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator
+    from collections.abc import AsyncGenerator, Iterator
 
 
 _T = TypeVar("_T")
 
 logger = getLogger("taskiq.asyncpg_broker")
+
+# Upper bound on how long a stop request waits while listen() is idle.
+_LISTEN_WAKE_UP_INTERVAL = 1.0
+
+
+@contextmanager
+def _wake_up_periodically(interval: float) -> Iterator[None]:
+    """
+    Keep a timer due every ``interval`` seconds on the running event loop.
+
+    ``taskiq worker`` stops on SIGINT or SIGTERM by setting an
+    ``asyncio.Event`` from a ``signal.signal`` handler. That only queues the
+    callbacks of the event's waiters: it does not wake a loop blocked in
+    ``select()``, so a worker whose channel gets no notification would never
+    run them. A due timer wakes the loop, and the loop then runs them.
+
+    Args:
+        interval: seconds between two wake-ups.
+
+    Yields:
+        Nothing; the timer is cancelled when the block exits.
+    """
+    loop = get_running_loop()
+
+    def wake_up() -> None:
+        nonlocal handle
+        handle = loop.call_later(interval, wake_up)
+
+    handle = loop.call_later(interval, wake_up)
+    try:
+        yield
+    finally:
+        handle.cancel()
 
 
 def _parse_delay(value: Any) -> float:
@@ -278,47 +311,51 @@ class PostgresqlBroker(AsyncBroker):
 
         :yields: AckableMessage instances.
         """
-        while True:
-            try:
-                async for message_id in self.listen_driver:
-                    # Normalize payload to integer ID
-                    # (psycopg may yield string payloads).
-                    try:
-                        normalized_id = int(message_id)  # type: ignore[arg-type]
-                    except (TypeError, ValueError):
-                        logger.warning(
-                            "Invalid NOTIFY payload %r on channel %s",
-                            message_id,
-                            self.channel_name,
+        # A timer rather than a timeout on each read: the read stays in the
+        # caller's task, so cancelling it, as taskiq does on shutdown, cannot
+        # lose a notification that arrives at the same moment.
+        with _wake_up_periodically(_LISTEN_WAKE_UP_INTERVAL):
+            while True:
+                try:
+                    async for message_id in self.listen_driver:
+                        # Normalize payload to integer ID
+                        # (psycopg may yield string payloads).
+                        try:
+                            normalized_id = int(message_id)  # type: ignore[arg-type]
+                        except (TypeError, ValueError):
+                            logger.warning(
+                                "Invalid NOTIFY payload %r on channel %s",
+                                message_id,
+                                self.channel_name,
+                            )
+                            continue
+
+                        # Atomically claim the message row. If None is returned,
+                        # another worker has already claimed it.
+                        row = await self.driver.delete_returning(
+                            self.columns.primary_key,
+                            normalized_id,
+                            [self.columns.message],
                         )
-                        continue
 
-                    # Atomically claim the message row. If None is returned, another
-                    # worker has already claimed it.
-                    row = await self.driver.delete_returning(
-                        self.columns.primary_key,
-                        normalized_id,
-                        [self.columns.message],
-                    )
+                        if row is None:
+                            # Claimed elsewhere or missing; skip.
+                            continue
 
-                    if row is None:
-                        # Claimed elsewhere or missing; skip.
-                        continue
+                        message: Optional[bytes] = row.get(self.columns.message.name)
 
-                    message: Optional[bytes] = row.get(self.columns.message.name)
+                        if message is None:
+                            logger.warning(
+                                "Message with id %s has no payload.",
+                                message_id,
+                            )
+                            continue
 
-                    if message is None:
-                        logger.warning(
-                            "Message with id %s has no payload.",
-                            message_id,
-                        )
-                        continue
+                        async def ack(*, _message_id: int = message_id) -> None:
+                            # No-op: the row was already deleted when claimed.
+                            return None
 
-                    async def ack(*, _message_id: int = message_id) -> None:
-                        # No-op: the row was already deleted when claimed.
-                        return None
-
-                    yield AckableMessage(data=message, ack=ack)
-            except Exception as error:
-                logger.exception("Error processing message: %s", error)
-                continue
+                        yield AckableMessage(data=message, ack=ack)
+                except Exception as error:
+                    logger.exception("Error processing message: %s", error)
+                    continue

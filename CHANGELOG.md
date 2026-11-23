@@ -76,6 +76,9 @@ Upgrading from 0.4.x:
   `min_size=1, max_size=1`). The migration used to hold one connection while it
   waited for a second: asyncpg waited with no timeout, psycopg until its pool
   timeout.
+- `taskiq worker` stops on SIGINT or SIGTERM while no message arrives. With the
+  asyncpg and psqlpy drivers its worker processes used to hang until one did,
+  and the main process waited for them.
 
 ### Removed
 
