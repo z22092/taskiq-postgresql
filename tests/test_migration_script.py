@@ -30,9 +30,12 @@ from taskiq_postgresql import migrations
 from taskiq_postgresql.abc.query import MIGRATION_LOCK_NAMESPACE, Column
 from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.migrations import (
+    DEFAULT_LOCK_TIMEOUT,
     ColumnSchema,
+    FormatOptions,
     IndexSchema,
     MigrationStep,
+    TableSchema,
     collect_components,
     collect_schemas,
     render_sql,
@@ -72,6 +75,8 @@ SHAPES = [
 ]
 SHAPE_IDS = [f"{kind}-{field}" if field else kind for kind, field in SHAPES]
 WAIT_SECONDS = 10
+# Short, so a test that waits it out stays fast; far below WAIT_SECONDS.
+LOCK_TIMEOUT = 1
 
 
 def build_component(
@@ -450,6 +455,7 @@ def test_the_script_has_a_header_and_ends_every_statement() -> None:
         [
             *lines[:2],
             "BEGIN;",
+            "SET LOCAL lock_timeout = '10s';",
             *lock_lines(script),
             *(
                 f"{statement};"
@@ -480,9 +486,51 @@ def test_the_lock_line_is_the_runtime_lock_key() -> None:
 
     # The namespace is a contract between releases: never change it.
     assert MIGRATION_LOCK_NAMESPACE == "taskiq_postgresql"
-    assert script.splitlines()[3] == (
+    # After BEGIN and the lock timeout.
+    assert script.splitlines()[4] == (
         "SELECT pg_advisory_xact_lock(hashtext('taskiq_postgresql'), hashtext('jobs'));"
     )
+
+
+def test_the_lock_timeout_is_the_first_statement() -> None:
+    schemas = [table_schema("broker")]
+
+    assert DEFAULT_LOCK_TIMEOUT == 10  # noqa: PLR2004
+    assert render_sql(schemas).splitlines()[2:4] == [
+        "BEGIN;",
+        "SET LOCAL lock_timeout = '10s';",
+    ]
+    assert render_sql(schemas, lock_timeout=3).splitlines()[3] == (
+        "SET LOCAL lock_timeout = '3s';"
+    )
+    # Without BEGIN, the tool's own transaction is the one SET LOCAL lasts for.
+    assert render_sql(schemas, transaction=False).splitlines()[2] == (
+        "SET LOCAL lock_timeout = '10s';"
+    )
+    # Without the advisory lock, the table locks still wait at most this long.
+    assert render_sql(schemas, lock=False).splitlines()[3] == (
+        "SET LOCAL lock_timeout = '10s';"
+    )
+    for transaction in (True, False):
+        assert "lock_timeout" not in render_sql(
+            schemas,
+            transaction=transaction,
+            lock_timeout=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "lock_timeout",
+    [-1, 2_147_484, True, 1.5, "10"],
+    ids=["negative", "above-the-server-maximum", "bool", "fraction", "text"],
+)
+def test_a_lock_timeout_the_script_cannot_set_is_refused(lock_timeout: Any) -> None:
+    message = "lock_timeout must be a whole number of seconds from 0 to 2147483"
+
+    with pytest.raises(ValueError, match=message):
+        render_sql([table_schema("broker")], lock_timeout=lock_timeout)
+    with pytest.raises(ValueError, match=message):
+        FormatOptions(lock_timeout=lock_timeout)
 
 
 def test_without_the_lock_there_is_no_lock_line() -> None:
@@ -758,6 +806,178 @@ async def test_a_startup_waits_for_the_lock_the_script_holds(
     finally:
         await holder.close()
         await close_component(component)
+
+
+def script_in_a_transaction(schema: TableSchema, *, transaction: bool) -> str:
+    """
+    The script with ``LOCK_TIMEOUT``, in its own transaction or in a tool's.
+
+    Without its own ``BEGIN``, it runs inside the ``BEGIN`` and ``COMMIT`` that
+    Alembic, Django and Flyway wrap around a migration.
+    """
+    script = render_sql(
+        [schema],
+        transaction=transaction,
+        lock_timeout=LOCK_TIMEOUT,
+    )
+    return script if transaction else f"BEGIN;\n{script}COMMIT;\n"
+
+
+async def lock_waited_on(
+    admin: asyncpg.Connection,
+    blocker_pid: int,
+    script: asyncio.Task[None],
+) -> tuple[str, str]:
+    """
+    Wait until a session waits on a lock ``blocker_pid`` holds.
+
+    Returns:
+        The type and mode of the lock it waits for.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + WAIT_SECONDS
+    while not script.done() and loop.time() < deadline:
+        waiting = await admin.fetchrow(
+            "SELECT locktype, mode FROM pg_locks "
+            "WHERE NOT granted AND $1 = ANY(pg_blocking_pids(pid)) LIMIT 1",
+            blocker_pid,
+        )
+        if waiting is not None:
+            return waiting["locktype"], waiting["mode"]
+        await asyncio.sleep(0.05)
+    pytest.fail("the script never waited on the lock")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "transaction",
+    [True, False],
+    ids=["transaction", "tool-transaction"],
+)
+async def test_the_lock_timeout_bounds_the_wait_for_the_advisory_lock(
+    transaction: bool,
+    driver: str,
+    empty_dsn: str,
+    inspector: asyncpg.Connection,
+    postgres_table: str,
+) -> None:
+    schema = table_schema("broker", table_name=postgres_table)
+    (lock_line,) = lock_lines(render_sql([schema]))
+    loop = asyncio.get_running_loop()
+    # Another script, or a worker's run_migrations=True, holds the lock.
+    holder = await asyncpg.connect(empty_dsn)
+    try:
+        holding = holder.transaction()
+        await holding.start()
+        await holder.execute(lock_line)
+        started = loop.time()
+        script = asyncio.create_task(
+            run_script(
+                empty_dsn,
+                driver,
+                script_in_a_transaction(schema, transaction=transaction),
+            ),
+        )
+        try:
+            waited_on = await lock_waited_on(
+                inspector,
+                holder.get_server_pid(),
+                script,
+            )
+            with pytest.raises(Exception, match="lock timeout"):
+                await asyncio.wait_for(script, WAIT_SECONDS)
+            waited = loop.time() - started
+        finally:
+            await holding.rollback()
+            await asyncio.gather(script, return_exceptions=True)
+    finally:
+        await holder.close()
+
+    assert waited_on == ("advisory", "ExclusiveLock")
+    assert LOCK_TIMEOUT <= waited < WAIT_SECONDS
+    # It failed as a whole: the table it would have created is not there.
+    assert await inspector.fetchval("SELECT to_regclass($1)", postgres_table) is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "transaction",
+    [True, False],
+    ids=["transaction", "tool-transaction"],
+)
+async def test_the_lock_timeout_bounds_the_wait_of_alter_table_on_a_live_table(
+    transaction: bool,
+    driver: str,
+    empty_dsn: str,
+    inspector: asyncpg.Connection,
+    postgres_table: str,
+) -> None:
+    schema = table_schema("broker", table_name=postgres_table)
+    await run_script(empty_dsn, driver, render_sql([schema]))
+    insert = (
+        f"INSERT INTO {postgres_table} (task_id, task_name, message, labels) "  # noqa: S608
+        "VALUES (gen_random_uuid(), 'task', 'message', '{}')"
+    )
+    loop = asyncio.get_running_loop()
+    # A worker's transaction that read the table and has not ended yet.
+    reader = await asyncpg.connect(empty_dsn)
+    writer = await asyncpg.connect(empty_dsn)
+    produced: Optional[asyncio.Task[str]] = None
+    try:
+        reading = reader.transaction()
+        await reading.start()
+        await reader.fetchval(f"SELECT count(*) FROM {postgres_table}")  # noqa: S608
+        started = loop.time()
+        script = asyncio.create_task(
+            run_script(
+                empty_dsn,
+                driver,
+                script_in_a_transaction(schema, transaction=transaction),
+            ),
+        )
+        try:
+            waited_on = await lock_waited_on(
+                inspector,
+                reader.get_server_pid(),
+                script,
+            )
+            # A producer's INSERT, queued behind the waiting ALTER TABLE.
+            produced = asyncio.create_task(writer.execute(insert))
+            with pytest.raises(Exception, match="lock timeout"):
+                await asyncio.wait_for(script, WAIT_SECONDS)
+            waited = loop.time() - started
+            await asyncio.wait_for(produced, WAIT_SECONDS)
+        finally:
+            await reading.rollback()
+            await asyncio.gather(
+                script,
+                *([produced] if produced else []),
+                return_exceptions=True,
+            )
+    finally:
+        await reader.close()
+        await writer.close()
+
+    assert waited_on == ("relation", "AccessExclusiveLock")
+    assert LOCK_TIMEOUT <= waited < WAIT_SECONDS
+    # The INSERT went through while the reader's transaction was still open.
+    assert await inspector.fetchval(f"SELECT count(*) FROM {postgres_table}") == 1  # noqa: S608
+
+
+@pytest.mark.anyio
+async def test_the_largest_lock_timeout_is_one_the_server_accepts(
+    driver: str,
+    empty_dsn: str,
+) -> None:
+    script = render_sql([table_schema("result_backend")], lock_timeout=2_147_483)
+
+    await run_script(empty_dsn, driver, script)
+    with pytest.raises(Exception, match="lock_timeout"):
+        await run_script(
+            empty_dsn,
+            driver,
+            script.replace("'2147483s'", "'2147484s'"),
+        )
 
 
 @pytest.mark.anyio

@@ -61,6 +61,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "COMPONENT_KINDS",
+    "DEFAULT_LOCK_TIMEOUT",
     "MIGRATION_FORMATS_GROUP",
     "TASK_ID_TYPES",
     "ColumnSchema",
@@ -102,6 +103,13 @@ IndexMethod = Literal["hash", "btree"]
 
 MIGRATION_FORMATS_GROUP: Final = "taskiq_postgresql.migration_formats"
 """The entry-point group that ``taskiq postgresql generate --format`` reads."""
+
+DEFAULT_LOCK_TIMEOUT: Final = 10
+"""Seconds a script's statement waits for a lock before the script fails."""
+
+# The server keeps lock_timeout as an int of milliseconds and refuses a larger
+# value when the script runs.
+_MAX_LOCK_TIMEOUT: Final = 2_147_483
 
 # Keyed by the upper-cased SQL spelling; PostgreSQL type names ignore case.
 _TYPE_NAMES: Final[Mapping[str, TypeName]] = {
@@ -165,8 +173,10 @@ class MigrationStep:
     """
     One additive, idempotent step of a table's migration.
 
-    Steps run in ``number`` order and each one is safe to run again, so the
-    whole list brings a table of any earlier release up to date.
+    Steps run in ``number`` order and each one is idempotent, so the whole
+    list brings a table of any earlier release up to date. Idempotent is not
+    lock-free: on a table that already exists, ``ALTER TABLE`` and
+    ``CREATE INDEX`` lock it before they find that nothing is missing.
 
     Attributes:
         number: Position of the step, from 1.
@@ -325,13 +335,20 @@ def render_sql(
     *,
     transaction: bool = True,
     lock: bool = True,
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
 ) -> str:
     """
     Render the SQL script that creates the tables, or completes them.
 
     The script runs every step of every table, with ``IF NOT EXISTS``, so it
-    is safe to run again and on a database an earlier release migrated. The
-    output is the same for the same tables, options and package version.
+    is idempotent: it completes a database an earlier release migrated, and a
+    second run changes nothing. It still locks the tables when nothing is
+    missing, because ``ALTER TABLE`` and ``CREATE INDEX`` lock a table before
+    they find that the column or index exists. On a live database
+    ``ALTER TABLE`` waits for every open transaction that used the table,
+    and every later query on the table waits behind it; ``lock_timeout``
+    bounds that wait. The output is the same for the same tables, options and
+    package version.
 
     Args:
         schemas: The tables, in the order their statements run.
@@ -341,21 +358,32 @@ def render_sql(
         lock: Take, per table, the advisory lock ``run_migrations=True``
             takes, so the script and starting workers create the tables one
             after the other. The lock lasts until the transaction ends.
+        lock_timeout: Seconds a statement waits for a lock, the advisory lock
+            included, before it fails and the transaction rolls back. The
+            first statement sets it with ``SET LOCAL lock_timeout``, which
+            lasts until the transaction ends (the caller's transaction with
+            ``transaction=False``). ``0`` leaves the statement out, so the
+            session's own ``lock_timeout`` applies.
 
     Returns:
         The script: a header comment, then each statement, starting on a new
         line and ending with a semicolon. A statement may span several lines.
 
     Raises:
-        ValueError: if ``schemas`` is empty or a table name cannot be written
-            in a script.
+        ValueError: if ``schemas`` is empty, a table name cannot be written
+            in a script, or ``lock_timeout`` is not a whole number of seconds
+            from 0 to 2147483.
     """
     tables = list(schemas)
     if not tables:
         raise ValueError("render_sql() needs at least one table schema")
     for table in tables:
         _check_table_name(table.name)
+    _check_lock_timeout(lock_timeout)
     statements: list[str] = []
+    if lock_timeout:
+        # First, so that it also bounds the wait for the advisory lock.
+        statements.append(f"SET LOCAL lock_timeout = '{lock_timeout}s'")
     if lock:
         # Sorted, so two scripts that lock the same tables take the locks in
         # the same order and cannot deadlock each other.
@@ -387,12 +415,24 @@ class FormatOptions:
         transaction: ``False`` with ``--no-transaction``: the target tool runs
             the migration in its own transaction.
         lock: ``False`` with ``--no-lock``: leave out the advisory lock.
+        lock_timeout: Seconds a statement waits for a lock before the
+            migration fails, from ``--lock-timeout``; ``0`` sets none. See
+            ``render_sql``.
         extra: Format-specific options, from repeated ``--option KEY=VALUE``.
+
+    Raises:
+        ValueError: if ``lock_timeout`` is not a whole number of seconds from
+            0 to 2147483.
     """
 
     transaction: bool = True
     lock: bool = True
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT
     extra: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """Refuse a ``lock_timeout`` no format could write."""
+        _check_lock_timeout(self.lock_timeout)
 
 
 MigrationFormat = Callable[[Sequence[TableSchema], FormatOptions], str]
@@ -421,7 +461,8 @@ def sql_format(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
 
     Args:
         schemas: The tables.
-        options: ``transaction`` and ``lock`` go to ``render_sql``.
+        options: ``transaction``, ``lock`` and ``lock_timeout`` go to
+            ``render_sql``.
 
     Returns:
         The SQL script.
@@ -434,7 +475,12 @@ def sql_format(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
         raise MigrationFormatOptionError(
             f"the sql format takes no --option; got {', '.join(sorted(options.extra))}",
         )
-    return render_sql(schemas, transaction=options.transaction, lock=options.lock)
+    return render_sql(
+        schemas,
+        transaction=options.transaction,
+        lock=options.lock,
+        lock_timeout=options.lock_timeout,
+    )
 
 
 def available_formats() -> list[str]:
@@ -513,6 +559,19 @@ def _check_table_name(name: str) -> None:
         raise ValueError(
             f"table name {name!r} cannot be written in a SQL script: it is "
             "empty or holds a line break or a NUL",
+        )
+
+
+def _check_lock_timeout(seconds: int) -> None:
+    # A bool is an int, and True would read as one second.
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, int)
+        or not 0 <= seconds <= _MAX_LOCK_TIMEOUT
+    ):
+        raise ValueError(
+            "lock_timeout must be a whole number of seconds from 0 to "
+            f"{_MAX_LOCK_TIMEOUT}, got {seconds!r}",
         )
 
 

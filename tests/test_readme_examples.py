@@ -500,7 +500,7 @@ def test_when_the_schema_blocks_are_read__then_they_match_the_generated_sql() ->
     generated = {}
     for kind in migrations.COMPONENT_KINDS:
         schema = table_schema(kind)
-        script = render_sql([schema], transaction=False, lock=False)
+        script = render_sql([schema], transaction=False, lock=False, lock_timeout=0)
         # Step 2's statements span lines, so the lines are joined with a break.
         generated[schema.name] = _normalized_sql(
             "\n".join(

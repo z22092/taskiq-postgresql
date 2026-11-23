@@ -79,6 +79,11 @@ def test_the_sql_format_renders_the_script_with_the_options() -> None:
         schemas,
         FormatOptions(transaction=False, lock=False),
     ) == render_sql(schemas, transaction=False, lock=False)
+    assert sql_format(schemas, FormatOptions(lock_timeout=0)) == render_sql(
+        schemas,
+        lock_timeout=0,
+    )
+    assert "lock_timeout = '3s'" in sql_format(schemas, FormatOptions(lock_timeout=3))
 
 
 def test_the_sql_format_refuses_extra_options() -> None:

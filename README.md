@@ -487,14 +487,30 @@ psql "$POSTGRESQL_URL" -v ON_ERROR_STOP=1 -f taskiq_tables.sql
 
 Only the script goes to standard output; messages go to standard error. The
 script starts with a comment that names the package version and the tables,
-then runs in one transaction: it takes, per table, the advisory lock
-`run_migrations=True` takes, then creates each table and index with
-`IF NOT EXISTS` and adds the broker's `channel` and `not_before` columns and
-their index the same way, which also upgrades a broker table created by 0.4.x.
-So it is safe to run again, and safe while workers with
-`run_migrations=True` are starting. The statements are the ones in
+then runs in one transaction: it sets a lock timeout for that transaction,
+takes, per table, the advisory lock `run_migrations=True` takes, then creates
+each table and index with `IF NOT EXISTS` and adds the broker's `channel` and
+`not_before` columns and their index the same way, which also upgrades a
+broker table created by 0.4.x. The statements are the ones in
 [Database schema](#database-schema), with your table names and
 `field_for_task_id`.
+
+The script is idempotent: a second run changes nothing, and the advisory lock
+lets it run while workers with `run_migrations=True` are starting. It is not
+lock-free. On a live database it locks the tables even when nothing is
+missing: `CREATE INDEX` waits for every open transaction that wrote to the
+table, and `ALTER TABLE` for every open transaction that used it, before they
+find that the index or the column exists, and every later query on the
+table, the producers' `INSERT` included, waits behind the `ALTER TABLE`. So
+the script starts with `SET LOCAL lock_timeout = '10s'`: a statement that
+waits that long for a lock, the advisory lock included, fails, and the whole
+script rolls back instead of stalling the broker. Run it again once the long
+transaction has ended. `--lock-timeout SECONDS` sets another limit;
+`--lock-timeout 0` leaves the statement out, so the session's own
+`lock_timeout` applies (PostgreSQL's default, 0, waits for ever).
+`taskiq postgresql migrate` checks first and runs no DDL when every table,
+column and index exists, so it takes no table lock on a database that is
+already up to date.
 
 To generate without importing the application, for example where its settings
 are not available, name one component per call. `--table-name` and
@@ -505,6 +521,9 @@ taskiq postgresql generate --component broker --table-name taskiq_messages --fie
 ```
 
 `--no-transaction` leaves out `BEGIN` and `COMMIT`, and `--no-lock` the lock.
+Without `BEGIN`, `SET LOCAL lock_timeout` is the first statement and lasts
+until the transaction that runs the script ends; outside a transaction
+PostgreSQL ignores it with a warning.
 `--format` picks another output format, when a package has installed one (see
 [Writing a migration format](#writing-a-migration-format)), and
 `--option KEY=VALUE` passes options to it.
@@ -536,9 +555,9 @@ exists, startup only checks for them.
 ### Alembic, Django and Flyway
 
 These tools run each migration in a transaction of their own, so give them the
-script without `BEGIN` and `COMMIT`. The lock stays, and holds until their
-transaction commits. For Flyway, write the script as a versioned migration,
-with the next free version number:
+script without `BEGIN` and `COMMIT`. The lock and the lock timeout stay, and
+last until their transaction ends. For Flyway, write the script as a versioned
+migration, with the next free version number:
 
 ```bash
 taskiq postgresql generate app:scheduler --no-transaction > db/migration/V2__taskiq_tables.sql
@@ -620,14 +639,15 @@ The contract:
   `columns` (`ColumnSchema`: `name`, `sql_type`, `type_name`, `length`,
   `nullable`, `default`, `primary_key`), `indexes` (`IndexSchema`: `name`,
   `columns`, `method`) and `steps` (`MigrationStep`: `number`, and the SQL
-  `statements` in the order they run, each safe to run again). The columns and
+  `statements` in the order they run, each idempotent). The columns and
   indexes are the table's shape after every step. Read the structure instead of
   parsing SQL; to emit SQL, reuse `render_sql` or the steps' statements as they
   are.
 - `options` is a `FormatOptions`: `transaction` and `lock` (`False` with
-  `--no-transaction` and `--no-lock`), and `extra`, the `--option KEY=VALUE`
-  pairs. Raise `MigrationFormatOptionError` for an option the format does not
-  accept; `generate` then exits with 2.
+  `--no-transaction` and `--no-lock`), `lock_timeout` (the seconds of
+  `--lock-timeout`, 10 by default, 0 for none), and `extra`, the
+  `--option KEY=VALUE` pairs. Raise `MigrationFormatOptionError` for an option
+  the format does not accept; `generate` then exits with 2.
 - When the format needs an optional dependency, import it at module level and
   put it in an extra named after the format. If the import fails, `generate`
   tells the user to run `pip install '<your-package>[<format>]'`. Listing the

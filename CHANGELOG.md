@@ -95,7 +95,12 @@ Upgrading from 0.4.x:
   Alembic, Django or Flyway (`--no-transaction`). It reads the components from your application
   (`app:broker`, `app:scheduler`, as `taskiq worker` does) or, without
   importing it, from `--component`. The script takes the same advisory lock as
-  `run_migrations=True` and is safe to run again.
+  `run_migrations=True` and is idempotent. It still locks the tables when
+  nothing is missing, so on a live database it starts with
+  `SET LOCAL lock_timeout = '10s'` and fails after that long without a lock
+  instead of stalling the broker; `--lock-timeout SECONDS` changes the limit
+  and `--lock-timeout 0` leaves it out. `migrate` runs no DDL when everything
+  exists.
 - `taskiq postgresql migrate` creates the tables once, with the code
   `run_migrations=True` runs, whatever the components set. Run it before the
   workers, which can then use `run_migrations=False` and a role that only reads
