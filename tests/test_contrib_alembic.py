@@ -43,6 +43,7 @@ from taskiq_postgresql.contrib.alembic import (
     upgrade_taskiq_tables,
 )
 from taskiq_postgresql.migrations import (
+    DEFAULT_LOCK_TIMEOUT,
     FormatOptions,
     MigrationFormatOptionError,
     TableSchema,
@@ -127,10 +128,40 @@ else:
         run(connection)
 """
 ALEMBIC_INI = "[alembic]\nscript_location = %(here)s/migrations\n"
+# Where the taskiq steps keep the transaction's own lock_timeout while theirs
+# applies, and the statements that keep and give it back.
+SAVED_LOCK_TIMEOUT = "taskiq_postgresql_step.lock_timeout"
+SAVE_LOCK_TIMEOUT = (
+    f"SELECT set_config('{SAVED_LOCK_TIMEOUT}', current_setting('lock_timeout'), true)"
+)
+RESTORE_LOCK_TIMEOUT = (
+    "SELECT set_config('lock_timeout', "
+    f"NULLIF(current_setting('{SAVED_LOCK_TIMEOUT}', true), ''), true)"
+)
 
 
 def default_schemas() -> list[TableSchema]:
     return [table_schema(kind) for kind in KINDS]
+
+
+def bounded(
+    statements: Sequence[str],
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+) -> list[str]:
+    """
+    ``statements`` as the Alembic integration runs them.
+
+    They run with a ``lock_timeout`` of their own, set after keeping the
+    transaction's, which comes back after them; ``0`` adds nothing.
+    """
+    if not lock_timeout:
+        return list(statements)
+    return [
+        SAVE_LOCK_TIMEOUT,
+        f"SET LOCAL lock_timeout = '{lock_timeout}s'",
+        *statements,
+        RESTORE_LOCK_TIMEOUT,
+    ]
 
 
 def run_upgrade(
@@ -339,9 +370,10 @@ def upgrade_default_tables() -> None:
 
 def default_statements() -> list[str]:
     broker, *others = default_schemas()
+    # Each call bounds the lock waits of its own statements.
     return [
-        *migration_statements([broker], through=2),
-        *migration_statements(others, through=1),
+        *bounded(migration_statements([broker], through=2)),
+        *bounded(migration_statements(others, through=1)),
     ]
 
 
@@ -396,7 +428,9 @@ def test_upgrade_taskiq_tables_takes_import_paths(
 
     assert printed == "".join(
         f"{statement};\n\n"
-        for statement in migration_statements([table_schema("broker")], through=2)
+        for statement in bounded(
+            migration_statements([table_schema("broker")], through=2),
+        )
     )
 
 
@@ -408,14 +442,22 @@ def test_the_alembic_format_is_registered() -> None:
     assert load_format("alembic") is alembic_format
 
 
-def step_statements(schemas: list[TableSchema], *, lock: bool = True) -> list[str]:
-    """Each step of each table, by table name, every step with its own lock."""
+def step_statements(
+    schemas: list[TableSchema],
+    *,
+    lock: bool = True,
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+) -> list[str]:
+    """
+    Each step of each table, by table name.
+
+    Every step has its own lock and its own bound on lock waits.
+    """
     statements = []
     for schema in sorted(schemas, key=lambda table: table.name):
         for step in schema.steps:
-            if lock:
-                statements.append(migration_statements([schema])[0])
-            statements.extend(step.statements)
+            locks = migration_statements([schema])[:1] if lock else []
+            statements.extend(bounded([*locks, *step.statements], lock_timeout))
     return statements
 
 

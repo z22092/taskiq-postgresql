@@ -72,7 +72,12 @@ from tests.helpers import (
     in_database,
     run_script,
 )
-from tests.test_contrib_alembic import autogenerate, offline_sql, run_upgrade
+from tests.test_contrib_alembic import (
+    autogenerate,
+    bounded,
+    offline_sql,
+    run_upgrade,
+)
 from tests.test_contrib_sqlalchemy import sqlalchemy_url
 from tests.test_migrations import scram_verifier
 
@@ -1202,8 +1207,8 @@ def test_when_the_alembic_revision_examples_run__then_they_create_the_tables(
     assert offline_sql(revision["upgrade"]) == "".join(
         f"{statement};\n\n"
         for statement in [
-            *migration_statements([broker], through=2),
-            *migration_statements(others, through=1),
+            *bounded(migration_statements([broker], through=2)),
+            *bounded(migration_statements(others, through=1)),
         ]
     )
     for _ in range(2):

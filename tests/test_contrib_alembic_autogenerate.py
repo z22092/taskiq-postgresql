@@ -48,6 +48,7 @@ from tests.helpers import run_script
 from tests.test_contrib_alembic import (
     SQLALCHEMY_DRIVERS,
     alembic,
+    bounded,
     make_alembic_project,
     offline_sql,
     run_upgrade,
@@ -170,7 +171,7 @@ def test_the_revision_writes_the_step_sql_and_imports_nothing(
     upgrade = render_python_code(script.upgrade_ops)
     downgrade = render_python_code(script.downgrade_ops)
 
-    assert executed(upgrade) == [lock_of(broker), *broker.steps[1].statements]
+    assert executed(upgrade) == bounded([lock_of(broker), *broker.steps[1].statements])
     assert "# taskiq-postgresql step 2 of the broker table taskiq_messages" in upgrade
     assert "ACCESS EXCLUSIVE" in upgrade
     # The downgrade leaves the additive step in place.
@@ -561,14 +562,16 @@ def test_through_keeps_a_revision_at_its_step_when_the_package_gains_steps(
     assert after == before
     assert before == "".join(
         f"{statement};\n\n"
-        for statement in [
-            lock_of(broker),
-            *(
-                statement
-                for step in broker.steps[:through]
-                for statement in step.statements
-            ),
-        ]
+        for statement in bounded(
+            [
+                lock_of(broker),
+                *(
+                    statement
+                    for step in broker.steps[:through]
+                    for statement in step.statements
+                ),
+            ],
+        )
     )
 
 
@@ -630,7 +633,9 @@ def test_colons_in_a_step_reach_the_server_as_written(
         lambda: upgrade_taskiq_tables(op, schema, through=1),
     )
 
-    assert printed == f"{lock_of(schema)};\n\n{statement};\n\n"
+    assert printed == "".join(
+        f"{line};\n\n" for line in bounded([lock_of(schema), statement])
+    )
     assert offline_sql(lambda: upgrade_taskiq_tables(op, schema, through=1)) == printed
     defaults = {
         row[1]: row[7]

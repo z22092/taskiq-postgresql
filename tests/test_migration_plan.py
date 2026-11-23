@@ -23,6 +23,7 @@ import pytest
 
 from taskiq_postgresql import migrations
 from taskiq_postgresql.migrations import (
+    DEFAULT_LOCK_TIMEOUT,
     CatalogState,
     ColumnSchema,
     IndexSchema,
@@ -355,9 +356,21 @@ def test_the_plan_renders_the_script_of_its_pending_steps() -> None:
     lines = script.splitlines()
     assert lines[0].startswith("-- taskiq-postgresql ")
     assert lines[1] == "-- pending: taskiq_messages step 2"
+    # As in render_sql, the lock timeout comes first, so that it also bounds
+    # the wait for the advisory lock.
     assert script.split("\n", 2)[2] == "".join(
-        f"{statement};\n" for statement in ["BEGIN", *plan.statements(), "COMMIT"]
+        f"{statement};\n"
+        for statement in [
+            "BEGIN",
+            f"SET LOCAL lock_timeout = '{DEFAULT_LOCK_TIMEOUT}s'",
+            *plan.statements(),
+            "COMMIT",
+        ]
     )
+    assert "SET LOCAL lock_timeout = '3s';" in plan.render_sql(lock_timeout=3)
+    assert "lock_timeout" not in plan.render_sql(lock_timeout=0)
+    with pytest.raises(ValueError, match="lock_timeout must be a whole number"):
+        plan.render_sql(lock_timeout=-1)
     assert "BEGIN" not in plan.render_sql(transaction=False)
     assert "pg_advisory_xact_lock" not in plan.render_sql(lock=False)
 
