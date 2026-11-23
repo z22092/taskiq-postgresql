@@ -1,6 +1,10 @@
+import asyncio
 import socket
-from typing import Optional, TypeVar, Union
+from collections.abc import Awaitable, Callable
+from typing import Any, Optional, TypeVar, Union
 from urllib.parse import SplitResult, urlsplit
+
+import asyncpg
 
 from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
@@ -44,12 +48,18 @@ def in_database(dsn: str, name: str) -> str:
     return urlsplit(dsn)._replace(path=f"/{name}").geturl()
 
 
+async def fetch_on_server(dsn: str, query: str, *args: Any) -> list[asyncpg.Record]:
+    """Run one query on the database ``dsn`` names, on a connection of its own."""
+    connection = await asyncpg.connect(dsn)
+    try:
+        return await connection.fetch(query, *args)
+    finally:
+        await connection.close()
+
+
 async def _execute_on_server(dsn: str, statement: str) -> None:
-    """Run one statement on the database ``dsn`` names, through the asyncpg driver."""
-    sink = PostgresqlBroker(dsn=dsn, driver="asyncpg")
-    async with sink.driver, sink.driver.connection() as connection:
-        await connection.execute(statement)
-    await sink.driver.on_shutdown()
+    """Run one statement on the database ``dsn`` names."""
+    await fetch_on_server(dsn, statement)
 
 
 async def create_database(dsn: str, name: str) -> None:
@@ -78,3 +88,47 @@ async def drop_and_shutdown(
     async with component.driver, component.driver.connection() as connection:
         await connection.execute(f"DROP TABLE {table}")
     await component.shutdown()
+
+
+async def listen_backends(dsn: str, channel: str) -> list[int]:
+    """Return the pids of the sessions whose last statement LISTENs on ``channel``."""
+    rows = await fetch_on_server(
+        dsn,
+        "SELECT pid FROM pg_stat_activity "
+        "WHERE pid <> pg_backend_pid() AND query ILIKE $1",
+        f"LISTEN %{channel}%",
+    )
+    return [row["pid"] for row in rows]
+
+
+async def terminate_backends(dsn: str, pids: list[int]) -> None:
+    """End the server sessions ``pids``, as a restart or an operator would."""
+    await fetch_on_server(
+        dsn,
+        "SELECT pg_terminate_backend(p) FROM unnest($1::int[]) p",
+        pids,
+    )
+
+
+async def eventually(
+    check: Callable[[], Union[bool, Awaitable[bool]]],
+    timeout: float,
+) -> None:
+    """
+    Wait until ``check`` holds, polling every 0.05 s.
+
+    Raises:
+        AssertionError: if it still does not hold after ``timeout`` seconds.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        result = check()
+        if not isinstance(result, bool):
+            result = await result
+        if result:
+            return
+        if loop.time() >= deadline:
+            msg = f"still false after {timeout} s"
+            raise AssertionError(msg)
+        await asyncio.sleep(0.05)
