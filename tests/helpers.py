@@ -1,6 +1,6 @@
 import socket
 from typing import Optional, TypeVar, Union
-from urllib.parse import SplitResult
+from urllib.parse import SplitResult, urlsplit
 
 from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
@@ -37,6 +37,33 @@ def with_netloc(
     if password is not None:
         userinfo = f"{userinfo}:{password}"
     return parts._replace(netloc=f"{userinfo}@{address}" if userinfo else address)
+
+
+def in_database(dsn: str, name: str) -> str:
+    """Return ``dsn`` pointed at the database ``name`` on the same server."""
+    return urlsplit(dsn)._replace(path=f"/{name}").geturl()
+
+
+async def _execute_on_server(dsn: str, statement: str) -> None:
+    """Run one statement on the database ``dsn`` names, through the asyncpg driver."""
+    sink = PostgresqlBroker(dsn=dsn, driver="asyncpg")
+    async with sink.driver, sink.driver.connection() as connection:
+        await connection.execute(statement)
+    await sink.driver.on_shutdown()
+
+
+async def create_database(dsn: str, name: str) -> None:
+    """
+    Create the database ``name`` on the server ``dsn`` points at.
+
+    ``name`` is placed in SQL as written: pass a generated identifier.
+    """
+    await _execute_on_server(dsn, f"CREATE DATABASE {name}")
+
+
+async def drop_database(dsn: str, name: str) -> None:
+    """Drop the database ``name``, closing any connection still open to it."""
+    await _execute_on_server(dsn, f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
 
 
 async def drop_and_shutdown(

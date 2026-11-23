@@ -10,6 +10,7 @@ Thank you for your interest in contributing to TaskIQ PostgreSQL! This document 
 - [Running Tests](#running-tests)
 - [Code Style](#code-style)
 - [Dependency Policy](#dependency-policy)
+- [Changelog](#changelog)
 - [Submitting Changes](#submitting-changes)
 - [Reporting Issues](#reporting-issues)
 - [Release Process](#release-process)
@@ -265,6 +266,23 @@ The sha256 sets for the pins checked into the repository were reproduced
 with this exact command, with an empty diff for all eight entries, including
 `hatchling` and `tomli`.
 
+## Changelog
+
+`CHANGELOG.md` follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).
+
+- Every PR that changes what a user sees or has to do (a feature, a fix, a
+  deprecation, a removal, a changed default, a changed dependency range) adds an
+  entry under `## [Unreleased]`, in the group that fits: Added, Changed,
+  Deprecated, Removed, Fixed or Security. Docs-only, test-only, CI and tooling
+  changes need no entry.
+- Write for the person who installs the package: say what changed and, for a
+  breaking change, what to do about it. Start a breaking entry with
+  `**BREAKING:**`.
+- The release moves the `## [Unreleased]` entries under a new
+  `## [X.Y.Z] - YYYY-MM-DD` heading, leaves an empty `## [Unreleased]` above it
+  and updates the comparison links at the bottom. That change goes in the PR
+  that precedes the release.
+
 ## Submitting Changes
 
 ### Before Submitting
@@ -295,7 +313,8 @@ with this exact command, with an empty diff for all eight entries, including
    - Keep the first line under 72 characters
    - Add more details in the body if needed
 
-4. **Update CHANGELOG**: Add entry for your changes (if applicable)
+4. **Update CHANGELOG**: Add an entry under `## [Unreleased]` for a
+   user-visible change (see [Changelog](#changelog))
 
 5. **Submit PR**: Use the pull request template
 
@@ -379,6 +398,9 @@ Use the feature request template and include:
 ```
 tests/
 ├── conftest.py                 # Fixtures: postgresql_dsn, drivers, teardown
+├── helpers.py                  # Shared helpers: teardown, scratch databases, DSN and port utilities
+├── test_dsn.py                 # DSN validation tests
+├── test_readme_examples.py     # Runs the README's examples and checks its tables
 ├── test_broker.py              # Broker functionality tests
 ├── test_result_backend.py      # Result backend tests
 └── test_scheduler_source.py    # Scheduler tests
@@ -447,7 +469,9 @@ in `tests/test_broker.py`, which is the maintained version.
 Releases are cut by publishing a GitHub Release. There is no version bump
 commit: the version comes from the tag.
 
-1. **Update CHANGELOG** (if present) and merge the change to `main` through a PR.
+1. **Prepare the changelog**: move the `## [Unreleased]` entries under the new
+   version heading (see [Changelog](#changelog)) and merge the change to `main`
+   through a PR.
 2. **Publish a GitHub Release** with tag `vX.Y.Z` on `main`. The `pypi`
    environment only accepts deployments from `v*` tags.
 3. `cd.yml` sets the package version from the tag (normalized with
