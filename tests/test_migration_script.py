@@ -33,6 +33,7 @@ from taskiq_postgresql.migrations import (
     ColumnSchema,
     IndexSchema,
     MigrationStep,
+    StepObjects,
     collect_components,
     collect_schemas,
     migration_statements,
@@ -320,14 +321,20 @@ def test_a_column_type_without_a_description_is_refused() -> None:
 
 def test_a_step_holds_any_statement_and_an_index_any_method() -> None:
     # The shapes a later step needs: ALTER TABLE, and a btree on several columns.
+    index = IndexSchema("jobs_not_before_idx", ("channel", "not_before"), "btree")
     step = MigrationStep(
         number=2,
         statements=("ALTER TABLE jobs ADD COLUMN IF NOT EXISTS channel VARCHAR",),
+        objects=StepObjects(
+            creates_table=False,
+            columns=("channel",),
+            indexes=(index,),
+        ),
     )
-    index = IndexSchema("jobs_not_before_idx", ("channel", "not_before"), "btree")
 
     assert step.statements[0].startswith("ALTER TABLE")
     assert index.columns == ("channel", "not_before")
+    assert step.objects.indexes == (index,)
 
 
 def test_kind_arguments_are_checked() -> None:
