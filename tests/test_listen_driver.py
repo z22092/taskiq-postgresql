@@ -9,6 +9,7 @@ import pytest
 from taskiq import AckableMessage, BrokerMessage
 
 from taskiq_postgresql import PostgresqlBroker
+from taskiq_postgresql.broker import _payload_excerpt
 from taskiq_postgresql.utils import get_db_listen_driver
 
 pytestmark = pytest.mark.anyio
@@ -16,6 +17,9 @@ pytestmark = pytest.mark.anyio
 MESSAGE_ID = 42
 LONG_PAYLOAD_LENGTH = 7000  # under the 8000 byte NOTIFY limit
 LOG_LINE_BUDGET = 1000
+# Integers no row of the broker's table can have: its id is a SERIAL, from 1
+# to 2147483647. The longest is the most digits int() parses.
+OUT_OF_RANGE_IDS = ("9" * 4300, "2147483648", "0", "-1")
 # Far beyond any test, so only the sweep that starts listen() runs.
 SWEEP_OUT_OF_THE_WAY = 60.0
 # How long a listening worker may take to claim a message it is notified of.
@@ -111,3 +115,53 @@ async def test_when_payload_is_long_and_not_an_integer__then_log_line_is_bounded
     assert len(logged) < LOG_LINE_BUDGET
     assert "truncated" in logged
     assert str(LONG_PAYLOAD_LENGTH) in logged
+
+
+async def test_when_payload_is_an_integer_out_of_the_id_range__then_it_is_skipped(
+    broker: PostgresqlBroker,
+    postgresql_dsn: str,
+    driver: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # Claiming such an id fails on the server, or matches nothing, so it is
+    # skipped like any other invalid payload: one bounded line, no traceback.
+    worker = PostgresqlBroker(
+        dsn=postgresql_dsn,
+        channel_name=broker.channel_name,
+        table_name=broker.table_name,
+        driver=driver,
+        poll_interval=SWEEP_OUT_OF_THE_WAY,
+    )
+    message = BrokerMessage(
+        task_id=uuid.uuid4().hex,
+        task_name=uuid.uuid4().hex,
+        message=b"after-out-of-range-ids",
+        labels={},
+    )
+    await worker.startup()
+    try:
+        worker_task = asyncio.create_task(first_message(worker))
+        # The sweep that starts listen() finds nothing; then it reads LISTEN.
+        await asyncio.sleep(0.2)
+        for payload in OUT_OF_RANGE_IDS:
+            # psqlpy cannot map the void result of pg_notify, hence the cast.
+            await broker.driver.execute(
+                "SELECT pg_notify($1, $2)::text",
+                broker.channel_name,
+                payload,
+            )
+        await broker.kick(message)
+
+        received = await asyncio.wait_for(worker_task, timeout=NOTIFY_DELIVERS_WITHIN)
+    finally:
+        await worker.shutdown()
+
+    assert received.data == message.message
+    broker_records = [r for r in caplog.records if r.name == "taskiq.asyncpg_broker"]
+    assert [r.getMessage() for r in broker_records] == [
+        f"Invalid NOTIFY payload {_payload_excerpt(payload)} "
+        f"on channel {broker.channel_name}"
+        for payload in OUT_OF_RANGE_IDS
+    ]
+    assert all(record.exc_info is None for record in broker_records)
+    assert all(len(record.getMessage()) < LOG_LINE_BUDGET for record in broker_records)

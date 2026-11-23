@@ -75,8 +75,9 @@ name to a class. `drivers/__init__.py` imports a driver module only when
 
 The broker is the only place a payload is parsed: `_read_notified_ids` in
 `broker.py` reads the message id with `_parse_message_id`. A payload that is
-not an integer is logged, cut to its first 64 characters (`_payload_excerpt`)
-because any role that can connect can notify the channel, and skipped.
+not an integer from 1 to 2147483647, the range of the broker's `id` column,
+is logged, cut to its first 64 characters (`_payload_excerpt`) because any
+role that can connect can notify the channel, and skipped.
 
 asyncpg and psycopg shape their bind parameters with the shared
 `encode_params` in `drivers/_params.py`; psqlpy has its own

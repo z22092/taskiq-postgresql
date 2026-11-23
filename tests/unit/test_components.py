@@ -4,12 +4,12 @@ Unit tests for what the components hand to their driver.
 Construction opens no connection, so none of these tests needs a database.
 """
 
-from typing import Any, Union
+from typing import Any, Optional, Union
 
 import pytest
 
 from taskiq_postgresql.abc.query import Column, PrimaryKeyColumn
-from taskiq_postgresql.broker import PostgresqlBroker
+from taskiq_postgresql.broker import PostgresqlBroker, _parse_message_id
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
@@ -125,3 +125,22 @@ async def test_when_connection_is_used_outside_the_driver_context__then_it_fails
     with pytest.raises(DatabaseConnectionError):
         async with instance.connection():
             pass
+
+
+@pytest.mark.parametrize(
+    ("payload", "message_id"),
+    [
+        ("1", 1),
+        ("2147483647", 2147483647),
+        ("0", None),
+        ("2147483648", None),
+        ("-1", None),
+        ("not-a-number", None),
+    ],
+)
+def test_the_broker_hands_a_claim_only_ids_its_table_can_hold(
+    payload: str,
+    message_id: Optional[int],
+) -> None:
+    # The broker's id column is a SERIAL: 1 to 2147483647.
+    assert _parse_message_id(payload) == message_id

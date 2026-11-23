@@ -58,6 +58,9 @@ logger = getLogger("taskiq.asyncpg_broker")
 
 # The most characters of an invalid NOTIFY payload that a log line shows.
 _MAX_LOGGED_PAYLOAD = 64
+# The ids a SERIAL primary key gives, the broker table's id column.
+_MIN_MESSAGE_ID = 1
+_MAX_MESSAGE_ID = 2_147_483_647
 # The ceilings of the first wait before reopening LISTEN and of the longest.
 _FIRST_WAIT = 0.5
 _LONGEST_WAIT = 30.0
@@ -123,9 +126,14 @@ def _parse_message_id(payload: str) -> Optional[int]:
     """Return the message id a NOTIFY carries, or None if it is not one."""
     # The only place a payload is parsed: the drivers yield it unparsed.
     try:
-        return int(payload)
+        message_id = int(payload)
     except ValueError:
         return None
+    # Out of the id column's range, a claim matches no row or fails on the
+    # server, whose error would log the whole payload with a traceback.
+    if not _MIN_MESSAGE_ID <= message_id <= _MAX_MESSAGE_ID:
+        return None
+    return message_id
 
 
 def _payload_excerpt(payload: str) -> str:

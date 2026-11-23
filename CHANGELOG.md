@@ -240,7 +240,10 @@ Upgrading from 0.4.x:
   opened its pool.
 - The warning for a NOTIFY payload that is not a message id holds at most
   the first 64 characters of it, followed by its length when it is longer,
-  because any role that can connect can notify the channel.
+  because any role that can connect can notify the channel. An integer
+  outside the range of the broker's `id` column (1 to 2147483647) is not a
+  message id either: it gets that warning, where its claim used to log an
+  error with the whole number and a traceback, or match no row.
 - `InsertOrUpdateQuery.make_query(..., on_conflict_action="NOTHING")` raised
   `TypeError`; it now names the conflict columns.
 - `shutdown()` no longer hangs on a connection that stopped answering: the
