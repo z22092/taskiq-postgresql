@@ -39,6 +39,14 @@ updates:
     cooldown:
       default-days: 14
     open-pull-requests-limit: 5
+    # The typos repository also tags its sibling crates, and Dependabot reads
+    # "varcon-core-v4.0.10" as typos 4.0.10 (a 2024 commit, older than
+    # v1.52.0). varcon-core has tags from 2.0.0 upwards, so any typos version
+    # at 2 or above is ambiguous; a real typos 2.x is bumped by hand. The
+    # dependency name is the repository URL.
+    ignore:
+      - dependency-name: "https://github.com/crate-ci/typos"
+        versions: [">=2"]
     groups:
       pre-commit-hooks:
         patterns:
@@ -46,8 +54,9 @@ updates:
     commit-message:
       prefix: "ci(deps)"
 
-  # The only container image is the PostgreSQL one in docker-compose.yml;
-  # the "docker" ecosystem reads Dockerfiles, not compose files.
+  # The only container images are the PostgreSQL ones in docker-compose.yml
+  # (the default service and the pg17 profile); the "docker" ecosystem reads
+  # Dockerfiles, not compose files.
   - package-ecosystem: "docker-compose"
     directory: "/"
     schedule:
@@ -56,6 +65,11 @@ updates:
     cooldown:
       default-days: 14
     open-pull-requests-limit: 5
+    # Majors are added deliberately, in the compose file and in
+    # tests/conftest.py together; Dependabot only moves the pins within a major.
+    ignore:
+      - dependency-name: "postgres"
+        update-types: ["version-update:semver-major"]
     groups:
       docker-images:
         patterns:

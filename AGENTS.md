@@ -27,6 +27,8 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces |
 | `taskiq_postgresql/utils/` | Driver lookup by name, DSN helpers, optional-import checks |
 | `tests/` | Integration tests against a real PostgreSQL |
+| `tests/conftest.py`, `tests/helpers.py` | Fixtures (`postgresql_dsn`, drivers, teardown) and shared helpers: teardown, scratch databases, DSN and port utilities |
+| `tests/test_readme_examples.py` | Runs the README's examples and checks its tables |
 | `tests/unit/` | Tests that need no database (SQL text, parameter shaping, wiring) |
 | `scripts/check_pins.py` | Checks that pins declared in several places agree |
 | `docs/` | Architecture, ADRs; `docs/spikes/` holds dated planning notes |
@@ -94,7 +96,9 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
 - **Schema.** Tables are created with `CREATE TABLE IF NOT EXISTS` when
   `run_migrations=True`, so existing deployments keep their tables. Changing a
   column is a schema change for them; `tests/unit/test_components.py` pins the
-  current DDL.
+  current DDL. The migration's advisory lock key (`MigrationLockQuery` in
+  `abc/query.py`) is a contract between releases;
+  `tests/test_migrations.py::test_migration_lock_key_is_pinned` pins it.
 - **Types.** `ty` checks `taskiq_postgresql/` at the Python 3.10 floor and must
   stay clean. Fix the code; a `# ty: ignore[<rule>]` is allowed only with a
   comment saying why, and never as a blanket ignore.
@@ -116,7 +120,8 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   (`fix(psycopg): ...`) and `!` for a breaking change (`feat!: ...`); subject
   under 72 characters, body says why.
 - **CHANGELOG.md** (Keep a Changelog) gets an entry for every user-visible
-  change.
+  change; the rules are under "Changelog" in
+  [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md).
 - **Tests prove changes.** A behaviour change comes with a test that fails
   without it and passes with it.
 

@@ -10,6 +10,7 @@ Thank you for your interest in contributing to TaskIQ PostgreSQL! This document 
 - [Running Tests](#running-tests)
 - [Code Style](#code-style)
 - [Dependency Policy](#dependency-policy)
+- [Changelog](#changelog)
 - [Submitting Changes](#submitting-changes)
 - [Reporting Issues](#reporting-issues)
 - [Release Process](#release-process)
@@ -56,7 +57,11 @@ uv run pre-commit install
 ### Database Setup
 
 The test suite starts a throwaway PostgreSQL container by itself
-(testcontainers, image pinned by digest), so no setup is needed.
+(testcontainers, image pinned by digest), so no setup is needed. It runs on
+the newest pinned major (18) by default; set `TEST_POSTGRES_MAJOR=17` to run on
+17. An empty value means the default. An unsupported value stops the run once,
+before any test, with a single usage error (exit code 4) that names the
+supported majors. CI also runs a `test (py3.13, pg17)` leg on 17.
 
 To run the tests against a database you already have, set `POSTGRESQL_URL`
 (credentials come from your environment, never from the repository):
@@ -65,7 +70,7 @@ To run the tests against a database you already have, set `POSTGRESQL_URL`
 export POSTGRESQL_URL="postgresql://<user>@<host>:5432/<database>"
 ```
 
-For manual work, `docker-compose.yml` starts a local PostgreSQL bound to
+For manual work, `docker-compose.yml` starts a local PostgreSQL 18 bound to
 `127.0.0.1:5432` with trust authentication (development only), so the DSN has
 no password:
 
@@ -78,6 +83,19 @@ export POSTGRESQL_URL="postgresql://postgres@localhost:5432/postgres"
 you ran an earlier compose file (password authentication), run
 `docker compose down -v` once, or the passwordless DSN fails with
 `fe_sendauth: no password supplied`.
+
+The previous major is available behind a compose profile, on `127.0.0.1:5433`
+with its own volume:
+
+```bash
+docker compose --profile pg17 up -d --wait postgres17
+export POSTGRESQL_URL="postgresql://postgres@localhost:5433/postgres"
+```
+
+Moving from the PostgreSQL 17 compose file to this one needs the same
+`docker compose down -v`: the 18 image keeps its data under
+`/var/lib/postgresql/18/` on a volume mounted at `/var/lib/postgresql`, and it
+refuses to start over a volume that still holds the 17 data format.
 
 Port 5432 must be free on the host. The tests do not need the compose
 database; the `postgresql_dsn` fixture uses `POSTGRESQL_URL` when it is set and
@@ -198,9 +216,15 @@ async def process_task(
   there.
 - Dependabot waits 14 days before proposing a release, matching
   `exclude-newer = "14 days"` in `[tool.uv]`.
-- The Postgres image is declared in both `tests/conftest.py` and
-  `docker-compose.yml`. `scripts/check_pins.py` fails when they differ, and a
-  Dependabot docker PR needs the matching manual bump in `tests/conftest.py`.
+- `tests/conftest.py` pins one Postgres image per supported major
+  (`POSTGRES_IMAGES`; the newest key is the default), and `docker-compose.yml`
+  declares the same set of images (the 17 one under the `pg17` profile).
+  `scripts/check_pins.py` fails when the sets differ, when the compose
+  `postgres` service does not run the newest major, or when a workflow names an
+  image or a literal major (quoted or not) conftest does not declare. A
+  Dependabot docker PR
+  needs the matching manual bump in `tests/conftest.py`; Dependabot ignores
+  Postgres major bumps, which are added by hand in both files.
 
 ### Regenerating the build-constraint hashes
 
@@ -231,6 +255,23 @@ The sha256 sets for the pins checked into the repository were reproduced
 with this exact command, with an empty diff for all eight entries, including
 `hatchling` and `tomli`.
 
+## Changelog
+
+`CHANGELOG.md` follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).
+
+- Every PR that changes what a user sees or has to do (a feature, a fix, a
+  deprecation, a removal, a changed default, a changed dependency range) adds an
+  entry under `## [Unreleased]`, in the group that fits: Added, Changed,
+  Deprecated, Removed, Fixed or Security. Docs-only, test-only, CI and tooling
+  changes need no entry.
+- Write for the person who installs the package: say what changed and, for a
+  breaking change, what to do about it. Start a breaking entry with
+  `**BREAKING:**`.
+- The release moves the `## [Unreleased]` entries under a new
+  `## [X.Y.Z] - YYYY-MM-DD` heading, leaves an empty `## [Unreleased]` above it
+  and updates the comparison links at the bottom. That change goes in the PR
+  that precedes the release.
+
 ## Submitting Changes
 
 ### Before Submitting
@@ -260,7 +301,8 @@ with this exact command, with an empty diff for all eight entries, including
    [`AGENTS.md`](../AGENTS.md); keep the first line under 72 characters and
    say why in the body.
 
-4. **Update CHANGELOG**: Add entry for your changes (if applicable)
+4. **Update CHANGELOG**: Add an entry under `## [Unreleased]` for a
+   user-visible change (see [Changelog](#changelog))
 
 5. **Submit PR**: Use the pull request template
 
@@ -405,7 +447,8 @@ in `tests/test_broker.py`, which is the maintained version.
 
 Releases are the maintainer's. The steps, and the rule that the version
 comes from the tag with no version bump commit, are under "Releases" in
-[`AGENTS.md`](../AGENTS.md).
+[`AGENTS.md`](../AGENTS.md); the changelog step follows
+[Changelog](#changelog).
 
 ## Getting Help
 

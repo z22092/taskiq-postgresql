@@ -29,12 +29,12 @@ driver for `LISTEN`.
 
 - `QueryDriver` holds the table definition (primary key, columns,
   `created_at`, index columns) and one builder per statement from
-  `abc/query.py`, created in its `__init__`. Drivers implement `create_table`,
-  `create_index`, `insert`, `insert_or_update`, `delete`, `delete_returning`,
-  `delete_by_date`, `select`, `exists`, `execute`, `on_startup` and
-  `on_shutdown`. Every query method enters `async with driver`, which creates
-  the connection pool on first use; `on_shutdown` closes it, and does nothing
-  when no query ever created it.
+  `abc/query.py`, created in its `__init__`. Drivers implement `insert`,
+  `insert_or_update`, `delete`, `delete_returning`, `delete_by_date`,
+  `select`, `exists`, `execute`, `on_startup` and `on_shutdown`. Every query
+  method enters `async with driver`, which creates the connection pool on
+  first use; `on_shutdown` closes it, and does nothing when no query ever
+  created it.
 - `ListenDriver` owns the connection that listens on the channel (for psqlpy,
   a pool listener). Iterating it (`async for`) yields the ids carried by
   `NOTIFY`.
@@ -76,6 +76,16 @@ Created by `on_startup` only when the component gets `run_migrations=True`,
 with `CREATE TABLE IF NOT EXISTS` and hash indexes, so an existing table is
 never altered. `tests/unit/test_components.py::test_default_schema` pins the
 DDL below.
+
+`on_startup` migrates on one connection, in one transaction. It first checks
+with `to_regclass` (`RelationsExistQuery`) whether the table and every index
+it creates exist; if they do, it returns without a lock or DDL, so a role
+with only DML privileges can start. Otherwise it takes
+`pg_advisory_xact_lock(hashtext('taskiq_postgresql'), hashtext(<table name>))`
+(`MigrationLockQuery`) and runs the DDL: a concurrent startup waits for the
+commit, and its `IF NOT EXISTS` then finds the objects. The lock key stays
+the same across releases, so two versions in a rolling deploy also wait for
+each other.
 
 | Table | Columns | Hash indexes |
 |---|---|---|

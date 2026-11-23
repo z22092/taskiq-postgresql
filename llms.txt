@@ -1,0 +1,24 @@
+# taskiq-postgresql
+
+> PostgreSQL integration for taskiq: a broker that delivers messages with LISTEN/NOTIFY, a result backend and a persistent schedule source, all in one PostgreSQL database.
+
+## Docs
+
+- [README](https://github.com/z22092/taskiq-postgresql/blob/main/README.md): installation, quickstart, configuration reference, TLS, database schema, upgrading
+- [CONTRIBUTING](https://github.com/z22092/taskiq-postgresql/blob/main/.github/CONTRIBUTING.md): development setup, tests, dependency policy, changelog conventions, release process
+- [CHANGELOG](https://github.com/z22092/taskiq-postgresql/blob/main/CHANGELOG.md): notable changes per release
+- [SECURITY](https://github.com/z22092/taskiq-postgresql/blob/main/SECURITY.md): how to report a vulnerability
+- [pyproject.toml](https://github.com/z22092/taskiq-postgresql/blob/main/pyproject.toml): supported Python, taskiq and driver version ranges
+
+## Source
+
+- [broker.py](https://github.com/z22092/taskiq-postgresql/blob/main/taskiq_postgresql/broker.py): `PostgresqlBroker`
+- [result_backend.py](https://github.com/z22092/taskiq-postgresql/blob/main/taskiq_postgresql/result_backend.py): `PostgresqlResultBackend`
+- [scheduler_source.py](https://github.com/z22092/taskiq-postgresql/blob/main/taskiq_postgresql/scheduler_source.py): `PostgresqlSchedulerSource`
+- [exceptions.py](https://github.com/z22092/taskiq-postgresql/blob/main/taskiq_postgresql/exceptions.py): `DatabaseConnectionError` and `ResultIsMissingError`
+
+## Optional
+
+- [Drivers](https://github.com/z22092/taskiq-postgresql/tree/main/taskiq_postgresql/drivers): the asyncpg, psycopg and psqlpy implementations
+- [Tests](https://github.com/z22092/taskiq-postgresql/tree/main/tests): the test suite, which runs every driver against a real PostgreSQL
+- [taskiq documentation](https://taskiq-python.github.io/): the framework this package plugs into

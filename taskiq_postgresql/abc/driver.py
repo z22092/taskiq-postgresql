@@ -15,6 +15,8 @@ from taskiq_postgresql.abc.query import (
     DeleteReturningQuery,
     InsertOrUpdateQuery,
     InsertQuery,
+    MigrationLockQuery,
+    RelationsExistQuery,
     SelectQuery,
 )
 from taskiq_postgresql.exceptions import DatabaseConnectionError
@@ -74,6 +76,8 @@ class QueryDriver(_ConnectionStringHolder, ABC):
             [self.primary_key, *self.columns, self.created_at],
         )
         self.create_index_query = CreateIndexQuery(self.table_name)
+        self.relations_exist_query = RelationsExistQuery(self.table_name)
+        self.migration_lock_query = MigrationLockQuery(self.table_name)
         self.insert_query = InsertQuery(
             self.table_name,
         )
@@ -99,14 +103,6 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         traceback: Optional[TracebackType],
     ) -> None:
         """Exit the context manager."""
-
-    @abstractmethod
-    async def create_table(self) -> Any:
-        """Create a table."""
-
-    @abstractmethod
-    async def create_index(self) -> Any:
-        """Create an index."""
 
     @abstractmethod
     async def insert(
@@ -168,10 +164,16 @@ class QueryDriver(_ConnectionStringHolder, ABC):
 
     @abstractmethod
     async def on_startup(self) -> None:
-        """On startup."""
-        async with self:
-            await self.create_table()
-            await self.create_index()
+        """
+        Create the table and its indexes when ``run_migrations`` is set.
+
+        Runs on one connection, in one transaction. When the table and every
+        index already exist it does nothing else, so a role without CREATE on
+        the schema or ownership of the table can start. Otherwise it takes
+        ``migration_lock_query`` before the DDL: a concurrent startup waits for
+        the commit, and its ``IF NOT EXISTS`` then finds the objects instead
+        of failing on a duplicate catalog entry.
+        """
 
     @abstractmethod
     async def on_shutdown(self) -> None:

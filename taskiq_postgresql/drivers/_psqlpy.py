@@ -3,10 +3,10 @@ from asyncio import Queue as AsyncQueue
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncGenerator, AsyncIterator, Final, Optional, Sequence, Union
+from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
 from uuid import UUID
 
-from psqlpy import Connection, ConnectionPool, QueryResult
+from psqlpy import Connection, ConnectionPool
 from psqlpy.extra_types import JSONB
 from typing_extensions import Self
 
@@ -102,22 +102,6 @@ class PsqlpyDriver(QueryDriver):
         traceback: Optional[TracebackType],
     ) -> None:
         """Exit the context manager."""
-
-    async def create_table(self) -> list:
-        """Create a table."""
-        async with self, self.connection() as connection:
-            results: Final[QueryResult] = await connection.fetch(
-                querystring=self.create_table_query.make_query(),
-            )
-            return results.result()
-
-    async def create_index(self) -> None:
-        """Create an index."""
-        if self.index_columns is not None:
-            async with self, self.connection() as connection:
-                await connection.execute_batch(
-                    self.create_index_query.make_query(self.index_columns),
-                )
 
     async def insert(
         self,
@@ -240,14 +224,27 @@ class PsqlpyDriver(QueryDriver):
             return results.result(as_tuple=True)
 
     async def on_startup(self) -> None:
-        """On startup."""
+        """Create the table and its indexes, see ``QueryDriver.on_startup``."""
         if self.run_migrations:
-            async with self, self.connection() as connection:
-                transaction = connection.transaction()
-                await transaction.begin()
-                await self.create_table()
-                await self.create_index()
-                await transaction.commit()
+            async with (
+                self,
+                self.connection() as connection,
+                connection.transaction() as transaction,
+            ):
+                if await transaction.fetch_val(
+                    self.relations_exist_query.make_query(self.index_columns),
+                    self.relations_exist_query.relation_names(self.index_columns),
+                ):
+                    return
+                await transaction.execute(
+                    self.migration_lock_query.make_query(),
+                    list(self.migration_lock_query.params()),
+                )
+                await transaction.execute_batch(self.create_table_query.make_query())
+                if self.index_columns is not None:
+                    await transaction.execute_batch(
+                        self.create_index_query.make_query(self.index_columns),
+                    )
 
     async def on_shutdown(self) -> None:
         """On shutdown."""

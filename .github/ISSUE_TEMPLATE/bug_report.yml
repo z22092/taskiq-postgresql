@@ -1,5 +1,5 @@
-name: 🐛 Bug Report
-description: File a bug report to help us improve
+name: Bug report
+description: Report something that does not work as documented
 title: "[BUG] "
 labels: ["bug", "triage"]
 assignees:
@@ -9,28 +9,37 @@ body:
   - type: markdown
     attributes:
       value: |
-        Thanks for taking the time to fill out this bug report!
+        Thanks for taking the time to report a bug.
+
+        Please search the existing issues first. Do not paste connection
+        strings with passwords, tokens or certificates anywhere in this form.
+        For a security vulnerability, do not open an issue: follow
+        [SECURITY.md](https://github.com/z22092/taskiq-postgresql/blob/main/SECURITY.md).
 
   - type: input
     id: version
     attributes:
       label: taskiq-postgresql version
-      description: What version of taskiq-postgresql are you running?
-      placeholder: e.g., 0.1.0
+      description: Output of `pip show taskiq-postgresql` (or your lock file).
+      placeholder: the version pip prints
     validations:
       required: true
 
-  - type: dropdown
+  - type: input
     id: python-version
     attributes:
       label: Python version
-      description: What version of Python are you using?
-      options:
-        - Python 3.9
-        - Python 3.10
-        - Python 3.11
-        - Python 3.12
-        - Python 3.13
+      description: Output of `python --version`.
+      placeholder: the version python prints
+    validations:
+      required: true
+
+  - type: input
+    id: taskiq-version
+    attributes:
+      label: taskiq version
+      description: Output of `pip show taskiq`.
+      placeholder: the version pip prints
     validations:
       required: true
 
@@ -38,20 +47,23 @@ body:
     id: driver
     attributes:
       label: PostgreSQL driver
-      description: Which PostgreSQL driver are you using?
+      description: The `driver` argument you pass (the default is asyncpg).
       options:
         - asyncpg
-        - psycopg3
         - psqlpy
+        - psycopg
     validations:
       required: true
 
-  - type: input
+  - type: dropdown
     id: postgres-version
     attributes:
-      label: PostgreSQL version
-      description: What version of PostgreSQL are you using?
-      placeholder: e.g., 15.4
+      label: PostgreSQL major version
+      description: Result of `SHOW server_version;`. Versions 17 and 18 are the tested ones.
+      options:
+        - "18"
+        - "17"
+        - Other (state the version below)
     validations:
       required: true
 
@@ -59,46 +71,27 @@ body:
     id: what-happened
     attributes:
       label: What happened?
-      description: A clear and concise description of what the bug is.
-      placeholder: Tell us what you see!
+      description: What you saw, and what you expected to see instead.
     validations:
       required: true
 
   - type: textarea
-    id: expected-behavior
+    id: reproduction
     attributes:
-      label: Expected behavior
-      description: A clear and concise description of what you expected to happen.
-    validations:
-      required: true
-
-  - type: textarea
-    id: reproduction-steps
-    attributes:
-      label: Steps to reproduce
-      description: Steps to reproduce the behavior
-      placeholder: |
-        1. Go to '...'
-        2. Click on '....'
-        3. Scroll down to '....'
-        4. See error
-    validations:
-      required: true
-
-  - type: textarea
-    id: minimal-example
-    attributes:
-      label: Minimal code example
-      description: Provide a minimal code example that reproduces the issue
+      label: Minimal reproduction
+      description: >-
+        The smallest script that shows the problem, with the DSN read from an
+        environment variable. Say which component it touches (broker, result
+        backend or scheduler source).
       render: python
     validations:
-      required: false
+      required: true
 
   - type: textarea
     id: logs
     attributes:
       label: Relevant log output
-      description: Please copy and paste any relevant log output. This will be automatically formatted into code, so no need for backticks.
+      description: Full traceback or log lines. This is formatted as code, so no backticks are needed.
       render: shell
     validations:
       required: false
@@ -107,6 +100,6 @@ body:
     id: additional-context
     attributes:
       label: Additional context
-      description: Add any other context about the problem here.
+      description: Anything else that helps, such as the other PostgreSQL version if you chose "Other" above.
     validations:
       required: false

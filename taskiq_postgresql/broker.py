@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import math
 from asyncio import Queue as AsyncQueue
 from asyncio import Task, get_running_loop
+from contextlib import suppress
 from dataclasses import dataclass
 from logging import getLogger
 from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, TypeVar
@@ -26,6 +28,35 @@ if TYPE_CHECKING:
 _T = TypeVar("_T")
 
 logger = getLogger("taskiq.asyncpg_broker")
+
+
+def _parse_delay(value: Any) -> float:
+    """
+    Read the ``delay`` label as a number of seconds.
+
+    taskiq sends every label as ``str(value)``, so a float delay, such as the
+    one ``SmartRetryMiddleware`` computes, arrives as ``"2.5"`` or ``"5.0"``.
+
+    Args:
+        value: the ``delay`` label of a message.
+
+    Returns:
+        The delay in seconds; a negative delay is ``0.0``.
+
+    Raises:
+        ValueError: if the label is not a finite number of seconds.
+    """
+    # bool is an int subclass, so float(True) would silently mean 1 second.
+    if not isinstance(value, bool):
+        # OverflowError: float() of an int beyond the float range.
+        with suppress(TypeError, ValueError, OverflowError):
+            seconds = float(value)
+            # Neither NaN nor infinity is a time the event loop can schedule,
+            # so the stored message would never be notified.
+            if math.isfinite(seconds):
+                return max(seconds, 0.0)
+    msg = f"The 'delay' label must be a finite number of seconds, got {value!r:.50}"
+    raise ValueError(msg)
 
 
 @dataclass
@@ -177,7 +208,14 @@ class PostgresqlBroker(AsyncBroker):
         Inserts the message into the database and sends a NOTIFY.
 
         :param message: Message to send.
+        :raises ValueError: if the ``delay`` label is not a finite number of
+            seconds; nothing is stored then.
         """
+        # Parsed before the insert: a delay that fails here would otherwise
+        # leave a row that no NOTIFY ever announces.
+        delay_value = message.labels.get("delay")
+        delay_seconds = None if delay_value is None else _parse_delay(delay_value)
+
         message_inserted_id = await self.driver.insert(
             [
                 self.columns.task_id,
@@ -196,9 +234,7 @@ class PostgresqlBroker(AsyncBroker):
             ],
         )
 
-        delay_value = message.labels.get("delay")
-        if delay_value is not None:
-            delay_seconds = int(delay_value)
+        if delay_seconds is not None:
             return await self._schedule_notification(message_inserted_id, delay_seconds)
 
         return await self._send_notification(message_inserted_id)
@@ -211,7 +247,11 @@ class PostgresqlBroker(AsyncBroker):
             logger.exception("Error sending notification: %s", error)
             raise
 
-    async def _schedule_notification(self, message_id: int, delay_seconds: int) -> None:
+    async def _schedule_notification(
+        self,
+        message_id: int,
+        delay_seconds: float,
+    ) -> None:
         """Schedules the next task based on the schedule object."""
         loop = get_running_loop()
 

@@ -19,8 +19,45 @@ from tests.helpers import (
 
 _ReturnType = TypeVar("_ReturnType")
 
-# Kept on one line: scripts/check_pins.py matches it with a regex.
-POSTGRES_IMAGE = "postgres:17.10@sha256:7958605b474b3d264a969cb3a123d6aa00ad1e1fe9da8a69984dabb704d93317"  # noqa: E501
+# One pinned image per supported major, keyed by the major. The default is the
+# newest major, so adding a key moves the default with it.
+POSTGRES_IMAGES = {
+    "17": (
+        "postgres:17.11"
+        "@sha256:ff87138949ad9a46f32ff23bd6852b52ce024a13dffe9b4087be98292cdd3b4f"
+    ),
+    "18": (
+        "postgres:18.4"
+        "@sha256:a02db8cac496f15b094798a38254f14d6e00741f709360e5e00bb6668ea31636"
+    ),
+}
+DEFAULT_POSTGRES_MAJOR = max(POSTGRES_IMAGES, key=int)
+
+
+def selected_postgres_major() -> str:
+    """
+    Major named by ``TEST_POSTGRES_MAJOR``.
+
+    CI sets the variable to an empty string on the legs that keep the default,
+    so unset and empty both mean the default major.
+
+    :return: a key of ``POSTGRES_IMAGES``.
+    """
+    return os.environ.get("TEST_POSTGRES_MAJOR") or DEFAULT_POSTGRES_MAJOR
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    """
+    Reject an unsupported ``TEST_POSTGRES_MAJOR`` once, before any test runs.
+
+    :raises pytest.UsageError: when the value is not a supported major.
+    """
+    major = selected_postgres_major()
+    if major not in POSTGRES_IMAGES:
+        raise pytest.UsageError(
+            f"TEST_POSTGRES_MAJOR={major!r} is not supported; "
+            f"use one of {sorted(POSTGRES_IMAGES, key=int)}",
+        )
 
 
 @pytest.fixture(scope="session")
@@ -54,8 +91,9 @@ def postgresql_dsn() -> Generator[str, None, None]:
     """
     DSN to PostgreSQL.
 
-    Uses the ``POSTGRESQL_URL`` environment variable when it is set, otherwise
-    starts a throwaway PostgreSQL container for the whole test session.
+    Uses the ``POSTGRESQL_URL`` environment variable when it is set (it wins
+    over ``TEST_POSTGRES_MAJOR``), otherwise starts a throwaway PostgreSQL
+    container for the whole test session.
 
     :yield: dsn to PostgreSQL.
     """
@@ -65,7 +103,7 @@ def postgresql_dsn() -> Generator[str, None, None]:
         return
 
     # The DSN is built from the credentials the container itself holds.
-    with PostgresContainer(POSTGRES_IMAGE) as container:
+    with PostgresContainer(POSTGRES_IMAGES[selected_postgres_major()]) as container:
         yield container.get_connection_url(driver=None)
 
 

@@ -4,7 +4,6 @@ version = "0.4.1"
 description = "PostgreSQL integration for taskiq"
 readme = "README.md"
 authors = [
-    { name = "jeffersonsilva-mb", email = "jefferson.silva@mb.com.br" },
     { name = "Jefferson Venceslau", email = "jeff.venceslau@gmail.com" }
 ]
 dependencies = [
@@ -79,6 +78,9 @@ dev = [
     "pytest-timeout==2.4.0",
     "anyio==4.16.0",
     "testcontainers==4.15.0",
+    # taskiq's MSGPackSerializer imports it; the README tests check that it
+    # cannot store results.
+    "msgpack==1.2.4",
 ]
 # pip-audit pulls filelock through cachecontrol[filecache]; the fixed
 # filelock needs Python 3.11, so the audit tooling stays off 3.10.
@@ -86,7 +88,7 @@ audit = [
     "pip-audit==2.10.1; python_version >= \"3.11\"",
 ]
 lint = [
-    "ruff==0.17.3",
+    "ruff==0.17.4",
     "pre-commit==4.7.0; python_version >= \"3.11\"",
     "ty==0.0.99",
 ]
