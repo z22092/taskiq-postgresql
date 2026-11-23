@@ -32,12 +32,26 @@ EXIT_ON_SIGNAL = trap 'exit 130' INT; trap 'exit 143' TERM
 # environment lives in the same temporary directory, so the project .venv
 # keeps its Python. The copy is renamed into place only once complete, so the
 # trap never puts back a partial lock.
+#
+# pytest runs in the background and the shell forwards INT and TERM to it as
+# TERM, which tests/conftest.py turns into a KeyboardInterrupt so the fixtures
+# tear down and the PostgreSQL container is removed (with Ryuk disabled
+# nothing else removes it). TERM is forwarded instead of INT because a
+# background job of a non-interactive sh starts with SIGINT ignored. The shell
+# then waits for pytest to finish, so the lock is put back after the teardown.
 test-lowest: ## Run the suite on Python 3.10, lowest direct deps (CI job: test-lowest)
 	@tmp="$$(mktemp -d)" || exit 1; \
 	trap '[ ! -f "$$tmp/uv.lock" ] || cp "$$tmp/uv.lock" uv.lock; rm -rf "$$tmp"' EXIT; \
 	$(EXIT_ON_SIGNAL); \
 	cp uv.lock "$$tmp/uv.lock.part" && mv "$$tmp/uv.lock.part" "$$tmp/uv.lock" || exit 1; \
-	UV_PROJECT_ENVIRONMENT="$$tmp/venv" $(UV) run --python 3.10 --resolution lowest-direct --all-extras --group dev pytest
+	pid=; stop=; \
+	trap 'stop=1; [ -z "$$pid" ] || kill -TERM "$$pid" 2>/dev/null' INT TERM; \
+	UV_PROJECT_ENVIRONMENT="$$tmp/venv" $(UV) run --python 3.10 --resolution lowest-direct --all-extras --group dev pytest & \
+	pid=$$!; \
+	[ -z "$$stop" ] || kill -TERM "$$pid" 2>/dev/null; \
+	wait "$$pid"; rc=$$?; \
+	while kill -0 "$$pid" 2>/dev/null; do wait "$$pid"; rc=$$?; done; \
+	exit $$rc
 
 build: ## Build the sdist and wheel into dist/ (CI job: CD build)
 	$(UV) build
