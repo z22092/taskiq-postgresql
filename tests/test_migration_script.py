@@ -643,6 +643,11 @@ async def test_the_script_builds_the_catalog_run_migrations_builds(
         assert definitions[index.name.replace(scripted, "<table>")].endswith(
             f" USING {index.method} ({', '.join(index.columns)})",
         )
+    # Every index but the primary key's own, which PostgreSQL names.
+    assert set(definitions) == {
+        "<table>_pkey",
+        *(index.name.replace(scripted, "<table>") for index in schema.indexes),
+    }
 
 
 @pytest.mark.anyio

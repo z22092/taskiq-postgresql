@@ -200,7 +200,9 @@ class TableSchema:
         kind: The component that owns the table.
         name: Table name, as configured on the component.
         columns: Every column, in table order, after all steps.
-        indexes: Every index after all steps, besides the primary key's.
+        indexes: Every index after all steps, except the primary key's own
+            index, which ``CREATE TABLE`` creates and PostgreSQL names
+            (``taskiq_messages_pkey`` for ``taskiq_messages``).
         steps: The migration steps, in the order they run.
     """
 

@@ -640,9 +640,11 @@ The contract:
   `nullable`, `default`, `primary_key`), `indexes` (`IndexSchema`: `name`,
   `columns`, `method`) and `steps` (`MigrationStep`: `number`, and the SQL
   `statements` in the order they run, each idempotent). The columns and
-  indexes are the table's shape after every step. Read the structure instead of
-  parsing SQL; to emit SQL, reuse `render_sql` or the steps' statements as they
-  are.
+  indexes are the table's shape after every step, except that `indexes` leaves
+  out the primary key's own index, which `CREATE TABLE` creates and
+  PostgreSQL names (`taskiq_messages_pkey` for `taskiq_messages`). Read the
+  structure instead of parsing SQL; to emit SQL, reuse `render_sql` or the
+  steps' statements as they are.
 - `options` is a `FormatOptions`: `transaction` and `lock` (`False` with
   `--no-transaction` and `--no-lock`), `lock_timeout` (the seconds of
   `--lock-timeout`, 10 by default, 0 for none), and `extra`, the
