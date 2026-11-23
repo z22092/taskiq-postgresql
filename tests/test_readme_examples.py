@@ -29,6 +29,7 @@ import ssl
 import string
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 import types
@@ -60,6 +61,7 @@ from tests.helpers import (
 from tests.test_migrations import scram_verifier
 
 README = Path(__file__).resolve().parent.parent / "README.md"
+CHANGELOG = README.with_name("CHANGELOG.md")
 SCRIPTS = ("app.py", "kick.py", "schedule.py")
 CA_PLACEHOLDER = "/path/to/ca.pem"
 SCHEDULER_READY = "Starting scheduler"
@@ -401,6 +403,30 @@ def _signature_rows(component: type) -> list[tuple[str, Any]]:
     return rows
 
 
+def test_when_the_changelog_upgrade_sql_is_read__then_startup_runs_the_same() -> None:
+    """The SQL "Upgrading from 0.4.x" has users run is what startup() runs."""
+    unreleased = CHANGELOG.read_text().split("\n## ", 2)[1]
+    upgrading = unreleased.split("Upgrading from 0.4.x:", 1)[1].split("\n### ", 1)[0]
+    blocks = re.findall(
+        r"^ *```sql\n(.*?)^ *```$",
+        upgrading,
+        re.DOTALL | re.MULTILINE,
+    )
+    concurrently = re.findall(r"`(CREATE INDEX CONCURRENTLY [^`]+)`", upgrading)
+    driver = PostgresqlBroker(dsn="unused").driver
+    upgrade = driver.add_columns_query.make_query(
+        driver.added_columns,
+        driver.added_indexes,
+    )
+
+    assert [textwrap.dedent(block) for block in blocks] == [f"{upgrade}\n"]
+    # The same index, built without blocking writes on a large table.
+    assert len(concurrently) == 1
+    assert _normalized_sql(concurrently[0].replace(" CONCURRENTLY", "")) in (
+        _normalized_sql(upgrade)
+    )
+
+
 @pytest.mark.parametrize(
     "component",
     [PostgresqlBroker, PostgresqlResultBackend, PostgresqlSchedulerSource],
@@ -445,16 +471,37 @@ def _normalized_sql(statement: str) -> str:
 
 def test_when_the_schema_blocks_are_read__then_they_match_the_generated_sql() -> None:
     """
-    The README's DDL is what ``taskiq postgresql generate`` prints.
+    The README's DDL is what ``run_migrations=True`` executes.
 
-    ``tests/test_migration_script.py`` pins those statements to the ones
-    ``run_migrations=True`` executes.
+    It is also what ``taskiq postgresql generate`` prints;
+    ``tests/test_migration_script.py`` checks that both build the same tables.
     """
     expected = {}
+    for component in (
+        PostgresqlBroker(dsn="unused"),
+        PostgresqlResultBackend(dsn="unused"),
+        PostgresqlSchedulerSource(dsn="unused"),
+    ):
+        driver = component.driver
+        statements = [
+            f"{driver.create_table_query.make_query()};",
+            driver.create_index_query.make_query(driver.index_columns),
+        ]
+        if driver.added_columns or driver.added_indexes:
+            # The broker's upgrade step, which startup runs after the CREATEs.
+            statements.append(
+                driver.add_columns_query.make_query(
+                    driver.added_columns,
+                    driver.added_indexes,
+                ),
+            )
+        expected[driver.table_name] = _normalized_sql(" ".join(statements))
+    assert "ALTER TABLE taskiq_messages" in expected["taskiq_messages"]
+    generated = {}
     for kind in migrations.COMPONENT_KINDS:
         schema = table_schema(kind)
         script = render_sql([schema], transaction=False, lock=False)
-        expected[schema.name] = _normalized_sql(
+        generated[schema.name] = _normalized_sql(
             "".join(line for line in script.splitlines() if not line.startswith("--")),
         )
     documented = {}
@@ -465,6 +512,7 @@ def test_when_the_schema_blocks_are_read__then_they_match_the_generated_sql() ->
         assert table, block.source
         documented[table.group(1)] = _normalized_sql(block.source)
     assert documented == expected
+    assert documented == generated
 
 
 @pytest.mark.parametrize(

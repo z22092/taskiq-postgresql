@@ -1,9 +1,10 @@
 # taskiq-postgresql
 
 PostgreSQL integration for [taskiq](https://taskiq-python.github.io/): a broker
-that delivers messages with `LISTEN`/`NOTIFY`, a result backend, and a
-persistent schedule source, all in one PostgreSQL database. It works with three
-drivers, [asyncpg](https://magicstack.github.io/asyncpg/),
+that keeps pending messages in a table and delivers them with `LISTEN`/`NOTIFY`
+and a periodic sweep, a result backend, and a persistent schedule source, all in
+one PostgreSQL database. It works with three drivers,
+[asyncpg](https://magicstack.github.io/asyncpg/),
 [psycopg 3](https://www.psycopg.org/psycopg3/) and
 [psqlpy](https://github.com/psqlpy-python/psqlpy), each installed as an extra.
 
@@ -71,17 +72,21 @@ async def add(a: int, b: int) -> int:
 ```
 
 `run_migrations=True` creates the tables and indexes on startup (`CREATE ... IF
-NOT EXISTS`). Processes that start at the same time, such as the two that
+NOT EXISTS`) and adds the broker's `channel` and `not_before` columns to its
+table (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`), which also upgrades a table
+created by 0.4.x. Processes that start at the same time, such as the two that
 `taskiq worker` starts by default, take a PostgreSQL advisory lock first, so
-they create the tables one after the other. Once the tables and indexes exist,
-startup only checks for them, so the application's role needs no `CREATE`
-privilege from then on. `run_migrations` is off by default; you can leave it
-off and create the tables yourself, with `taskiq postgresql migrate` or the SQL
-that `taskiq postgresql generate` prints (see [Migrations](#migrations)).
+they create the tables one after the other. Once the tables, indexes and
+columns exist, startup only checks for them, so the application's role needs no
+`CREATE` privilege from then on ([Privileges](#privileges)). `run_migrations`
+is off by default; you can leave it off and create the tables yourself, with
+`taskiq postgresql migrate` or the SQL that `taskiq postgresql generate` prints
+(see [Migrations](#migrations)).
 
-Start a worker. Start it before anything sends tasks: the worker claims a
-message when it receives its `NOTIFY`, and a notification sent while no worker
-is listening is not replayed.
+Start a worker. It claims a message as soon as the message's `NOTIFY` arrives,
+and it also sweeps the table for due messages when it starts and every
+`poll_interval` seconds, so a message sent while no worker was listening is
+delivered once one is ([Delivery](#delivery)).
 
 ```bash
 taskiq worker app:broker
@@ -161,13 +166,14 @@ once, at startup, for all three components and all drivers; if it returns
 | `result_backend` | `AsyncResultBackend` or `None` | `None` | Result backend; `.with_result_backend(...)` does the same. |
 | `task_id_generator` | `Callable[[], str]` or `None` | `None` | Custom task id factory. |
 | `field_for_task_id` | `"VarChar"`, `"Text"` or `"Uuid"` | `"Uuid"` | SQL type of the `task_id` column. |
-| `channel_name` | `str` | `"taskiq"` | `LISTEN`/`NOTIFY` channel. Use a different one per queue that shares a database. |
+| `channel_name` | `str` | `"taskiq"` | `LISTEN`/`NOTIFY` channel, also stored with each message: a worker's sweep takes only the messages of its own channel. Use a different one per queue that shares a database. |
 | `table_name` | `str` | `"taskiq_messages"` | Table that holds pending messages. |
 | `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. `"pg8000"` is in the type annotation but raises `ValueError`. |
 | `max_retry_attempts` | `int` | `5` | Accepted for compatibility, currently unused. |
 | `connection_kwargs` | `dict` or `None` | `None` | Keyword arguments for the driver's pool and for its `LISTEN` connection, so each option must be valid for both. |
 | `pool_kwargs` | `dict` or `None` | `None` | Accepted for compatibility, currently unused. Use `connection_kwargs`. |
-| `run_migrations` | `bool` | `False` | Create the table and index on startup. |
+| `run_migrations` | `bool` | `False` | Create the table and index on startup, and add the `channel` and `not_before` columns with their index. |
+| `poll_interval` | `float` | `1.0` | Seconds between two sweeps of the table for due messages; see [Delivery](#delivery). A value that is not a finite number above zero raises `ValueError`. |
 
 ### PostgresqlResultBackend
 
@@ -237,6 +243,39 @@ broker = PostgresqlBroker(
     connection_kwargs={"command_timeout": 30},
 ).with_result_backend(result_backend)
 ```
+
+## Delivery
+
+`kick()` stores each message in the broker's table in one `INSERT`, together
+with the broker's channel and the time the message becomes due. The PostgreSQL
+server computes that time from its own clock: `NOW()`, plus the `delay` label
+in seconds when the message has one, as `@broker.task(delay=...)` and
+`SmartRetryMiddleware` set. A message due at once is also announced with
+`NOTIFY`, and a listening worker claims it right away. A delayed message gets
+no `NOTIFY`, and nothing waits for it in the process that sent it, so it is
+delivered even if that process exits before the delay ends. If the `NOTIFY`
+fails once the message is stored, `kick()` logs a warning and returns, and the
+next sweep delivers the message; an error while storing it is raised to the
+caller.
+
+Every worker sweeps the table for the due messages of its channel, earliest due
+first, when it starts listening and then every `poll_interval` seconds, however
+many notifications arrive in between. The sweep also delivers a message whose
+`NOTIFY` reached no worker, because none was listening or the `LISTEN`
+connection was down. No message is claimed before it is due. Once it is due, a
+running worker of its channel that keeps up with its messages claims it within
+about `poll_interval` seconds.
+
+A worker claims a message by deleting its row (`DELETE ... RETURNING`), so each
+message reaches one worker only. Delivery is at most once: a claimed message is
+gone from the table, and a worker that stops before finishing the task does not
+give it back.
+
+If the `LISTEN` connection closes or fails, the worker keeps delivering through
+the sweep alone, so every message then waits for the next sweep. The connection
+is opened again only when the broker starts again. With asyncpg and psycopg the
+worker logs a warning when this happens; psqlpy gives no sign that its `LISTEN`
+connection ended, so with psqlpy nothing is logged.
 
 ## TLS
 
@@ -327,7 +366,17 @@ CREATE TABLE IF NOT EXISTS taskiq_messages (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS taskiq_messages_id_idx ON taskiq_messages USING HASH (id);
+ALTER TABLE taskiq_messages
+  ADD COLUMN IF NOT EXISTS channel VARCHAR,
+  ADD COLUMN IF NOT EXISTS not_before TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW();
+CREATE INDEX IF NOT EXISTS taskiq_messages_not_before_idx
+  ON taskiq_messages (channel, not_before, id);
 ```
+
+`channel` holds the broker's `channel_name` and `not_before` the time the
+message becomes due. They are added by `ALTER TABLE` rather than in
+`CREATE TABLE`, so a new table and one created by 0.4.x end up with the same
+columns.
 
 The result backend (`taskiq_results`):
 
@@ -358,6 +407,16 @@ CREATE INDEX IF NOT EXISTS taskiq_schedulers_task_name_idx ON taskiq_schedulers 
 `Uuid`). A broker message is deleted
 when a worker claims it (`DELETE ... RETURNING`), which is why only one worker
 gets each message.
+
+### Privileges
+
+Once the tables, indexes and columns above exist, no role needs a DDL
+privilege. Besides `USAGE` on the schema, a role that sends tasks needs
+`INSERT` and `SELECT` on the broker's table (the `INSERT` returns the new id)
+and `USAGE` on its `taskiq_messages_id_seq` sequence. A worker needs `SELECT`,
+`UPDATE` and `DELETE` on the broker's table: `UPDATE` because the sweep locks
+the row it claims with `FOR UPDATE SKIP LOCKED`. A worker that also sends
+tasks, for example through `SmartRetryMiddleware`, needs both sets.
 
 ## Migrations
 
@@ -568,8 +627,17 @@ It is the only upgrade guide.
   selected, for example `pip install "taskiq-postgresql[psycopg]"`.
 - `DatabaseConnectionError` on startup: the DSN, the network path or TLS
   settings are wrong; the message carries the driver's own error.
-- A task is sent but no worker runs it: start the worker before the sender, and
-  use the same `channel_name` on both sides.
+- A task is sent but no worker runs it: use the same `channel_name` and
+  `table_name` on both sides. A delayed task waits for its delay, then for the
+  next sweep.
+- `column "channel" of relation "taskiq_messages" does not exist` from
+  `kick()`, or a worker logging `Error claiming a due message on channel ...`
+  with `column "channel" does not exist` every `poll_interval`, or
+  `Error claiming message <id> on channel ...` with
+  `column "not_before" does not exist` for each `NOTIFY`: the table was
+  created by 0.4.x and lacks the new columns. Start once with
+  `run_migrations=True`, or run the SQL in "Upgrading from 0.4.x" of the
+  changelog.
 - `Fatal Python error: PyGILState_Release` when a process that used psqlpy
   exits: psqlpy occasionally aborts the interpreter at exit, after the work is
   done, which turns the exit code into an abort. It happens with psqlpy alone,
