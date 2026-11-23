@@ -196,7 +196,7 @@ def _generate(
         migrations.AmbiguousMigrationFormatError,
     ) as error:
         parser.error(str(error))
-    except ImportError as error:
+    except Exception as error:  # a format's module and entry point are not ours
         return _fail(error)
     try:
         schemas = _schemas(namespace, parser, migrations)

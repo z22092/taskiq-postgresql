@@ -14,7 +14,7 @@ import random
 import string
 import subprocess
 import sys
-from importlib.metadata import entry_points, version
+from importlib.metadata import EntryPoint, entry_points, version
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterator, Optional
@@ -685,6 +685,51 @@ def test_a_format_two_packages_register_is_a_usage_error(
         "migration format 'tables' is registered by several installed packages: "
         "acme-tables, bolt-tables; uninstall all but one of them"
     ) in err
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        (
+            "taskiq_postgresql.migrations:MIGRATION_FORMATS_GROUP",
+            "TypeError: the migration format 'broken' names str, not a callable",
+        ),
+        (
+            "taskiq_postgresql.migrations:no_such_format",
+            (
+                "AttributeError: module 'taskiq_postgresql.migrations' has no "
+                "attribute 'no_such_format'"
+            ),
+        ),
+    ],
+    ids=["not-callable", "missing-attribute"],
+)
+def test_an_entry_point_that_names_no_format_fails_with_1(
+    value: str,
+    message: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        migrations,
+        "_entry_points",
+        lambda: [
+            EntryPoint(
+                name="broken",
+                value=value,
+                group=migrations.MIGRATION_FORMATS_GROUP,
+            ),
+        ],
+    )
+
+    code, out, err = run_in_process(
+        ["generate", "--component", "broker", "--format", "broken"],
+        capsys,
+    )
+
+    # One line, as for the other errors in the user's setup: no traceback.
+    assert (code, out) == (1, "")
+    assert err == f"taskiq postgresql: error: {message}\n"
 
 
 def test_a_format_that_cannot_load_fails_with_1(
