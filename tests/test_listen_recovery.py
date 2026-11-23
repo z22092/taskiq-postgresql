@@ -8,6 +8,7 @@ packets without a FIN or RST.
 """
 
 import asyncio
+import gc
 import logging
 import uuid
 from collections.abc import AsyncGenerator
@@ -20,26 +21,30 @@ from taskiq_postgresql import PostgresqlBroker
 from taskiq_postgresql.abc.driver import ListenDriver
 from taskiq_postgresql.broker import _ReopenWaits
 from tests.helpers import (
+    NOTIFY_DELIVERS_WITHIN,
     eventually,
     fetch_on_server,
     listen_backends,
     terminate_backends,
+    with_sslmode_allow,
 )
 from tests.silent_proxy import SilentProxy
 
 pytestmark = pytest.mark.anyio
 
 LOGGER = "taskiq.asyncpg_broker"
-# Short enough for a test, long enough for a healthy local server to answer.
+# How often listen() checks a quiet LISTEN connection.
 HEALTH_CHECK = 0.3
-QUERY_TIMEOUT = 0.5
-# Room on top of the waits a test adds up: asyncpg may take up to
-# QUERY_TIMEOUT more to give a claim up, psycopg up to 1 s to wake a wait it
-# gave up, and a busy machine schedules late.
-SLACK = 3.0
+# Long enough for a healthy local server to answer on a busy machine, where a
+# connect or a claim took over 0.5 s; short enough for a test to wait for a
+# silent connection to be given up.
+QUERY_TIMEOUT = 2.0
+# Room on top of the waits a test adds up: psycopg takes up to 1 s to wake a
+# wait it gave up, the connect or claim after a given-up one may take up to
+# QUERY_TIMEOUT on a busy machine, and that machine schedules late.
+SLACK = QUERY_TIMEOUT + 3.0
 # A value no test waits for.
 OUT_OF_THE_WAY = 60.0
-NOTIFY_DELIVERS_WITHIN = 3.0
 FAST_SWEEP = 0.2
 # How late a 0.05 s sleep may wake up while listen() runs beside it.
 RESPONSIVE_WITHIN = 0.5
@@ -48,8 +53,9 @@ REOPEN_CEILINGS = (0.5, 1.0, 2.0, 4.0, 8.0, 16.0, 30.0, 30.0)
 # Waits of at least 0.25, 0.5, 1 and 2 s leave room for four attempts in 3 s.
 MOST_ATTEMPTS_IN_3_S = 4
 MOST_STOPS_IN_5_S = 5
-# One LISTEN to start; anything above it came from health checks.
-STARTING_LISTENS = 1
+# The LISTENs a connection sends to start: psqlpy sends its own on the first
+# read, after the one of on_startup(). Any more came from health checks.
+STARTING_LISTENS = {"asyncpg": 1, "psqlpy": 2, "psycopg": 1}
 
 
 def message_for(payload: bytes) -> BrokerMessage:
@@ -67,6 +73,9 @@ def recovering_broker(
 ) -> PostgresqlBroker:
     """A broker of its own channel and table, with the test's timing."""
     kwargs.setdefault("poll_interval", OUT_OF_THE_WAY)
+    if driver == "asyncpg":
+        # These tests cancel connects, see with_sslmode_allow().
+        dsn = with_sslmode_allow(dsn)
     return PostgresqlBroker(
         dsn=dsn,
         channel_name=f"{table}_channel",
@@ -280,7 +289,7 @@ async def test_when_the_pool_goes_silent__then_listen_keeps_its_pace(
     caplog: pytest.LogCaptureFixture,
     listening: list[asyncio.Task[None]],
 ) -> None:
-    """A claim that gets no answer is logged and given up, and the pool heals."""
+    """A connection that stops answering, in a claim or its release, is given up."""
     if driver == "psqlpy":
         pytest.skip("psqlpy claims are not bounded by query_timeout, see README")
     loop = asyncio.get_running_loop()
@@ -306,15 +315,22 @@ async def test_when_the_pool_goes_silent__then_listen_keeps_its_pace(
 
             async def slowest_tick() -> float:
                 slowest = 0.0
-                for _ in range(40):
+                # Until the stuck claim is given up and the pool is back.
+                for _ in range(round((QUERY_TIMEOUT + 1.0) / 0.05)):
                     started = loop.time()
                     await asyncio.sleep(0.05)
                     slowest = max(slowest, loop.time() - started)
                 return slowest
 
             assert await slowest_tick() < RESPONSIVE_WITHIN
+            # Silenced while a claim waits for its answer, or after the answer
+            # while asyncpg resets the connection for the pool: either way the
+            # connection is given up.
             await eventually(
-                lambda: bool(messages(caplog, logging.ERROR, "got no answer")),
+                lambda: bool(
+                    messages(caplog, logging.ERROR, "got no answer")
+                    or messages(caplog, logging.WARNING, "Releasing a connection"),
+                ),
                 timeout=2 * QUERY_TIMEOUT + SLACK,
             )
             await eventually(
@@ -613,4 +629,63 @@ async def test_when_listen_is_health_checked__then_each_notify_is_delivered_once
 
     assert sorted(received) == sorted(message.message for message in sent)
     assert len(sessions) == 1
-    assert statements > STARTING_LISTENS + 2
+    assert statements > STARTING_LISTENS[driver] + 2
+
+
+async def test_when_a_health_check_is_cancelled_twice__then_no_error_is_left_unread(
+    postgresql_dsn: str,
+    postgres_table: str,
+    driver: str,
+) -> None:
+    """
+    A second cancellation during a given-up probe leaves no task error unread.
+
+    shutdown() cancels the reader, and the end of listen() cancels it again,
+    often while it still waits for the probe it gave up.
+    """
+    if driver != "psycopg":
+        pytest.skip("only psycopg waits for its probe in a task of its own")
+    loop = asyncio.get_running_loop()
+    unread: list[str] = []
+    previous = loop.get_exception_handler()
+    loop.set_exception_handler(
+        lambda _, context: unread.append(
+            f"{context['message']}: {context.get('exception')!r}",
+        ),
+    )
+    try:
+        async with SilentProxy(postgresql_dsn) as proxy:
+            worker = recovering_broker(
+                proxy.dsn,
+                postgres_table,
+                driver,
+                health_check_interval=0.05,
+                # Out of the way, so that only the cancellations end the probe.
+                query_timeout=OUT_OF_THE_WAY,
+            )
+            await worker.startup()
+            try:
+                reading = asyncio.ensure_future(anext(aiter(worker.listen_driver)))
+                await eventually(lambda: len(proxy.listen_links) == 1, timeout=3)
+                link = proxy.listen_links[0]
+                proxy.silence(listen=True)
+                sent = link.listen_statements
+                await eventually(lambda: link.listen_statements > sent, timeout=3)
+                reading.cancel()
+                # Lets the first cancellation run into _give_up(), so that the
+                # second one stops it there; without this both land at once.
+                await asyncio.sleep(0)
+                reading.cancel()
+                await asyncio.gather(reading, return_exceptions=True)
+                # The probe ends on the socket shut down by the first cancellation.
+                await asyncio.sleep(0.5)
+                del reading
+                # asyncio reports an unread error once the task is collected,
+                # which has to happen while the handler above is installed.
+                gc.collect()
+            finally:
+                await close(worker, postgresql_dsn)
+    finally:
+        loop.set_exception_handler(previous)
+
+    assert unread == []

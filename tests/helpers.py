@@ -1,8 +1,9 @@
 import asyncio
+import os
 import socket
 from collections.abc import Awaitable, Callable
 from typing import Any, Optional, TypeVar, Union
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 import asyncpg
 
@@ -11,6 +12,10 @@ from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 
 _ReturnType = TypeVar("_ReturnType")
+
+# How long a listening worker may take to get a message it is notified of,
+# with room for a busy machine, where 0.6 s was seen under CPU load.
+NOTIFY_DELIVERS_WITHIN = 3.0
 
 
 def closed_local_port() -> int:
@@ -41,6 +46,24 @@ def with_netloc(
     if password is not None:
         userinfo = f"{userinfo}:{password}"
     return parts._replace(netloc=f"{userinfo}@{address}" if userinfo else address)
+
+
+def with_sslmode_allow(dsn: str) -> str:
+    """
+    ``dsn`` with ``sslmode=allow``, unless it or ``PGSSLMODE`` names a mode.
+
+    For asyncpg, 0.32 at least: a connect() cancelled during the SSLRequest of
+    the default ``prefer`` leaves an error nobody reads
+    (MagicStack/asyncpg#1397), which fails a test that cancels connects.
+    ``allow`` connects without that exchange and still moves to TLS when the
+    server requires it.
+    """
+    parts = urlsplit(dsn)
+    names = {name for name, _ in parse_qsl(parts.query, keep_blank_values=True)}
+    if "sslmode" in names or os.environ.get("PGSSLMODE"):
+        return dsn
+    query = f"{parts.query}&sslmode=allow" if parts.query else "sslmode=allow"
+    return parts._replace(query=query).geturl()
 
 
 def in_database(dsn: str, name: str) -> str:

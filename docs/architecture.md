@@ -70,8 +70,8 @@ name to a class. `drivers/__init__.py` imports a driver module only when
 | Pool | `asyncpg.create_pool` | `psqlpy.ConnectionPool` | `psycopg_pool.AsyncConnectionPool` with `AsyncRawCursor`, so `$n` placeholders work |
 | JSONB values | dict -> JSON text (`pydantic_core.to_json`) | wrapped in `psqlpy.extra_types.JSONB` (JSON text is parsed first) | dict -> JSON text (`pydantic_core.to_json`) |
 | UUID values | `UUID` -> hex text | text -> `uuid.UUID` | `UUID` -> hex text |
-| Listen | `asyncpg.connect` + `add_listener` callback into a queue; a termination listener ends the iteration when the connection closes | pool `listener()`; `add_callback` with a no-op registers the channel, and a task iterates the listener into a queue, then queues the error that ended it | autocommit connection, `LISTEN <channel>`, then `notifies(timeout=health_check_interval)` in rounds, with no notify handler |
-| Bounded waits (`query_timeout`) | `pool.acquire(timeout=...)`, `fetchrow(timeout=...)`; a close that runs out aborts the connections (`terminate()`) | the LISTEN health check and its close only | `_answered_within` shuts the socket down and closes the connection when a query runs out; `pool.close(timeout=...)` |
+| Listen | `asyncpg.connect` + `add_listener` callback into a queue; a termination listener ends the iteration when the connection closes | pool `listener()`; `add_callback` with a no-op registers the channel, `LISTEN <channel>` on the listener's connection subscribes before `on_startup()` returns (psqlpy sends its own only on the first read), and a task iterates the listener into a queue, then queues the error that ended it | autocommit connection, `LISTEN <channel>`, then `notifies(timeout=health_check_interval)` in rounds, with no notify handler |
+| Bounded waits (`query_timeout`) | `pool.acquire(timeout=...)`, `fetchrow(timeout=...)`; a close that runs out aborts the connections (`terminate()`) | the startup `LISTEN`, the LISTEN health check and its close only | `_answered_within` shuts the socket down and closes the connection when a query runs out; `pool.close(timeout=...)` |
 
 The broker is the only place a payload is parsed: `_read_notified_ids` in
 `broker.py` reads the message id with `_parse_message_id`. A payload that is
@@ -102,9 +102,9 @@ the `NOTIFY`. Use a lower-case `channel_name`, so that every driver delivers
 at once.
 
 Two statements are formatted outside the builders: `LISTEN` in the listen
-drivers (psycopg's `LISTEN <channel>` that subscribes, and in all three the
-health check, which repeats the statement that registered the channel,
-quoting included), and `NOTIFY <channel>, '<id>'` in the broker, whose
+drivers (the `LISTEN <channel>` with which psycopg and psqlpy subscribe, and
+in all three the health check, which repeats the statement that registered
+the channel, quoting included), and `NOTIFY <channel>, '<id>'` in the broker, whose
 payload is the integer id its own INSERT returned.
 
 ### Tables

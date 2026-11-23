@@ -1,4 +1,4 @@
-"""Integration tests for NOTIFY payload handling against a real PostgreSQL."""
+"""Integration tests for the listen drivers against a real PostgreSQL."""
 
 import asyncio
 import logging
@@ -11,6 +11,7 @@ from taskiq import AckableMessage, BrokerMessage
 from taskiq_postgresql import PostgresqlBroker
 from taskiq_postgresql.broker import _payload_excerpt
 from taskiq_postgresql.utils import get_db_listen_driver
+from tests.helpers import NOTIFY_DELIVERS_WITHIN
 
 pytestmark = pytest.mark.anyio
 
@@ -22,8 +23,6 @@ LOG_LINE_BUDGET = 1000
 OUT_OF_RANGE_IDS = ("9" * 4300, "2147483648", "0", "-1")
 # Far beyond any test, so only the sweep that starts listen() runs.
 SWEEP_OUT_OF_THE_WAY = 60.0
-# How long a listening worker may take to claim a message it is notified of.
-NOTIFY_DELIVERS_WITHIN = 3
 
 
 async def first_message(worker: PostgresqlBroker) -> AckableMessage:
@@ -165,3 +164,32 @@ async def test_when_payload_is_an_integer_out_of_the_id_range__then_it_is_skippe
     ]
     assert all(record.exc_info is None for record in broker_records)
     assert all(len(record.getMessage()) < LOG_LINE_BUDGET for record in broker_records)
+
+
+async def test_when_on_startup_returns__then_a_notify_sent_at_once_is_read(
+    postgresql_dsn: str,
+    postgres_table: str,
+    driver: str,
+) -> None:
+    """on_startup() returns once LISTEN is in effect, before anything reads."""
+    psycopg = pytest.importorskip("psycopg")
+    channel = f"{postgres_table}_at_once"
+    listener = get_db_listen_driver(driver)(  # type: ignore[arg-type]
+        postgresql_dsn,
+        channel,
+    )
+    await listener.on_startup()
+    try:
+        # Blocking on purpose: the event loop runs nothing of the listener's
+        # between on_startup() and this NOTIFY.
+        with psycopg.connect(postgresql_dsn, autocommit=True) as sender:
+            sender.execute("SELECT pg_notify(%s, %s)", (channel, "at-once"))
+        async with aclosing(listener.__aiter__()) as notifications:
+            received = await asyncio.wait_for(
+                anext(notifications),
+                timeout=NOTIFY_DELIVERS_WITHIN,
+            )
+    finally:
+        await listener.on_shutdown()
+
+    assert received == "at-once"
