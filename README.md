@@ -652,6 +652,10 @@ The contract:
   put it in an extra named after the format. If the import fails, `generate`
   tells the user to run `pip install '<your-package>[<format>]'`. Listing the
   formats loads none of them.
+- Pick a name no other package uses. When several installed packages register
+  one name, `generate` refuses it, exits with 2 and names the packages. A name
+  this package registers, such as `sql`, always loads this package's own
+  format, so no other package can replace it.
 
 All these names are importable from `taskiq_postgresql.migrations`.
 

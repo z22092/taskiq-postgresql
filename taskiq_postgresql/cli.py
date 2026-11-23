@@ -191,7 +191,10 @@ def _generate(
         parser.error(f"--lock-timeout: {error}")
     try:
         render = migrations.load_format(namespace.format)
-    except migrations.UnknownMigrationFormatError as error:
+    except (
+        migrations.UnknownMigrationFormatError,
+        migrations.AmbiguousMigrationFormatError,
+    ) as error:
         parser.error(str(error))
     except ImportError as error:
         return _fail(error)

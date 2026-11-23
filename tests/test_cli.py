@@ -16,6 +16,7 @@ import subprocess
 import sys
 from importlib.metadata import entry_points, version
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Iterator, Optional
 from urllib.parse import urlsplit
 
@@ -649,6 +650,41 @@ def test_generate_hands_the_options_to_a_third_party_format(
 
     assert code == 0
     assert out == "taskiq_messages {'author': 'me', 'id': 'a=b'}\n"
+
+
+def test_a_format_two_packages_register_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    class RegisteredEntryPoint:
+        name = "tables"
+
+        def __init__(self, package: str) -> None:
+            self.dist = SimpleNamespace(name=package)
+
+        def load(self) -> Any:
+            """Fail the test: an ambiguous format must not be loaded."""
+            raise AssertionError("loaded an ambiguous format")
+
+    monkeypatch.setattr(
+        migrations,
+        "_entry_points",
+        lambda: [
+            RegisteredEntryPoint("acme-tables"),
+            RegisteredEntryPoint("bolt-tables"),
+        ],
+    )
+
+    code, out, err = run_in_process(
+        ["generate", "--component", "broker", "--format", "tables"],
+        capsys,
+    )
+
+    assert (code, out) == (2, "")
+    assert (
+        "migration format 'tables' is registered by several installed packages: "
+        "acme-tables, bolt-tables; uninstall all but one of them"
+    ) in err
 
 
 def test_a_format_that_cannot_load_fails_with_1(

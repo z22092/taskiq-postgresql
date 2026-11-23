@@ -64,6 +64,7 @@ __all__ = [
     "DEFAULT_LOCK_TIMEOUT",
     "MIGRATION_FORMATS_GROUP",
     "TASK_ID_TYPES",
+    "AmbiguousMigrationFormatError",
     "ColumnSchema",
     "ComponentKind",
     "FormatOptions",
@@ -110,6 +111,7 @@ DEFAULT_LOCK_TIMEOUT: Final = 10
 # The server keeps lock_timeout as an int of milliseconds and refuses a larger
 # value when the script runs.
 _MAX_LOCK_TIMEOUT: Final = 2_147_483
+_DISTRIBUTION: Final = "taskiq-postgresql"
 
 # Keyed by the upper-cased SQL spelling; PostgreSQL type names ignore case.
 _TYPE_NAMES: Final[Mapping[str, TypeName]] = {
@@ -451,6 +453,19 @@ class UnknownMigrationFormatError(LookupError):
         )
 
 
+class AmbiguousMigrationFormatError(LookupError):
+    """Several installed packages, none of them this one, register the format."""
+
+    def __init__(self, format_name: str, distributions: Iterable[str]) -> None:
+        self.format_name = format_name
+        self.distributions = tuple(distributions)
+        super().__init__(
+            f"migration format {format_name!r} is registered by several "
+            f"installed packages: {', '.join(self.distributions)}; uninstall "
+            "all but one of them",
+        )
+
+
 class MigrationFormatOptionError(ValueError):
     """A migration format got an ``--option`` it does not accept."""
 
@@ -497,6 +512,10 @@ def load_format(name: str) -> MigrationFormat:
     """
     Load a migration format registered under ``MIGRATION_FORMATS_GROUP``.
 
+    A format this package registers, such as ``sql``, is always the one
+    loaded, whatever else registers its name. Any other name must be
+    registered by one installed package only.
+
     Args:
         name: The entry-point name, for example ``"sql"``.
 
@@ -506,15 +525,30 @@ def load_format(name: str) -> MigrationFormat:
     Raises:
         UnknownMigrationFormatError: if no installed package registers ``name``;
             the error lists the available formats.
+        AmbiguousMigrationFormatError: if several installed packages, none of
+            them this one, register ``name``; the error names them.
         ImportError: if the format cannot be imported, usually because its
             optional dependency is missing; the message says what to install.
         TypeError: if the entry point does not name a callable.
     """
-    for entry_point in _entry_points():
-        if entry_point.name == name:
-            break
-    else:
+    found = [entry_point for entry_point in _entry_points() if entry_point.name == name]
+    if not found:
         raise UnknownMigrationFormatError(name, available_formats())
+    own = [
+        entry_point
+        for entry_point in found
+        if _distribution_name(entry_point) == _DISTRIBUTION
+    ]
+    # Otherwise the order of sys.path would choose, and an installed package
+    # could replace a format without anyone noticing.
+    if not own and len(found) > 1:
+        raise AmbiguousMigrationFormatError(
+            name,
+            sorted(
+                _distribution_name(entry_point) or "<unknown>" for entry_point in found
+            ),
+        )
+    entry_point = (own or found)[0]
     try:
         loaded = entry_point.load()
     except ImportError as error:
@@ -532,9 +566,15 @@ def _entry_points() -> Iterable[Any]:
     return entry_points(group=MIGRATION_FORMATS_GROUP)
 
 
-def _install_hint(entry_point: Any, error: ImportError) -> str:
+def _distribution_name(entry_point: Any) -> Optional[str]:
+    # An EntryPoint built by hand, rather than read from an installed
+    # package, has no distribution.
     distribution = getattr(entry_point, "dist", None)
-    package = distribution.name if distribution is not None else "taskiq-postgresql"
+    return None if distribution is None else distribution.name
+
+
+def _install_hint(entry_point: Any, error: ImportError) -> str:
+    package = _distribution_name(entry_point) or _DISTRIBUTION
     # A format's optional dependencies go in an extra named after the format,
     # unless the entry point names its extras.
     extra = ",".join(getattr(entry_point, "extras", None) or [entry_point.name])
@@ -546,7 +586,7 @@ def _install_hint(entry_point: Any, error: ImportError) -> str:
 
 def _package_version() -> str:
     try:
-        return version("taskiq-postgresql")
+        return version(_DISTRIBUTION)
     except PackageNotFoundError:
         # A source tree that was never installed has no metadata.
         return "unknown"
