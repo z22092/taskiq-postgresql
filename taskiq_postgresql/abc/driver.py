@@ -6,13 +6,14 @@ from typing import Any, AsyncIterator, Optional, Sequence, Union
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.query import (
+    AddColumnsQuery,
+    AddedIndex,
     Column,
     CreatedAtColumn,
     CreateIndexQuery,
     CreateTableQuery,
     DeleteByDateQuery,
     DeleteQuery,
-    DeleteReturningQuery,
     InsertOrUpdateQuery,
     InsertQuery,
     MigrationLockQuery,
@@ -60,15 +61,25 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         created_at: Optional[Column] = None,
         index_columns: Optional[Sequence[Column]] = None,
         run_migrations: bool = False,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
         **connection_kwargs: Any,
     ) -> None:
-        """Initialize the backend."""
+        """
+        Initialize the backend.
+
+        ``added_columns`` and ``added_indexes`` are not part of
+        ``CREATE TABLE``: ``on_startup`` adds them last, so a table created by
+        an older release gets them too.
+        """
         self.connection_string = connection_string
         self.table_name = table_name
         self.columns = columns
         self.primary_key = primary_key
         self.created_at = created_at or CreatedAtColumn()
         self.index_columns = index_columns
+        self.added_columns = added_columns
+        self.added_indexes = added_indexes
         self.connection_kwargs = connection_kwargs
 
         self.create_table_query = CreateTableQuery(
@@ -78,11 +89,11 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self.create_index_query = CreateIndexQuery(self.table_name)
         self.relations_exist_query = RelationsExistQuery(self.table_name)
         self.migration_lock_query = MigrationLockQuery(self.table_name)
+        self.add_columns_query = AddColumnsQuery(self.table_name)
         self.insert_query = InsertQuery(
             self.table_name,
         )
         self.delete_query = DeleteQuery(self.table_name)
-        self.delete_returning_query = DeleteReturningQuery(self.table_name)
         self.delete_by_date_query = DeleteByDateQuery(self.table_name)
         self.select_query = SelectQuery(
             self.table_name,
@@ -129,16 +140,13 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         """Delete a row from a table."""
 
     @abstractmethod
-    async def delete_returning(
-        self,
-        where_column: Column,
-        value: Any,
-        returning: Sequence[Column],
-    ) -> Optional[dict[str, Any]]:
-        """Atomically delete a row and return requested columns.
+    async def fetch_row(self, query: str, *values: Any) -> Optional[dict[str, Any]]:
+        """
+        Run ``query`` with ``values`` bound to ``$1``, ``$2``, ...
 
-        Returns a dictionary mapping column names to values for the deleted row,
-        or None if no row matched (e.g., already claimed by another worker).
+        Returns:
+            The first row it returns, by column name, or None if it returns
+            none.
         """
 
     @abstractmethod
@@ -167,12 +175,14 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         """
         Create the table and its indexes when ``run_migrations`` is set.
 
-        Runs on one connection, in one transaction. When the table and every
-        index already exist it does nothing else, so a role without CREATE on
-        the schema or ownership of the table can start. Otherwise it takes
-        ``migration_lock_query`` before the DDL: a concurrent startup waits for
-        the commit, and its ``IF NOT EXISTS`` then finds the objects instead
-        of failing on a duplicate catalog entry.
+        Runs on one connection, in one transaction. When the table, every
+        index and the ``added_columns`` and ``added_indexes`` already exist it
+        does nothing else, so a role without CREATE on the schema or ownership
+        of the table can start. Otherwise it takes ``migration_lock_query``
+        before the DDL: a concurrent startup waits for the commit, and its
+        ``IF NOT EXISTS`` then finds the objects instead of failing on a
+        duplicate catalog entry. ``added_columns`` and ``added_indexes`` come
+        last, so a table created by an older release gets them too.
         """
 
     @abstractmethod
@@ -209,5 +219,11 @@ class ListenDriver(_ConnectionStringHolder, ABC):
     # A plain def: the drivers implement it as an async generator, which
     # returns the iterator directly instead of a coroutine.
     @abstractmethod
-    def __aiter__(self) -> AsyncIterator[int]:
-        """Iterate over the ids of the notified messages."""
+    def __aiter__(self) -> AsyncIterator[str]:
+        """
+        Yield the payload of each NOTIFY on the channel, unparsed.
+
+        The broker reads the message id and skips, with a warning, a payload
+        that is not one. A driver that parsed it would raise in its NOTIFY
+        callback instead, which loses the NOTIFY and can stop LISTEN.
+        """

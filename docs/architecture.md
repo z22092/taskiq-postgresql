@@ -28,16 +28,19 @@ driver for `LISTEN`.
 `taskiq_postgresql/abc/driver.py` defines the two interfaces:
 
 - `QueryDriver` holds the table definition (primary key, columns,
-  `created_at`, index columns) and one builder per statement from
-  `abc/query.py`, created in its `__init__`. Drivers implement `insert`,
-  `insert_or_update`, `delete`, `delete_returning`, `delete_by_date`,
-  `select`, `exists`, `execute`, `on_startup` and `on_shutdown`. Every query
-  method enters `async with driver`, which creates the connection pool on
-  first use; `on_shutdown` closes it, and does nothing when no query ever
-  created it.
+  `created_at`, index columns, and the `added_columns` and `added_indexes`
+  that `on_startup` adds to a table that may already exist) and one builder
+  per statement from `abc/query.py`, created in its `__init__`. Drivers
+  implement `insert`, `insert_or_update`, `delete`, `fetch_row`,
+  `delete_by_date`, `select`, `exists`, `execute`, `on_startup` and
+  `on_shutdown`. `fetch_row(query, *values)` runs a query its caller built
+  and returns the first row as a `dict`, or `None`; the broker runs its claims
+  through it. Every query method enters `async with driver`, which creates the
+  connection pool on first use; `on_shutdown` closes it, and does nothing when
+  no query ever created it.
 - `ListenDriver` owns the connection that listens on the channel (for psqlpy,
-  a pool listener). Iterating it (`async for`) yields the ids carried by
-  `NOTIFY`.
+  a pool listener). Iterating it (`async for`) yields the payload of each
+  `NOTIFY` unparsed, as the `str` the server sent.
 
 `utils/get_db_driver.py` and `utils/get_db_listen_driver.py` map the `driver`
 name to a class. `drivers/__init__.py` imports a driver module only when
@@ -52,12 +55,12 @@ name to a class. `drivers/__init__.py` imports a driver module only when
 | Pool | `asyncpg.create_pool` | `psqlpy.ConnectionPool` | `psycopg_pool.AsyncConnectionPool` with `AsyncRawCursor`, so `$n` placeholders work |
 | JSONB values | dict -> JSON text (`pydantic_core.to_json`) | wrapped in `psqlpy.extra_types.JSONB` (JSON text is parsed first) | dict -> JSON text (`pydantic_core.to_json`) |
 | UUID values | `UUID` -> hex text | text -> `uuid.UUID` | `UUID` -> hex text |
-| Listen | `asyncpg.connect` + `add_listener` callback into a queue | pool `listener()` with a callback into a queue | autocommit connection, `LISTEN <channel>`, then `notifies()` |
+| Listen | `asyncpg.connect` + `add_listener` callback into a queue; a termination listener ends the iteration when the connection closes | pool `listener()` with a callback into a queue | autocommit connection, `LISTEN <channel>`, then `notifies()` alone, with no notify handler |
 
-Every listen driver reads the payload with `parse_message_id` in
-`drivers/_notify.py`: a payload that is not an integer is logged, cut to its
-first 64 characters because any role that can connect can notify the channel,
-and skipped.
+The broker is the only place a payload is parsed: `_queue_notified_ids` in
+`broker.py` reads the message id with `_parse_message_id`. A payload that is
+not an integer is logged, cut to its first 64 characters (`_payload_excerpt`)
+because any role that can connect can notify the channel, and skipped.
 
 asyncpg and psycopg shape their bind parameters with the shared
 `encode_params` in `drivers/_params.py`; psqlpy has its own
@@ -84,34 +87,45 @@ integer id its own INSERT returned.
 ### Tables
 
 Created by `on_startup` only when the component gets `run_migrations=True`,
-with `CREATE TABLE IF NOT EXISTS` and hash indexes, so an existing table is
-never altered. `tests/unit/test_components.py::test_default_schema` pins the
-DDL below.
+with `CREATE TABLE IF NOT EXISTS` and hash indexes. The broker's table then
+gets its `channel` and `not_before` columns and a btree index on them from
+`AddColumnsQuery` (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, then
+`CREATE INDEX IF NOT EXISTS`), so a table created by 0.4.x ends up with the
+same columns as a new one. The DDL is additive only: no column is ever
+changed or dropped. `tests/unit/test_components.py::test_default_schema` pins
+the `CREATE TABLE` and hash index DDL below, and
+`tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql`
+the added columns and their index.
 
 `on_startup` migrates on one connection, in one transaction. It first checks
 with `to_regclass` (`RelationsExistQuery`) whether the table and every index
-it creates exist; if they do, it returns without a lock or DDL, so a role
-with only DML privileges can start. Otherwise it takes
+it creates exist, and with `pg_attribute` whether the table has the added
+columns; if they all do, it returns without a lock or DDL, so a role with only
+DML privileges can start. Otherwise it takes
 `pg_advisory_xact_lock(hashtext('taskiq_postgresql'), hashtext(<table name>))`
-(`MigrationLockQuery`) and runs the DDL: a concurrent startup waits for the
-commit, and its `IF NOT EXISTS` then finds the objects. The lock key stays
-the same across releases, so two versions in a rolling deploy also wait for
-each other.
+(`MigrationLockQuery`) and runs the DDL in that transaction: `CREATE TABLE`,
+the hash indexes, then the added columns and their index, before the commit.
+A concurrent startup waits for the commit, and its `IF NOT EXISTS` then finds
+the objects. The lock key stays the same across releases, so two versions in a
+rolling deploy also wait for each other.
 
-| Table | Columns | Hash indexes |
+| Table | Columns | Indexes |
 |---|---|---|
-| `taskiq_messages` | `id SERIAL` (PK), `task_id` (type from `field_for_task_id`), `task_name VARCHAR`, `message BYTEA`, `labels JSONB`, `created_at` | `id` |
-| `taskiq_results` | `task_id` (PK, type from `field_for_task_id`), `result BYTEA`, `created_at` | `task_id` |
-| `taskiq_schedulers` | `id UUID` (PK), `task_name VARCHAR(100)`, `schedule JSONB`, `updated_at`, `created_at` | `id`, `task_name` |
+| `taskiq_messages` | `id SERIAL` (PK), `task_id` (type from `field_for_task_id`), `task_name VARCHAR`, `message BYTEA`, `labels JSONB`, `created_at`; added: `channel VARCHAR`, `not_before TIMESTAMP WITH TIME ZONE` | hash on `id`; added: btree `taskiq_messages_not_before_idx` on `(channel, not_before, id)` |
+| `taskiq_results` | `task_id` (PK, type from `field_for_task_id`), `result BYTEA`, `created_at` | hash on `task_id` |
+| `taskiq_schedulers` | `id UUID` (PK), `task_name VARCHAR(100)`, `schedule JSONB`, `updated_at`, `created_at` | hash on `id` and on `task_name` |
 
-All columns are `NOT NULL`; `created_at` and `updated_at` default to `NOW()`.
+All columns but the broker's `channel` are `NOT NULL`; `created_at`,
+`updated_at` and `not_before` default to `NOW()`. A row stored by 0.4.x has no
+`channel`.
 
 ### Queries by operation
 
 | Operation | Builder | SQL shape |
 |---|---|---|
-| `PostgresqlBroker.kick` | `InsertQuery` | `INSERT ... VALUES ($1, ...) RETURNING id`, then `NOTIFY` |
-| `PostgresqlBroker.listen` | `DeleteReturningQuery` | `DELETE FROM ... WHERE id = $1 RETURNING message` |
+| `PostgresqlBroker.kick` | `InsertQuery` | `INSERT ... (..., channel, not_before) VALUES ($1, ..., $5, NOW() + make_interval(secs => $6::double precision)) RETURNING id`, then `NOTIFY` when the message is due at once |
+| `PostgresqlBroker.listen`, sweep | `ClaimDueQuery`, run by `fetch_row` | `DELETE FROM ... WHERE id = (SELECT id ... WHERE channel = $1 AND not_before <= NOW() ORDER BY not_before, id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING message` |
+| `PostgresqlBroker.listen`, notified id | `ClaimByIdQuery`, run by `fetch_row` | `DELETE FROM ... WHERE id = $2 AND not_before <= NOW() AND (channel = $1 OR channel IS NULL) RETURNING message` |
 | `PostgresqlResultBackend.set_result` | `InsertOrUpdateQuery` | `INSERT ... ON CONFLICT (task_id) DO UPDATE SET result = EXCLUDED.result` |
 | `is_result_ready` | `SelectQuery` | `SELECT 1 FROM ... WHERE task_id = $1` |
 | `get_result` | `SelectQuery`, then `DeleteQuery` unless `keep_results` | `SELECT result ... WHERE task_id = $1` |
@@ -128,24 +142,37 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant W1 as Worker 1 (listen)
     participant W2 as Worker 2 (listen)
-    P->>DB: INSERT message row RETURNING id
-    P->>DB: NOTIFY channel, 'id'
-    DB-->>W1: notification(id)
-    DB-->>W2: notification(id)
-    W1->>DB: DELETE ... WHERE id = $1 RETURNING message
+    P->>DB: INSERT row with channel and not_before, RETURNING id
+    P->>DB: NOTIFY channel, 'id' (only when due at once)
+    DB-->>W1: notification('id')
+    DB-->>W2: notification('id')
+    W1->>DB: DELETE ... WHERE id = $2 AND due RETURNING message
     DB-->>W1: row (claimed)
-    W2->>DB: DELETE ... WHERE id = $1 RETURNING message
+    W2->>DB: DELETE ... WHERE id = $2 AND due RETURNING message
     DB-->>W2: no row (skip)
+    loop on start, then every poll_interval
+        W1->>DB: DELETE the oldest due row of the channel, SKIP LOCKED
+    end
 ```
 
-1. `kick` inserts the message and sends `NOTIFY` with the new row id. With a
-   `delay` label, the `NOTIFY` is scheduled on the producer's event loop
-   (`loop.call_at`), so it is only sent if that process is still running.
-2. Every listening worker receives the id; its listen driver yields it as an
-   `int`.
-3. Each worker runs `DELETE ... RETURNING`; PostgreSQL gives the row to one of
-   them, and the others get no row and move on. The message is yielded as an
+1. `kick` inserts the message with the broker's channel and `not_before`, which
+   the server computes as `NOW()` plus the `delay` label. Only a message due at
+   once gets a `NOTIFY` with the new row id; a delayed one waits in the table
+   for a sweep, so its delivery does not depend on the producer's process. A
+   failed `NOTIFY` is logged as a warning, and the sweep delivers the message.
+2. `listen()` runs one task that reads the listen driver and queues the id the
+   broker parses from each payload. Its loop claims a notified id at once
+   (`ClaimByIdQuery`), and sweeps the channel for due messages
+   (`ClaimDueQuery`) when it starts and then every `poll_interval` seconds,
+   however many notifications arrive in between.
+3. Each claim is one `DELETE ... RETURNING`; PostgreSQL gives the row to one
+   worker, and the others get no row and move on. The message is yielded as an
    `AckableMessage` whose `ack` is a no-op, because the row is already gone.
+4. When reading `LISTEN` ends or fails, `listen()` logs a warning (asyncpg and
+   psycopg; psqlpy's listener gives no sign that its connection ended) and
+   delivers by the sweep alone; only `startup()` opens the connection again.
+   `shutdown()` sets an `Event` that ends `listen()`, so its sweep does not
+   reopen the pool `shutdown()` closes.
 
 ## Error handling
 
@@ -166,6 +193,9 @@ sequenceDiagram
 - `ResultIsMissingError`: `get_result` finds no row for the task id.
 - `TypeError`: a component is built without a usable DSN, or its DSN
   callable returns no usable DSN at `startup()`.
-- `ValueError`: an unknown driver name, a column/value count mismatch, or an
-  upsert without update columns.
-- `PostgresqlBroker.listen` logs any other exception and keeps listening.
+- `ValueError`: an unknown driver name, a column/value count mismatch, an
+  upsert without update columns, a `delay` label that is not a finite number
+  of seconds, or a `poll_interval` that is not one above zero.
+- `PostgresqlBroker.listen` logs a failed claim and tries again at the next
+  sweep; when reading `LISTEN` fails, it logs a warning and keeps delivering
+  by the sweep.

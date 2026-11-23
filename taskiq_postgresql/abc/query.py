@@ -1,4 +1,4 @@
-from typing import Any, Final, Literal, Optional, Sequence
+from typing import Any, Final, Literal, NamedTuple, Optional, Sequence
 
 
 class QueryBase:
@@ -41,6 +41,17 @@ class Column(QueryBase):
             parts.append("PRIMARY KEY")
 
         return " ".join(parts)
+
+    def placeholder(self, position: int) -> str:
+        """Return the SQL that stands for the value bound at ``position``."""
+        return f"${position}"
+
+
+class ClaimColumns(NamedTuple):
+    """Columns that tell which channel a message belongs to and when it is due."""
+
+    channel: Column
+    not_before: Column
 
 
 class CreateTableQuery(QueryBase):
@@ -100,22 +111,96 @@ class MigrationLockQuery(QueryBase):
         return (MIGRATION_LOCK_NAMESPACE, self.table_name)
 
 
-class RelationsExistQuery(QueryBase):
-    """Query telling whether a table and every index it gets all exist."""
+class AddedIndex(NamedTuple):
+    """A btree index that ``AddColumnsQuery`` creates after adding its columns."""
 
-    def relation_names(self, index_columns: Optional[Sequence[Column]]) -> list[str]:
+    name: str
+    columns: Sequence[Column]
+
+
+class AddColumnsQuery(QueryBase):
+    """Query adding columns, then indexes, to a table that may already exist."""
+
+    def make_query(
+        self,
+        columns: Sequence[Column],
+        indexes: Sequence[AddedIndex] = (),
+    ) -> str:
+        """Return the query as a string: one statement each, without parameters."""
+        statements = []
+        if columns:
+            add_columns = ",\n".join(
+                f"  ADD COLUMN IF NOT EXISTS {column.make_query()}"
+                for column in columns
+            )
+            statements.append(f"ALTER TABLE {self.table_name}\n{add_columns};")
+        for index in indexes:
+            indexed = ", ".join(column.name for column in index.columns)
+            statements.append(
+                f"CREATE INDEX IF NOT EXISTS {index.name}\n"
+                f"  ON {self.table_name} ({indexed});",
+            )
+        return "\n".join(statements)
+
+
+class RelationsExistQuery(QueryBase):
+    """
+    Query telling whether a table and every index it gets all exist.
+
+    Given the columns and indexes ``AddColumnsQuery`` adds, it also tells
+    whether the table has them.
+    """
+
+    def relation_names(
+        self,
+        index_columns: Optional[Sequence[Column]],
+        *,
+        added_indexes: Sequence[AddedIndex] = (),
+    ) -> list[str]:
         """Return the table name, then the name of each index on it."""
         return [
             self.table_name,
             *(index_name(self.table_name, column) for column in index_columns or ()),
+            *(index.name for index in added_indexes),
         ]
 
-    def make_query(self, index_columns: Optional[Sequence[Column]]) -> str:
-        """Return the query as a string, one parameter per relation name."""
-        return "SELECT " + " AND ".join(
-            f"to_regclass(${position}) IS NOT NULL"
-            for position in range(1, len(self.relation_names(index_columns)) + 1)
+    def params(
+        self,
+        index_columns: Optional[Sequence[Column]],
+        *,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
+    ) -> list[str]:
+        """Return the arguments of the query: relation names, then column names."""
+        return [
+            *self.relation_names(index_columns, added_indexes=added_indexes),
+            *(column.name for column in added_columns),
+        ]
+
+    def make_query(
+        self,
+        index_columns: Optional[Sequence[Column]],
+        *,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
+    ) -> str:
+        """Return the query as a string, one parameter per item of ``params``."""
+        relation_count = len(
+            self.relation_names(index_columns, added_indexes=added_indexes),
         )
+        checks = [
+            f"to_regclass(${position}) IS NOT NULL"
+            for position in range(1, relation_count + 1)
+        ]
+        checks.extend(
+            "EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1)"  # noqa: S608
+            f" AND attname::text = ${position} AND NOT attisdropped)"
+            for position in range(
+                relation_count + 1,
+                relation_count + 1 + len(added_columns),
+            )
+        )
+        return "SELECT " + " AND ".join(checks)
 
 
 class InsertQuery(QueryBase):
@@ -134,10 +219,14 @@ class InsertQuery(QueryBase):
         returning: Optional[Sequence[Column]] = None,
     ) -> str:
         """Return the query as a string."""
+        placeholders = ", ".join(
+            column.placeholder(position)
+            for position, column in enumerate(columns, start=1)
+        )
         return (
             f"INSERT INTO {self.table_name} "  # noqa: S608
             f"({', '.join(column.name for column in columns)}) "
-            f"VALUES ({', '.join(f'${i}' for i in range(1, len(columns) + 1))})"
+            f"VALUES ({placeholders})"
             + (
                 f" RETURNING {', '.join(column.name for column in returning)}"
                 if returning is not None
@@ -199,18 +288,52 @@ class DeleteQuery(QueryBase):
         return f"DELETE FROM {self.table_name} WHERE {column.name} = $1"  # noqa: S608
 
 
-class DeleteReturningQuery(QueryBase):
-    """Query to delete a row from a table and return specified columns."""
+class ClaimDueQuery(QueryBase):
+    """
+    Query deleting the oldest due row of the channel ``$1``, returning columns.
 
-    def __init__(self, table_name: str) -> None:
-        """Initialize the query."""
-        super().__init__(table_name)
+    It skips rows another claim holds instead of waiting for them.
+    """
 
-    def make_query(self, where_column: Column, returning: Sequence[Column]) -> str:
+    def make_query(
+        self,
+        primary_key: Column,
+        claim_columns: ClaimColumns,
+        returning: Sequence[Column],
+    ) -> str:
         """Return the query as a string."""
+        channel = claim_columns.channel.name
+        not_before = claim_columns.not_before.name
+        return (
+            f"DELETE FROM {self.table_name} WHERE {primary_key.name} = ("  # noqa: S608
+            f"SELECT {primary_key.name} FROM {self.table_name} "
+            f"WHERE {channel} = $1 AND {not_before} <= NOW() "
+            f"ORDER BY {not_before}, {primary_key.name} LIMIT 1 FOR UPDATE SKIP LOCKED"
+            f") RETURNING {', '.join(column.name for column in returning)}"
+        )
+
+
+class ClaimByIdQuery(QueryBase):
+    """
+    Query deleting the row whose id is ``$2``, returning columns.
+
+    It takes the row only once it is due, and only if it belongs to the
+    channel ``$1`` or to none (a row written before the channel column).
+    """
+
+    def make_query(
+        self,
+        primary_key: Column,
+        claim_columns: ClaimColumns,
+        returning: Sequence[Column],
+    ) -> str:
+        """Return the query as a string."""
+        channel = claim_columns.channel.name
+        not_before = claim_columns.not_before.name
         return (
             f"DELETE FROM {self.table_name} "  # noqa: S608
-            f"WHERE {where_column.name} = $1 "
+            f"WHERE {primary_key.name} = $2 AND {not_before} <= NOW() "
+            f"AND ({channel} = $1 OR {channel} IS NULL) "
             f"RETURNING {', '.join(column.name for column in returning)}"
         )
 
@@ -265,6 +388,28 @@ class CreatedAtColumn(Column):
             nullable=False,
             default="NOW()",
         )
+
+
+class NotBeforeColumn(Column):
+    """
+    Column for the time a message becomes due, by the server's clock.
+
+    Its bound value is a delay in seconds, added to the ``NOW()`` that the
+    insert also gives ``created_at``.
+    """
+
+    def __init__(self) -> None:
+        """Initialize the column."""
+        super().__init__(
+            "not_before",
+            "TIMESTAMP WITH TIME ZONE",
+            nullable=False,
+            default="NOW()",
+        )
+
+    def placeholder(self, position: int) -> str:
+        """Return the due time ``position``'s delay in seconds gives."""
+        return f"NOW() + make_interval(secs => ${position}::double precision)"
 
 
 class UpdatedAtColumn(Column):

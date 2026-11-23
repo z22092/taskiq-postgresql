@@ -26,6 +26,7 @@ import ssl
 import string
 import subprocess
 import sys
+import textwrap
 import threading
 import time
 from collections import Counter
@@ -45,6 +46,7 @@ from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from tests.helpers import create_database, drop_database, in_database
 
 README = Path(__file__).resolve().parent.parent / "README.md"
+CHANGELOG = README.with_name("CHANGELOG.md")
 SCRIPTS = ("app.py", "kick.py", "schedule.py")
 CA_PLACEHOLDER = "/path/to/ca.pem"
 SCHEDULER_READY = "Starting scheduler"
@@ -356,6 +358,30 @@ def _signature_rows(component: type) -> list[tuple[str, Any]]:
     return rows
 
 
+def test_when_the_changelog_upgrade_sql_is_read__then_startup_runs_the_same() -> None:
+    """The SQL "Upgrading from 0.4.x" has users run is what startup() runs."""
+    unreleased = CHANGELOG.read_text().split("\n## ", 2)[1]
+    upgrading = unreleased.split("Upgrading from 0.4.x:", 1)[1].split("\n### ", 1)[0]
+    blocks = re.findall(
+        r"^ *```sql\n(.*?)^ *```$",
+        upgrading,
+        re.DOTALL | re.MULTILINE,
+    )
+    concurrently = re.findall(r"`(CREATE INDEX CONCURRENTLY [^`]+)`", upgrading)
+    driver = PostgresqlBroker(dsn="unused").driver
+    upgrade = driver.add_columns_query.make_query(
+        driver.added_columns,
+        driver.added_indexes,
+    )
+
+    assert [textwrap.dedent(block) for block in blocks] == [f"{upgrade}\n"]
+    # The same index, built without blocking writes on a large table.
+    assert len(concurrently) == 1
+    assert _normalized_sql(concurrently[0].replace(" CONCURRENTLY", "")) in (
+        _normalized_sql(upgrade)
+    )
+
+
 @pytest.mark.parametrize(
     "component",
     [PostgresqlBroker, PostgresqlResultBackend, PostgresqlSchedulerSource],
@@ -407,10 +433,20 @@ def test_when_the_schema_blocks_are_read__then_they_match_the_generated_sql() ->
         PostgresqlSchedulerSource(dsn="unused"),
     ):
         driver = component.driver
-        expected[driver.table_name] = _normalized_sql(
-            f"{driver.create_table_query.make_query()};"
-            f"{driver.create_index_query.make_query(driver.index_columns)}",
-        )
+        statements = [
+            f"{driver.create_table_query.make_query()};",
+            driver.create_index_query.make_query(driver.index_columns),
+        ]
+        if driver.added_columns or driver.added_indexes:
+            # The broker's upgrade step, which startup runs after the CREATEs.
+            statements.append(
+                driver.add_columns_query.make_query(
+                    driver.added_columns,
+                    driver.added_indexes,
+                ),
+            )
+        expected[driver.table_name] = _normalized_sql(" ".join(statements))
+    assert "ALTER TABLE taskiq_messages" in expected["taskiq_messages"]
     documented = {}
     for block in _blocks("sql"):
         table = re.search(r"CREATE TABLE IF NOT EXISTS (\w+)", block.source)

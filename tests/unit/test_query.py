@@ -8,15 +8,17 @@ columns, so the expected SQL is written out in full.
 import pytest
 
 from taskiq_postgresql.abc.query import (
+    ClaimByIdQuery,
+    ClaimColumns,
     Column,
     CreatedAtColumn,
     CreateIndexQuery,
     CreateTableQuery,
     DeleteByDateQuery,
     DeleteQuery,
-    DeleteReturningQuery,
     InsertOrUpdateQuery,
     InsertQuery,
+    NotBeforeColumn,
     PrimaryKeyColumn,
     SelectQuery,
     UpdatedAtColumn,
@@ -25,6 +27,10 @@ from taskiq_postgresql.abc.query import (
 TASK_ID = Column("task_id", "UUID")
 RESULT = Column("result", "BYTEA")
 MESSAGE = Column("message", "BYTEA")
+CLAIM_COLUMNS = ClaimColumns(
+    channel=Column("channel", "VARCHAR", nullable=True),
+    not_before=NotBeforeColumn(),
+)
 
 
 @pytest.mark.parametrize(
@@ -171,11 +177,12 @@ def test_delete_binds_the_key() -> None:
     )
 
 
-def test_delete_returning() -> None:
-    query = DeleteReturningQuery("messages")
+def test_claim_by_id_deletes_the_due_row_returning_columns() -> None:
+    query = ClaimByIdQuery("messages")
 
-    assert query.make_query(PrimaryKeyColumn(), [MESSAGE, TASK_ID]) == (
-        "DELETE FROM messages WHERE id = $1 RETURNING message, task_id"
+    assert query.make_query(PrimaryKeyColumn(), CLAIM_COLUMNS, [MESSAGE, TASK_ID]) == (
+        "DELETE FROM messages WHERE id = $2 AND not_before <= NOW() "
+        "AND (channel = $1 OR channel IS NULL) RETURNING message, task_id"
     )
 
 
@@ -221,7 +228,7 @@ def test_values_never_reach_the_sql_text() -> None:
             on_conflict_update_columns=[RESULT],
         ),
         DeleteQuery("t").make_query(TASK_ID),
-        DeleteReturningQuery("t").make_query(TASK_ID, [RESULT]),
+        ClaimByIdQuery("t").make_query(TASK_ID, CLAIM_COLUMNS, [RESULT]),
         DeleteByDateQuery("t").make_query(CreatedAtColumn()),
         SelectQuery("t").make_query([RESULT], [TASK_ID]),
     ]

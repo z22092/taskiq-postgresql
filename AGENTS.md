@@ -19,7 +19,7 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 
 | Path | What it holds |
 |---|---|
-| `taskiq_postgresql/broker.py` | Broker: INSERT + `NOTIFY` on kick, `LISTEN` + `DELETE ... RETURNING` claim on listen |
+| `taskiq_postgresql/broker.py` | Broker: INSERT, plus `NOTIFY` when due at once, on kick; `LISTEN` and a periodic sweep, each claiming with `DELETE ... RETURNING`, on listen |
 | `taskiq_postgresql/result_backend.py` | Result backend: upsert, select, delete of serialized results (pickle by default) |
 | `taskiq_postgresql/scheduler_source.py` | Schedule source: schedules stored as JSONB |
 | `taskiq_postgresql/abc/query.py` | SQL builders for the DDL and every row query |
@@ -97,9 +97,13 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   asyncpg sends `LISTEN "<channel>"` quoted, so a channel name with upper case
   letters is lost on asyncpg and psqlpy: keep `channel_name` lower case.
 - **Schema.** Tables are created with `CREATE TABLE IF NOT EXISTS` when
-  `run_migrations=True`, so existing deployments keep their tables. Changing a
-  column is a schema change for them; `tests/unit/test_components.py` pins the
-  current DDL. The migration's advisory lock key (`MigrationLockQuery` in
+  `run_migrations=True`, so existing deployments keep their tables. Columns
+  added later (the broker's `channel` and `not_before` and their index) come
+  from `AddColumnsQuery` with `ADD COLUMN IF NOT EXISTS`, so a table created by
+  an older release gets them too; DDL is additive only. Changing a column is a
+  schema change for existing deployments; `tests/unit/test_components.py` and
+  `tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql`
+  pin the current DDL. The migration's advisory lock key (`MigrationLockQuery` in
   `abc/query.py`) is a contract between releases;
   `tests/test_migrations.py::test_migration_lock_key_is_pinned` pins it.
 - **Types.** `ty` checks `taskiq_postgresql/` at the Python 3.10 floor and must

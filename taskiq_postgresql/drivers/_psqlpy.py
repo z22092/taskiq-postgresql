@@ -3,7 +3,7 @@ from asyncio import Queue as AsyncQueue
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
+from typing import Any, AsyncGenerator, Optional, Sequence, Union
 from uuid import UUID
 
 from psqlpy import Connection, ConnectionPool
@@ -11,8 +11,7 @@ from psqlpy.extra_types import JSONB
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
-from taskiq_postgresql.abc.query import Column
-from taskiq_postgresql.drivers._notify import parse_message_id
+from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 
@@ -70,6 +69,8 @@ class PsqlpyDriver(QueryDriver):
         created_at: Optional[Column] = None,
         index_columns: Optional[Sequence[Column]] = None,
         run_migrations: bool = False,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the backend."""
@@ -81,6 +82,8 @@ class PsqlpyDriver(QueryDriver):
             created_at,
             index_columns,
             run_migrations,
+            added_columns,
+            added_indexes,
             **connection_kwargs,
         )
 
@@ -191,23 +194,12 @@ class PsqlpyDriver(QueryDriver):
             )
             return results.result(as_tuple=True)
 
-    async def delete_returning(
-        self,
-        where_column: Column,
-        value: Any,
-        returning: Sequence[Column],
-    ) -> Optional[dict[str, Any]]:
-        """Atomically delete a row and return requested columns."""
+    async def fetch_row(self, query: str, *values: Any) -> Optional[dict[str, Any]]:
+        """Return the first row of ``query``, see ``QueryDriver.fetch_row``."""
         async with self, self.connection() as connection:
-            results = await connection.fetch(
-                self.delete_returning_query.make_query(where_column, returning),
-                encode_psqlpy_params([where_column], [value]),
-            )
+            results = await connection.fetch(query, list(values))
             rows = results.result()
-            if not rows:
-                return None
-            row = rows[0]
-            return {column.name: row[column.name] for column in returning}
+            return rows[0] if rows else None
 
     async def select(
         self,
@@ -257,8 +249,16 @@ class PsqlpyDriver(QueryDriver):
                 connection.transaction() as transaction,
             ):
                 if await transaction.fetch_val(
-                    self.relations_exist_query.make_query(self.index_columns),
-                    self.relations_exist_query.relation_names(self.index_columns),
+                    self.relations_exist_query.make_query(
+                        self.index_columns,
+                        added_columns=self.added_columns,
+                        added_indexes=self.added_indexes,
+                    ),
+                    self.relations_exist_query.params(
+                        self.index_columns,
+                        added_columns=self.added_columns,
+                        added_indexes=self.added_indexes,
+                    ),
                 ):
                     return
                 await transaction.execute(
@@ -269,6 +269,13 @@ class PsqlpyDriver(QueryDriver):
                 if self.index_columns is not None:
                     await transaction.execute_batch(
                         self.create_index_query.make_query(self.index_columns),
+                    )
+                if self.added_columns or self.added_indexes:
+                    await transaction.execute_batch(
+                        self.add_columns_query.make_query(
+                            self.added_columns,
+                            self.added_indexes,
+                        ),
                     )
 
     async def on_shutdown(self) -> None:
@@ -298,7 +305,7 @@ class PsqlpyListenDriver(ListenDriver):
     ) -> None:
         """Initialize the listen driver."""
         super().__init__(connection_string, channel_name, **connection_kwargs)
-        self._queue: AsyncQueue[int] = AsyncQueue()
+        self._queue: AsyncQueue[str] = AsyncQueue()
 
     async def on_startup(self) -> None:
         """On startup."""
@@ -346,12 +353,12 @@ class PsqlpyListenDriver(ListenDriver):
             **channel**: name of the channel the notification was sent to;
             **payload**: the payload.
         """
-        message_id = parse_message_id(payload, self.channel_name)
-        if message_id is not None:
-            self._queue.put_nowait(message_id)
+        if self._queue is not None:
+            # Unparsed, see ListenDriver.__aiter__.
+            self._queue.put_nowait(payload)
 
-    async def __aiter__(self) -> AsyncIterator[int]:
+    async def __aiter__(self) -> AsyncGenerator[str, None]:
         """Iterate over the queue."""
         while True:
-            message_id = await self._queue.get()
-            yield message_id
+            payload = await self._queue.get()
+            yield payload
