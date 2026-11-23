@@ -102,10 +102,18 @@ Upgrading from 0.4.x:
   and writes rows.
 - `taskiq_postgresql.migrations` describes the tables as data (`table_schema`,
   `collect_schemas`) and renders the script (`render_sql`), or its statements
-  one by one (`migration_statements`), for tools that build their own
-  migrations. Other packages can add output formats to `generate --format`
-  through the `taskiq_postgresql.migration_formats` entry point group; the
-  README has the contract.
+  one by one (`migration_statements`, which stops after a given step with
+  `through=N`), for tools that build their own migrations. Other packages can
+  add output formats to `generate --format` through the
+  `taskiq_postgresql.migration_formats` entry point group; the README has the
+  contract.
+- `taskiq_postgresql.migrations` also compares a database with that
+  description. Each migration step declares the table, columns and indexes it
+  creates (`MigrationStep.objects`); `catalog_query` reads, in one read-only
+  query, what a database holds under those names; `plan_migration` turns that
+  into the steps still pending (`required` when a table or column is missing,
+  `advisory` when only an index is) and the problems no step fixes, such as an
+  invalid index or an index name another table took. It runs no DDL itself.
 - SQLAlchemy, SQLModel and Alembic integrations, each installed as an extra:
   `pip install "taskiq-postgresql[sqlalchemy]"`, `[sqlmodel]` or `[alembic]`.
   `taskiq_postgresql.contrib.sqlalchemy.add_taskiq_tables` adds the tables to
@@ -113,12 +121,24 @@ Upgrading from 0.4.x:
   defaults, primary key and indexes `run_migrations=True` creates, under the
   same names, so `create_all` builds the same tables;
   `taskiq_postgresql.contrib.sqlmodel.add_taskiq_tables` puts them on
-  `SQLModel.metadata`. `taskiq_postgresql.contrib.alembic` gives Alembic
-  `taskiq_metadata` for `target_metadata`, `exclude_taskiq_tables` for
+  `SQLModel.metadata`.
+- Alembic autogenerate writes the migration steps a database lacks. With
+  `taskiq_metadata(...)` from `taskiq_postgresql.contrib.alembic` in
+  `target_metadata` (or `add_taskiq_tables` on your own metadata and that
+  module imported in `env.py`), `alembic revision --autogenerate` writes each
+  missing step as `op.execute(...)` calls holding the step's SQL and the
+  advisory lock, so the revision never imports this package, and
+  `alembic check` fails while a step is missing from the revisions. Each
+  step's `downgrade()` leaves its columns and indexes in place. Generate
+  revisions against a database only Alembic migrates: where workers with
+  `run_migrations=True` already ran a step, autogenerate leaves it out. The
+  `alembic` extra allows Alembic 1.14 to 1.20, and both ends are tested. The
+  module also gives `exclude_taskiq_tables` for
   `include_object` (without it, autogenerate proposes dropping tables that
-  `run_migrations=True` created), `create_taskiq_tables(op, ...)` for a
-  revision's `upgrade()`, and `taskiq postgresql generate --format alembic`,
-  which writes a revision file.
+  `run_migrations=True` created), `upgrade_taskiq_tables(op, ..., through=N)`
+  for a hand-written revision when table names differ between environments,
+  and `taskiq postgresql generate --format alembic`, which writes a revision
+  file with every step.
 
 ### Changed
 

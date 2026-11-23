@@ -5,7 +5,11 @@ Autogenerate runs against databases that ``run_migrations=True`` set up. The
 revision tests run the ``alembic`` command itself, in a throwaway Alembic
 environment, through a sync (psycopg) and an async (asyncpg) SQLAlchemy
 dialect: asyncpg prepares every statement it sends, so a script of several
-statements in one call fails there.
+statements in one call fails there. ``test_contrib_alembic_autogenerate.py``
+covers the migration steps autogenerate writes.
+
+Every test here carries the ``alembic`` mark, so CI can run them alone on
+other Alembic versions: ``pytest -m alembic``.
 """
 
 from __future__ import annotations
@@ -13,13 +17,15 @@ from __future__ import annotations
 import ast
 import asyncio
 import io
+import json
 import os
 import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional
+from typing import Any, Callable, Iterator, Optional, Sequence
 
+import alembic as alembic_package
 import pytest
 from alembic import op
 from alembic.autogenerate import compare_metadata
@@ -32,9 +38,9 @@ from taskiq_postgresql import migrations
 from taskiq_postgresql.cli import PostgresqlCMD
 from taskiq_postgresql.contrib.alembic import (
     alembic_format,
-    create_taskiq_tables,
     exclude_taskiq_tables,
     taskiq_metadata,
+    upgrade_taskiq_tables,
 )
 from taskiq_postgresql.migrations import (
     FormatOptions,
@@ -59,26 +65,45 @@ from tests.test_contrib_sqlalchemy import (
     tables_in,
 )
 
+pytestmark = pytest.mark.alembic
+
 TIMEOUT = 60
 DEFAULT_TABLES = {"taskiq_messages", "taskiq_results", "taskiq_schedulers"}
 SQLALCHEMY_DRIVERS = ("psycopg", "asyncpg")
 URL_VARIABLE = "TASKIQ_TEST_ALEMBIC_URL"
+# JSON list of [kind, table name] pairs: the tables env.py hands autogenerate.
+TABLES_VARIABLE = "TASKIQ_TEST_ALEMBIC_TABLES"
+# Set to make taskiq_postgresql unimportable, as on a host without it.
+BLOCK_VARIABLE = "TASKIQ_TEST_ALEMBIC_BLOCK"
 # A minimal Alembic environment: the standard online and offline paths, and
 # the async one for the asyncpg dialect. The URL comes from the environment, so
 # no credential is written to disk.
 ENV_PY = f"""\
 import asyncio
+import json
 import os
+import sys
 
 from alembic import context
 from sqlalchemy import create_engine, pool
 from sqlalchemy.ext.asyncio import create_async_engine
 
 url = os.environ[{URL_VARIABLE!r}]
+tables = json.loads(os.environ.get({TABLES_VARIABLE!r}, "[]"))
+if os.environ.get({BLOCK_VARIABLE!r}):
+    sys.modules["taskiq_postgresql"] = None
+target_metadata = None
+if tables:
+    from taskiq_postgresql.contrib.alembic import taskiq_metadata
+    from taskiq_postgresql.migrations import table_schema
+
+    target_metadata = taskiq_metadata(
+        *(table_schema(kind, table_name=name) for kind, name in tables),
+    )
 
 
 def run(connection):
-    context.configure(connection=connection)
+    context.configure(connection=connection, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
 
@@ -91,7 +116,7 @@ async def run_async():
 
 
 if context.is_offline_mode():
-    context.configure(url=url, literal_binds=True)
+    context.configure(url=url, literal_binds=True, target_metadata=target_metadata)
     with context.begin_transaction():
         context.run_migrations()
 elif "+asyncpg" in url:
@@ -179,24 +204,45 @@ def new_database(postgresql_dsn: str) -> Iterator[Callable[[], str]]:
     yield from databases(postgresql_dsn)
 
 
+def make_alembic_project(path: Path) -> Path:
+    """Write an Alembic environment with an empty ``versions`` directory."""
+    (path / "alembic.ini").write_text(ALEMBIC_INI, encoding="utf-8")
+    (path / "migrations" / "versions").mkdir(parents=True)
+    (path / "migrations" / "env.py").write_text(ENV_PY, encoding="utf-8")
+    # The template `alembic init` copies, for `alembic revision`.
+    template = Path(alembic_package.__file__).parent / "templates" / "generic"
+    (path / "migrations" / "script.py.mako").write_text(
+        (template / "script.py.mako").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    return path
+
+
 @pytest.fixture
 def alembic_project(tmp_path: Path) -> Path:
     """An Alembic environment with an empty ``versions`` directory."""
-    (tmp_path / "alembic.ini").write_text(ALEMBIC_INI, encoding="utf-8")
-    (tmp_path / "migrations" / "versions").mkdir(parents=True)
-    (tmp_path / "migrations" / "env.py").write_text(ENV_PY, encoding="utf-8")
-    return tmp_path
+    return make_alembic_project(tmp_path)
 
 
 def alembic(
     project: Path,
     url: str,
     *args: str,
+    tables: Sequence[tuple[str, str]] = (),
+    block: bool = False,
 ) -> subprocess.CompletedProcess[str]:
-    """Run the ``alembic`` command on ``project``, connecting to ``url``."""
+    """
+    Run the ``alembic`` command on ``project``, connecting to ``url``.
+
+    ``tables`` become env.py's ``target_metadata``, and ``block`` makes
+    taskiq_postgresql unimportable in the command.
+    """
+    environment = {**os.environ, URL_VARIABLE: url, TABLES_VARIABLE: json.dumps(tables)}
+    if block:
+        environment[BLOCK_VARIABLE] = "1"
     return subprocess.run(  # noqa: S603
         [sys.executable, "-m", "alembic", "-c", str(project / "alembic.ini"), *args],
-        env={**os.environ, URL_VARIABLE: url},
+        env=environment,
         capture_output=True,
         text=True,
         timeout=TIMEOUT,
@@ -225,14 +271,19 @@ def test_autogenerate_finds_nothing_to_change_after_run_migrations(
     assert autogenerate(dsn, metadata, compare_server_default=True) == []
 
 
-def test_autogenerate_proposes_the_tables_on_an_empty_database(
+def test_autogenerate_proposes_every_step_on_an_empty_database(
     new_database: Callable[[], str],
 ) -> None:
     diffs = autogenerate(new_database(), taskiq_metadata(*default_schemas()))
 
-    assert {diff[1].name for diff in diffs if diff[0] == "add_table"} == (
-        DEFAULT_TABLES
-    )
+    # One operation per migration step, the tables in name order, in place of
+    # the add_table Alembic would propose.
+    assert diffs == [
+        ("taskiq_postgresql_step", "taskiq_messages", 1),
+        ("taskiq_postgresql_step", "taskiq_messages", 2),
+        ("taskiq_postgresql_step", "taskiq_results", 1),
+        ("taskiq_postgresql_step", "taskiq_schedulers", 1),
+    ]
 
 
 def test_the_filter_keeps_autogenerate_from_dropping_the_tables(
@@ -276,43 +327,51 @@ def test_the_filter_keeps_tables_of_the_same_name_in_other_schemas() -> None:
     assert include_object(unrelated, unrelated.name, "table", True, None)
 
 
-# --- create_taskiq_tables in a hand-written revision ---------------------------
+# --- upgrade_taskiq_tables in a hand-written revision -------------------------
+
+
+def upgrade_default_tables() -> None:
+    """What a hand-written revision runs for the default tables of this release."""
+    broker, *others = default_schemas()
+    upgrade_taskiq_tables(op, broker, through=2)
+    upgrade_taskiq_tables(op, *others, through=1)
+
+
+def default_statements() -> list[str]:
+    broker, *others = default_schemas()
+    return [
+        *migration_statements([broker], through=2),
+        *migration_statements(others, through=1),
+    ]
 
 
 @pytest.mark.parametrize("sqlalchemy_driver", SQLALCHEMY_DRIVERS)
-def test_create_taskiq_tables_runs_in_a_revision_twice(
+def test_upgrade_taskiq_tables_runs_in_a_revision_twice(
     sqlalchemy_driver: str,
     new_database: Callable[[], str],
 ) -> None:
     dsn = new_database()
 
-    def upgrade() -> None:
-        create_taskiq_tables(op, *default_schemas())
-
-    run_upgrade(dsn, sqlalchemy_driver, upgrade)
-    run_upgrade(dsn, sqlalchemy_driver, upgrade)
+    run_upgrade(dsn, sqlalchemy_driver, upgrade_default_tables)
+    run_upgrade(dsn, sqlalchemy_driver, upgrade_default_tables)
 
     assert tables_in(dsn) == DEFAULT_TABLES
 
 
-def test_create_taskiq_tables_prints_the_script_offline(
+def test_upgrade_taskiq_tables_prints_the_script_offline(
     driver: str,
     new_database: Callable[[], str],
 ) -> None:
-    schemas = default_schemas()
+    printed = offline_sql(upgrade_default_tables)
 
-    printed = offline_sql(lambda: create_taskiq_tables(op, *schemas))
-
-    assert printed == "".join(
-        f"{statement};\n\n" for statement in migration_statements(schemas)
-    )
+    assert printed == "".join(f"{statement};\n\n" for statement in default_statements())
     # What `alembic upgrade --sql` prints runs as it is, as through psql.
     dsn = new_database()
     asyncio.run(run_script(dsn, driver, f"BEGIN;\n{printed}COMMIT;\n"))
     assert tables_in(dsn) == DEFAULT_TABLES
 
 
-def test_create_taskiq_tables_takes_import_paths(
+def test_upgrade_taskiq_tables_takes_import_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -325,12 +384,20 @@ def test_create_taskiq_tables_takes_import_paths(
     monkeypatch.setattr(sys, "path", list(sys.path))
     try:
         printed = offline_sql(
-            lambda: create_taskiq_tables(op, f"{module}:broker", app_dir=str(tmp_path)),
+            lambda: upgrade_taskiq_tables(
+                op,
+                f"{module}:broker",
+                through=2,
+                app_dir=str(tmp_path),
+            ),
         )
     finally:
         sys.modules.pop(module, None)
 
-    assert "CREATE TABLE IF NOT EXISTS taskiq_messages" in printed
+    assert printed == "".join(
+        f"{statement};\n\n"
+        for statement in migration_statements([table_schema("broker")], through=2)
+    )
 
 
 # --- the alembic migration format --------------------------------------------
@@ -341,7 +408,18 @@ def test_the_alembic_format_is_registered() -> None:
     assert load_format("alembic") is alembic_format
 
 
-def test_the_revision_runs_the_statements_and_drops_nothing_by_default() -> None:
+def step_statements(schemas: list[TableSchema], *, lock: bool = True) -> list[str]:
+    """Each step of each table, by table name, every step with its own lock."""
+    statements = []
+    for schema in sorted(schemas, key=lambda table: table.name):
+        for step in schema.steps:
+            if lock:
+                statements.append(migration_statements([schema])[0])
+            statements.extend(step.statements)
+    return statements
+
+
+def test_the_revision_runs_the_steps_and_drops_nothing_by_default() -> None:
     schemas = [table_schema("broker"), table_schema("result_backend")]
 
     source = alembic_format(schemas, FormatOptions())
@@ -351,12 +429,15 @@ def test_the_revision_runs_the_statements_and_drops_nothing_by_default() -> None
     assert namespace["down_revision"] is None
     assert namespace["branch_labels"] is None
     assert namespace["depends_on"] is None
-    assert namespace["UPGRADE"] == tuple(migration_statements(schemas))
-    assert namespace["DOWNGRADE"] == ()
     assert offline_sql(namespace["upgrade"]) == "".join(
-        f"{statement};\n\n" for statement in migration_statements(schemas)
+        f"{statement};\n\n" for statement in step_statements(schemas)
     )
     assert offline_sql(namespace["downgrade"]) == ""
+    # The SQL is written out: the revision imports nothing but alembic.
+    imports = [
+        line for line in source.splitlines() if line.startswith(("import ", "from "))
+    ]
+    assert imports == ["from alembic import op"]
     # The same tables give the same file; other tables another revision.
     assert alembic_format(schemas, FormatOptions()) == source
     assert (
@@ -386,10 +467,12 @@ def test_the_revision_takes_its_options() -> None:
         "taskiq_tables",
         "app_0042",
     )
-    assert namespace["UPGRADE"] == tuple(migration_statements(schemas, lock=False))
-    assert namespace["DOWNGRADE"] == (
-        "DROP TABLE IF EXISTS taskiq_results",
-        "DROP TABLE IF EXISTS taskiq_messages",
+    assert offline_sql(namespace["upgrade"]) == "".join(
+        f"{statement};\n\n" for statement in step_statements(schemas, lock=False)
+    )
+    assert offline_sql(namespace["downgrade"]) == (
+        "DROP TABLE IF EXISTS taskiq_results;\n\n"
+        "DROP TABLE IF EXISTS taskiq_messages;\n\n"
     )
     assert "Revision ID: taskiq_tables\nRevises: app_0042\n" in source
     # Alembic runs every revision in its own transaction: never BEGIN/COMMIT.

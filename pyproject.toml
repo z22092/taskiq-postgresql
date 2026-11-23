@@ -139,6 +139,9 @@ packages = ["taskiq_postgresql"]
 testpaths = ["tests"]
 timeout = 60
 addopts = ["--strict-markers", "--strict-config"]
+markers = [
+    "alembic: the Alembic integration; CI also runs these on the oldest Alembic the extra allows",
+]
 
 [tool.ruff.format]
 exclude = [".venv/"]

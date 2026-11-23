@@ -1,67 +1,106 @@
 """
 Alembic support for the tables of taskiq-postgresql.
 
-Install it with ``pip install 'taskiq-postgresql[alembic]'``. Four ways in:
+Install it with ``pip install 'taskiq-postgresql[alembic]'``. Importing this
+module teaches Alembic's autogenerate the package's migration steps:
 
-- ``taskiq_metadata(...)`` in ``target_metadata``: autogenerate proposes the
-  tables on an empty database and nothing once they exist.
+- ``taskiq_metadata(...)`` in ``target_metadata`` (or ``add_taskiq_tables``
+  on your own metadata): autogenerate reads which steps the database lacks
+  and writes each one into the revision as a ``TaskiqStepOp``, with the
+  step's SQL spelled out, in place of the generic ``create_table``,
+  ``add_column`` and ``create_index`` it would write for these tables. On a
+  database that has every step, it writes nothing; ``alembic check`` fails
+  while a step is missing.
 - ``exclude_taskiq_tables(...)`` as ``include_object``: autogenerate leaves the
   tables alone, for projects whose workers keep ``run_migrations=True``.
-- ``create_taskiq_tables(op, ...)`` in a hand-written ``upgrade()``.
+- ``upgrade_taskiq_tables(op, ..., through=N)`` in a hand-written
+  ``upgrade()``, for table names that differ between environments.
 - ``taskiq postgresql generate --format alembic``, which writes a revision
-  file with the statements in it.
+  file with every step in it.
+
+The comparator registers itself globally on import, as Alembic's
+autogenerate hooks always have; it does nothing unless a metadata in
+``target_metadata`` holds the descriptions ``taskiq_metadata`` and
+``add_taskiq_tables`` record. No ``alembic.plugins`` entry point is
+published: before Alembic 1.20.1 one breaks ``import alembic``.
 """
 
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 from collections.abc import Callable, Sequence
 from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Final, Optional, Union
 
 try:
-    from alembic.operations import Operations
+    from alembic.autogenerate import comparators, renderers
+    from alembic.operations import MigrateOperation, Operations, ops
 except ImportError as error:
     raise ImportError(
         "alembic is not installed. Please install it with "
         "`pip install taskiq-postgresql[alembic]`.",
     ) from error
 
-from sqlalchemy import Table
+from sqlalchemy import MetaData, Table, text
 
-from taskiq_postgresql.contrib.sqlalchemy import _schemas, taskiq_metadata
+from taskiq_postgresql.contrib.sqlalchemy import (
+    METADATA_INFO_KEY,
+    _name,
+    _schemas,
+    taskiq_metadata,
+)
 from taskiq_postgresql.migrations import (
+    CatalogState,
+    ComponentKind,
     FormatOptions,
     MigrationFormatOptionError,
+    MigrationStep,
+    PendingStep,
     TableSchema,
+    _script_statements,
+    catalog_query,
     migration_statements,
+    plan_migration,
 )
 
 if TYPE_CHECKING:
     from types import ModuleType
 
+    from alembic.autogenerate.api import AutogenContext
     from sqlalchemy.schema import SchemaItem
 
 __all__ = [
+    "DIFF_NAME",
+    "TaskiqStepNoopOp",
+    "TaskiqStepOp",
     "alembic_format",
-    "create_taskiq_tables",
+    "compare_taskiq_steps",
     "exclude_taskiq_tables",
     "taskiq_metadata",
+    "upgrade_taskiq_tables",
 ]
+
+log = logging.getLogger(__name__)
+
+DIFF_NAME: Final = "taskiq_postgresql_step"
+"""The first item of a ``TaskiqStepOp``'s diff tuple, as ``alembic check`` shows it."""
 
 _OPTIONS: Final = ("revision", "down_revision", "downgrade")
 _DOWNGRADES: Final = ("none", "drop")
 _REVISION_ID: Final = re.compile(r"[A-Za-z0-9_]+")
 _DEFAULT_REVISION_LENGTH: Final = 12
+_INDENT: Final = "    "
 _REVISION: Final = '''\
-"""Create the taskiq-postgresql tables.
+"""Create or complete the taskiq-postgresql tables.
 
 Revision ID: {revision}
 Revises:{revises}
 Written by `taskiq postgresql generate --format alembic` (taskiq-postgresql
-{version}). Each UPGRADE statement only adds what is missing, so upgrade() is
-safe on a database that already has the tables.
+{version}). Each statement only adds what is missing, so upgrade() is safe on
+a database that already has the tables. The SQL is written out, so the
+revision never imports taskiq-postgresql.
 """
 
 from alembic import op
@@ -71,19 +110,207 @@ down_revision = {down_revision_literal}
 branch_labels = None
 depends_on = None
 
-UPGRADE = {upgrade}
-DOWNGRADE = {downgrade}
-
 
 def upgrade() -> None:
-    for statement in UPGRADE:
-        op.execute(statement)
+{upgrade}
 
 
 def downgrade() -> None:
-    for statement in DOWNGRADE:
-        op.execute(statement)
+{downgrade}
 '''
+
+
+class TaskiqStepOp(MigrateOperation):
+    """
+    One migration step of one table, as an autogenerate operation.
+
+    It renders as ``op.execute(...)`` calls with the step's SQL written out,
+    so the revision runs the same statements ``run_migrations=True`` runs,
+    and never imports taskiq-postgresql. It is not registered as an
+    ``op.<name>`` directive for the same reason.
+
+    Args:
+        table: The table name.
+        kind: The component that owns the table.
+        step: The step.
+        lock: Start with the advisory lock ``run_migrations=True`` takes, so
+            starting workers wait for the revision's transaction.
+        notes: The locks the step takes, written as comments.
+    """
+
+    def __init__(
+        self,
+        table: str,
+        kind: ComponentKind,
+        step: MigrationStep,
+        *,
+        lock: bool = True,
+        notes: Sequence[str] = (),
+    ) -> None:
+        self.table = table
+        self.kind = kind
+        self.step = step
+        self.lock = lock
+        self.notes = tuple(notes)
+
+    @classmethod
+    def from_pending(cls, pending: PendingStep, *, lock: bool = True) -> TaskiqStepOp:
+        """
+        Build the operation of a step ``plan_migration`` found pending.
+
+        Args:
+            pending: The pending step.
+            lock: As for the constructor.
+
+        Returns:
+            The operation.
+        """
+        return cls(
+            pending.table,
+            pending.kind,
+            pending.step,
+            lock=lock,
+            notes=pending.notes,
+        )
+
+    @property
+    def number(self) -> int:
+        """The step number."""
+        return self.step.number
+
+    @property
+    def statements(self) -> list[str]:
+        """The statements the revision executes, the lock first."""
+        return _script_statements([(self.table, (self.step,))], lock=self.lock)
+
+    def reverse(self) -> TaskiqStepNoopOp:
+        """
+        Return the downgrade: nothing, because every step is additive.
+
+        Returns:
+            The operation that renders the comment.
+        """
+        return TaskiqStepNoopOp(self)
+
+    def to_diff_tuple(self) -> tuple[str, str, int]:
+        """
+        Return the diff ``alembic check`` and ``compare_metadata`` report.
+
+        Returns:
+            ``("taskiq_postgresql_step", table, step number)``.
+        """
+        return (DIFF_NAME, self.table, self.number)
+
+
+class TaskiqStepNoopOp(MigrateOperation):
+    """
+    The downgrade of a ``TaskiqStepOp``: a comment, and no SQL.
+
+    A step only adds columns and indexes, which the previous release ignores,
+    and dropping them would lose data.
+
+    Args:
+        upgrade: The operation it undoes.
+    """
+
+    def __init__(self, upgrade: TaskiqStepOp) -> None:
+        self.upgrade = upgrade
+
+    def reverse(self) -> TaskiqStepOp:
+        """
+        Return the upgrade operation.
+
+        Returns:
+            The ``TaskiqStepOp``.
+        """
+        return self.upgrade
+
+    def to_diff_tuple(self) -> tuple[str, str, int]:
+        """
+        Return the diff of the upgrade it belongs to.
+
+        Returns:
+            ``("taskiq_postgresql_step_downgrade", table, step number)``.
+        """
+        return (f"{DIFF_NAME}_downgrade", self.upgrade.table, self.upgrade.number)
+
+
+@renderers.dispatch_for(TaskiqStepOp)
+def _render_step(autogen_context: AutogenContext, op: TaskiqStepOp) -> list[str]:
+    return _step_lines(op, _prefix(autogen_context))
+
+
+@renderers.dispatch_for(TaskiqStepNoopOp)
+def _render_noop(autogen_context: AutogenContext, op: TaskiqStepNoopOp) -> list[str]:
+    return _noop_lines(op.upgrade)
+
+
+def compare_taskiq_steps(
+    autogen_context: AutogenContext,
+    upgrade_ops: ops.UpgradeOps,
+    schemas: set[Optional[str]],
+) -> None:
+    """
+    Put the missing migration steps of the taskiq tables into a revision.
+
+    Registered as a schema-level autogenerate comparator when this module is
+    imported. It reads the catalog with one read-only query
+    (``catalog_query``), replaces the ``create_table``, ``add_column`` and
+    ``create_index`` operations Alembic generated for objects of the pending
+    steps with one ``TaskiqStepOp`` per step, and keeps every other
+    operation, so a type change or a stray column still shows. Problems no
+    step fixes, such as an invalid index, are logged as warnings.
+
+    It does nothing on a dialect other than PostgreSQL, when the default
+    schema is not compared, or when no metadata of ``target_metadata`` holds
+    descriptions under ``METADATA_INFO_KEY``. ``include_name`` and
+    ``include_object`` apply to the tables.
+
+    Args:
+        autogen_context: Alembic's autogenerate context.
+        upgrade_ops: The operations of the revision being generated.
+        schemas: The schema names being compared; ``None`` is the default.
+    """
+    dialect = autogen_context.dialect
+    connection = autogen_context.connection
+    if dialect is None or dialect.name != "postgresql" or None not in schemas:
+        return
+    tables = _described_tables(autogen_context)
+    if not tables or connection is None:
+        return
+    found = connection.execute(text(_escape_colons(catalog_query(tables)))).scalar()
+    plan = plan_migration(tables, CatalogState.from_json(found))
+    for problem in plan.problems:
+        log.warning("taskiq-postgresql: %s: %s", problem.code, problem.detail)
+    _drop_covered(upgrade_ops, plan.pending)
+    present = {
+        operation.to_diff_tuple()
+        for operation in upgrade_ops.ops
+        if isinstance(operation, TaskiqStepOp)
+    }
+    upgrade_ops.ops.extend(
+        operation
+        for operation in map(TaskiqStepOp.from_pending, plan.pending)
+        if operation.to_diff_tuple() not in present
+    )
+
+
+def _register(comparator: Callable[..., None]) -> None:
+    try:
+        from alembic.util import DispatchPriority  # noqa: PLC0415
+    except ImportError:
+        # Before 1.18 comparators run in registration order, and Alembic
+        # registered its table comparator when it was imported. A "postgresql"
+        # qualifier would hide that one: dispatch returns the qualifier's list
+        # or the default's, never both.
+        comparators.dispatch_for("schema")(comparator)
+        return
+    # From 1.18 global comparators run before the built-in ones unless they
+    # ask to run last, and this one edits what the table comparator emits.
+    comparators.dispatch_for("schema", priority=DispatchPriority.LAST)(comparator)
+
+
+_register(compare_taskiq_steps)
 
 
 def exclude_taskiq_tables(
@@ -132,45 +359,55 @@ def exclude_taskiq_tables(
     return include_object
 
 
-def create_taskiq_tables(
+def upgrade_taskiq_tables(
     op: Union[Operations, ModuleType],
     *targets: object,
+    through: int,
     app_dir: Optional[str] = None,
 ) -> None:
     """
-    Create the tables from a revision's ``upgrade()``.
+    Run the migration steps from a hand-written revision's ``upgrade()``.
 
-    It runs the statements ``taskiq postgresql generate`` prints, one per call
+    It runs steps 1 to ``through`` of each table, one statement per call
     (SQLAlchemy's asyncpg dialect refuses several in one), in the revision's
     transaction, so the advisory lock ``run_migrations=True`` takes lasts
-    until Alembic commits. Every statement only adds what is missing. With
-    ``alembic upgrade --sql`` the statements are printed instead.
+    until Alembic commits. A released step never changes, so the revision
+    runs the same SQL with every later release of the package. Every
+    statement only adds what is missing. With ``alembic upgrade --sql`` the
+    statements are printed instead.
+
+    Use it where an autogenerated revision would write the wrong table name:
+    when the name comes from settings that differ between environments.
 
     Args:
         op: ``alembic.op``, as a revision imports it, or an ``Operations``.
         *targets: As for ``taskiq_metadata``. ``table_schema(...)``
             descriptions keep the revision from importing the application.
+        through: The last step to run. Every table must have it: name the
+            tables of different step counts in separate calls.
         app_dir: As for ``taskiq_metadata``.
 
     Raises:
         TypeError: as ``taskiq_metadata`` does.
-        ValueError: as ``taskiq_metadata`` does.
+        ValueError: if a table has no step ``through``, or as
+            ``taskiq_metadata`` does.
         LookupError: as ``taskiq_metadata`` does.
         ImportError: as ``taskiq_metadata`` does.
         AttributeError: as ``taskiq_metadata`` does.
     """
-    for statement in migration_statements(_schemas(targets, app_dir)):
-        op.execute(statement)
+    for statement in migration_statements(_schemas(targets, app_dir), through=through):
+        op.execute(_escape_colons(statement))
 
 
 def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
     """
     Render the ``alembic`` migration format: a revision file.
 
-    ``upgrade()`` runs the statements of ``migration_statements`` one by one,
-    without ``BEGIN`` and ``COMMIT``: Alembic runs each revision in a
-    transaction of its own, so ``options.transaction`` changes nothing.
-    ``options.lock`` keeps or leaves out the advisory lock.
+    ``upgrade()`` is what autogenerate writes for these tables on an empty
+    database: each step of each table, its SQL written out, without ``BEGIN``
+    and ``COMMIT`` (Alembic runs each revision in a transaction of its own,
+    so ``options.transaction`` changes nothing). ``options.lock`` keeps or
+    leaves out the advisory locks.
 
     Options (``--option KEY=VALUE``):
 
@@ -179,8 +416,8 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
       give the same id.
     - ``down_revision``: the revision it follows, your current head; by
       default none, a first revision.
-    - ``downgrade``: ``none`` (default), ``downgrade()`` does nothing; or
-      ``drop``, it drops the tables with ``DROP TABLE IF EXISTS``.
+    - ``downgrade``: ``none`` (default), ``downgrade()`` leaves the tables in
+      place; or ``drop``, it drops them with ``DROP TABLE IF EXISTS``.
 
     Args:
         schemas: The tables.
@@ -204,9 +441,14 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
         raise MigrationFormatOptionError(
             f"downgrade must be 'none' or 'drop', got {downgrade!r}",
         )
-    upgrade = migration_statements(schemas, lock=options.lock)
+    steps = [
+        TaskiqStepOp(schema.name, schema.kind, step, lock=options.lock)
+        for schema in sorted(schemas, key=lambda table: table.name)
+        for step in schema.steps
+    ]
     revision = options.extra.get("revision")
     if revision is None:
+        upgrade = [statement for step in steps for statement in step.statements]
         digest = hashlib.sha256("\n".join(upgrade).encode()).hexdigest()
         revision = digest[:_DEFAULT_REVISION_LENGTH]
     down_revision = options.extra.get("down_revision")
@@ -215,26 +457,131 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
             raise MigrationFormatOptionError(
                 f"{key} must be letters, digits and _, got {value!r}",
             )
-    drops = (
-        [f"DROP TABLE IF EXISTS {schema.name}" for schema in reversed(schemas)]
-        if downgrade == "drop"
-        else []
-    )
+    if downgrade == "drop":
+        downgrade_lines = [
+            _execute_line("op.", f"DROP TABLE IF EXISTS {schema.name}")
+            for schema in reversed(schemas)
+        ]
+    else:
+        downgrade_lines = [
+            line for step in reversed(steps) for line in _noop_lines(step)
+        ]
     return _REVISION.format(
         revision=revision,
         revises="" if down_revision is None else f" {down_revision}",
         version=_package_version(),
         revision_literal=f'"{revision}"',
         down_revision_literal="None" if down_revision is None else f'"{down_revision}"',
-        upgrade=_tuple(upgrade),
-        downgrade=_tuple(drops),
+        upgrade=_body([line for step in steps for line in _step_lines(step, "op.")]),
+        downgrade=_body(downgrade_lines),
     )
 
 
-def _tuple(statements: Sequence[str]) -> str:
-    if not statements:
-        return "()"
-    return "(\n" + "".join(f"    {statement!r},\n" for statement in statements) + ")"
+def _described_tables(autogen_context: AutogenContext) -> list[TableSchema]:
+    metadata = autogen_context.metadata
+    if metadata is None:
+        collections: Sequence[MetaData] = ()
+    elif isinstance(metadata, MetaData):
+        collections = (metadata,)
+    else:
+        collections = tuple(metadata)
+    described: dict[str, TableSchema] = {}
+    for collection in collections:
+        for schema in collection.info.get(METADATA_INFO_KEY, ()):
+            described.setdefault(schema.name, schema)
+    return [
+        schema
+        for schema in described.values()
+        if _included(autogen_context, collections, schema)
+    ]
+
+
+def _included(
+    autogen_context: AutogenContext,
+    collections: Sequence[MetaData],
+    schema: TableSchema,
+) -> bool:
+    name = _name(schema.name)
+    if not autogen_context.run_name_filters(name, "table", {"schema_name": None}):
+        return False
+    for collection in collections:
+        table = collection.tables.get(name)
+        if table is not None:
+            return autogen_context.run_object_filters(table, name, "table", False, None)
+    return True
+
+
+def _drop_covered(upgrade_ops: ops.UpgradeOps, pending: Sequence[PendingStep]) -> None:
+    # Alembic's own comparators ran first and proposed generic operations for
+    # the objects the pending steps create; the steps replace exactly those.
+    created = {_name(item.table) for item in pending if item.table_missing}
+    columns = {
+        (_name(item.table), column)
+        for item in pending
+        for column in item.step.objects.columns
+    }
+    indexes = {
+        (_name(item.table), _name(index.name))
+        for item in pending
+        for index in item.step.objects.indexes
+    }
+
+    def covered(operation: MigrateOperation) -> bool:
+        if isinstance(operation, ops.AddColumnOp):
+            return (operation.table_name, operation.column.name) in columns
+        if isinstance(operation, ops.CreateIndexOp):
+            return (operation.table_name, operation.index_name) in indexes
+        return False
+
+    kept: list[MigrateOperation] = []
+    for operation in upgrade_ops.ops:
+        if getattr(operation, "schema", None) is not None:
+            kept.append(operation)
+            continue
+        if isinstance(operation, ops.CreateTableOp) and operation.table_name in created:
+            continue
+        if isinstance(operation, ops.ModifyTableOps):
+            operation.ops = [inner for inner in operation.ops if not covered(inner)]
+            if not operation.ops:
+                continue
+        elif covered(operation):
+            continue
+        kept.append(operation)
+    upgrade_ops.ops[:] = kept
+
+
+def _prefix(autogen_context: AutogenContext) -> str:
+    return autogen_context.opts.get("alembic_module_prefix", "op.") or ""
+
+
+def _step_lines(step: TaskiqStepOp, prefix: str) -> list[str]:
+    title = f"step {step.number} of the {step.kind} table {step.table}"
+    return [
+        f"# taskiq-postgresql {title}: the SQL run_migrations=True runs,",
+        "# and each statement only adds what is missing.",
+        *(f"# {note}." for note in step.notes),
+        *(_execute_line(prefix, statement) for statement in step.statements),
+    ]
+
+
+def _noop_lines(step: TaskiqStepOp) -> list[str]:
+    title = f"step {step.number} of {step.table}"
+    # A body of comments alone is not valid Python: pass makes it a statement.
+    return [f"# taskiq-postgresql {title} is additive: it stays.", "pass"]
+
+
+def _execute_line(prefix: str, statement: str) -> str:
+    return f"{prefix}execute({_escape_colons(statement)!r})"
+
+
+def _escape_colons(statement: str) -> str:
+    # op.execute() and text() read ":name" as a bind parameter; "\:" is a
+    # literal colon, in online and offline (--sql) mode alike.
+    return statement.replace(":", "\\:")
+
+
+def _body(lines: Sequence[str]) -> str:
+    return "\n".join(f"{_INDENT}{line}" for line in (lines or ["pass"]))
 
 
 def _package_version() -> str:

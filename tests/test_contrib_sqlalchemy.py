@@ -28,7 +28,11 @@ from sqlmodel import SQLModel
 
 from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.contrib import sqlmodel as sqlmodel_contrib
-from taskiq_postgresql.contrib.sqlalchemy import add_taskiq_tables, taskiq_metadata
+from taskiq_postgresql.contrib.sqlalchemy import (
+    METADATA_INFO_KEY,
+    add_taskiq_tables,
+    taskiq_metadata,
+)
 from taskiq_postgresql.migrations import (
     ColumnSchema,
     TableSchema,
@@ -321,6 +325,17 @@ def test_the_table_is_the_description() -> None:
     assert {
         index.dialect_options["postgresql"]["using"] for index in table.indexes
     } == {"hash"}
+
+
+def test_the_metadata_keeps_each_description_once() -> None:
+    metadata = MetaData()
+    broker, backend = table_schema("broker"), table_schema("result_backend")
+
+    add_taskiq_tables(metadata, broker, backend)
+    add_taskiq_tables(metadata, broker)
+
+    assert metadata.info[METADATA_INFO_KEY] == (broker, backend)
+    assert taskiq_metadata(broker).info[METADATA_INFO_KEY] == (broker,)
 
 
 def test_names_are_the_ones_postgresql_gives_an_unquoted_name() -> None:

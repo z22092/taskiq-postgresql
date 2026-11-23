@@ -510,8 +510,9 @@ with the next free version number:
 taskiq postgresql generate app:scheduler --no-transaction > db/migration/V2__taskiq_tables.sql
 ```
 
-For Alembic, install the `alembic` extra: [Alembic](#alembic) shows a helper
-for a revision of your own and a format that writes the revision file. In
+For Alembic, install the `alembic` extra: [Alembic](#alembic) shows how
+autogenerate writes the steps a database lacks, a helper for a revision of
+your own, and a format that writes the revision file. In
 Django, pass `render_sql(..., transaction=False)` from
 `taskiq_postgresql.migrations` to `migrations.RunSQL` in a migration of your
 own; describing the tables by component kind (`table_schema("broker")` and so
@@ -567,9 +568,11 @@ The contract:
 - `schemas` is a sequence of `TableSchema`, one per table: `kind`, `name`,
   `columns` (`ColumnSchema`: `name`, `sql_type`, `type_name`, `length`,
   `nullable`, `default`, `primary_key`), `indexes` (`IndexSchema`: `name`,
-  `columns`, `method`) and `steps` (`MigrationStep`: `number`, and the SQL
-  `statements` in the order they run, each safe to run again). The columns and
-  indexes are the table's shape after every step. Read the structure instead of
+  `columns`, `method`) and `steps` (`MigrationStep`: `number`, the SQL
+  `statements` in the order they run, each safe to run again, and `objects`,
+  a `StepObjects` with `creates_table` and the `columns` and `indexes` the
+  step creates). The columns and indexes are the table's shape after every
+  step. Read the structure instead of
   parsing SQL; to emit SQL, reuse `render_sql` or the steps' statements as they
   are.
 - `options` is a `FormatOptions`: `transaction` and `lock` (`False` with
@@ -641,9 +644,8 @@ add_taskiq_tables("app:scheduler")
 
 ### Alembic
 
-For autogenerate, put the tables in `target_metadata`. Alembic then proposes
-them for a database that lacks them, and nothing once they exist, whatever
-created them:
+Import `taskiq_postgresql.contrib.alembic` in `env.py` and put the tables in
+`target_metadata`:
 
 ```python
 # alembic/env.py
@@ -654,8 +656,56 @@ from taskiq_postgresql.contrib.alembic import taskiq_metadata
 target_metadata = [Base.metadata, taskiq_metadata("app:scheduler")]
 ```
 
+Importing the module registers an autogenerate hook. `alembic revision
+--autogenerate` then reads which migration steps the database lacks and writes
+each one into the revision as `op.execute(...)` calls that hold the step's
+SQL: the statements `run_migrations=True` and `generate` run, the advisory
+lock first. On an empty database that is every step; on a database 0.4.x set
+up, only the step that adds the broker's `channel` and `not_before`; on an
+up-to-date one, nothing. The SQL is written out, so the revision never imports
+this package and keeps doing the same thing after you upgrade it. Its
+`downgrade()` leaves the steps in place: they only add columns and indexes,
+which an earlier release ignores. The hook takes the place of the
+`create_table`, `add_column` and `create_index` Alembic would write for these
+tables and keeps everything else, so a column whose type differs from the
+description still shows up.
+
 If your models' metadata already holds the tables, as after
-`add_taskiq_tables` above, `target_metadata = Base.metadata` is enough.
+`add_taskiq_tables` above, import the module for its hook and keep your
+metadata:
+
+```python
+# alembic/env.py
+import taskiq_postgresql.contrib.alembic  # noqa: F401  (the autogenerate hook)
+from myapp.models import Base
+
+target_metadata = Base.metadata
+```
+
+`alembic check` runs autogenerate without writing a revision, and fails while
+the database lacks a step that no revision adds, with
+`New upgrade operations detected: [('taskiq_postgresql_step', 'taskiq_messages', 1), ...]`.
+Run it in CI against an empty database that only Alembic migrates, so that a
+step a release adds fails the build until a revision brings it:
+
+```bash
+alembic upgrade head
+alembic check
+```
+
+Autogenerate compares the revisions with the database it connects to. If
+workers with `run_migrations=True` already ran a step there, as on a shared
+development database, the step exists and the revision leaves it out; a
+production database that only Alembic migrates then never gets it. Generate
+revisions against a database that only Alembic migrates, or run the workers
+with `run_migrations=False` wherever Alembic owns the schema; `alembic check`
+in CI catches what slips through.
+
+The lock each step takes holds until Alembic commits, and workers that start
+meanwhile wait for it. With the default `transaction_per_migration=False`
+that is the end of `alembic upgrade`; pass
+`context.configure(..., transaction_per_migration=True)` to commit after each
+revision instead.
 
 If the workers keep `run_migrations=True` and Alembic should leave the tables
 alone, keep them out of `target_metadata` and filter them out instead;
@@ -669,20 +719,26 @@ include_object = exclude_taskiq_tables("app:scheduler")
 ```
 
 Pass it as `context.configure(..., include_object=include_object)`. It hides
-the tables, their columns and their indexes. Alembic does not compare
-sequences, so the broker's sequence needs no filter. If you already have an
-`include_object`, include an object only when both do.
+the tables, their columns and their indexes, from Alembic and from the hook.
+Alembic does not compare sequences, so the broker's sequence needs no filter.
+If you already have an `include_object`, include an object only when both do.
 
-To create the tables in a revision of your own, call `create_taskiq_tables`
-from `upgrade()`. It runs the statements that `generate` prints, one at a time
-and in the revision's transaction, so the advisory lock holds until Alembic
-commits; `alembic upgrade --sql` prints them:
+An autogenerated revision names the tables as they were where it was
+generated. When the names come from settings that differ between
+environments, write the revision by hand with `upgrade_taskiq_tables`. It runs
+the steps of each table up to the step `through` names, one statement at a
+time and in the revision's transaction. A released step never changes, so the
+revision runs the same SQL whatever release is installed; when a release adds
+a step, add a revision with the new `through`. Every table in a call must have
+that step, so tables with different numbers of steps take separate calls
+(`[step.number for step in table_schema("broker").steps]` lists them):
 
 ```python
 # alembic/versions/taskiq_tables.py
 from alembic import op
 
-from taskiq_postgresql.contrib.alembic import create_taskiq_tables
+from myapp.settings import QUEUE
+from taskiq_postgresql.contrib.alembic import upgrade_taskiq_tables
 from taskiq_postgresql.migrations import table_schema
 
 revision = "taskiq_tables"
@@ -690,11 +746,16 @@ down_revision = None
 
 
 def upgrade() -> None:
-    create_taskiq_tables(
+    upgrade_taskiq_tables(
         op,
-        table_schema("broker"),
-        table_schema("result_backend"),
-        table_schema("scheduler_source"),
+        table_schema("broker", table_name=f"{QUEUE}_messages"),
+        through=2,
+    )
+    upgrade_taskiq_tables(
+        op,
+        table_schema("result_backend", table_name=f"{QUEUE}_results"),
+        table_schema("scheduler_source", table_name=f"{QUEUE}_schedulers"),
+        through=1,
     )
 
 
@@ -702,11 +763,11 @@ def downgrade() -> None:
     pass
 ```
 
-Describing the tables by component kind keeps the revision from importing
-your application; pass `table_name` and `field_for_task_id` if you changed
-them. This revision runs the statements of the installed release each time it
-runs. `generate --format alembic` writes a revision file that holds the
-statements of the release that generated it instead:
+Pass `field_for_task_id` too if you changed it. `alembic upgrade --sql` prints
+the statements instead of running them.
+
+Without autogenerate, `generate --format alembic` writes a revision file with
+every step of each table, as autogenerate writes it for an empty database:
 
 ```bash
 taskiq postgresql generate app:scheduler --format alembic --option revision=taskiq_tables > alembic/versions/taskiq_tables.py
@@ -719,14 +780,13 @@ The format takes these options:
   give the same id.
 - `down_revision`: the revision it follows, usually your current head. By
   default there is none: it is a first revision.
-- `downgrade`: `none` (the default) leaves `downgrade()` empty; `drop` makes it
-  drop the tables with `DROP TABLE IF EXISTS`.
+- `downgrade`: `none` (the default) leaves the tables in place; `drop` makes
+  `downgrade()` drop them with `DROP TABLE IF EXISTS`.
 
 The file has no `BEGIN` or `COMMIT`, because Alembic runs each revision in its
 own transaction, so `--no-transaction` changes nothing; `--no-lock` leaves
-out the lock. Any other option, or a value the format does not accept, exits
-with 2. Every statement only adds what is missing, so when an upgrade changes
-the tables, add a revision with the new statements.
+out the locks. Any other option, or a value the format does not accept, exits
+with 2.
 
 ## Compatibility
 

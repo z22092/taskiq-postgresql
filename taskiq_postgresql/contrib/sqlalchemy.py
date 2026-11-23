@@ -7,6 +7,10 @@ come from the description in ``taskiq_postgresql.migrations``, the one
 the same columns, types, defaults, primary key and indexes, under the same
 names, and Alembic's autogenerate finds nothing to change on a database that
 ``run_migrations=True`` set up.
+
+The metadata also keeps the table descriptions themselves, under
+``metadata.info[METADATA_INFO_KEY]``: that is where
+``taskiq_postgresql.contrib.alembic`` finds the migration steps.
 """
 
 from __future__ import annotations
@@ -47,7 +51,14 @@ from taskiq_postgresql.migrations import (
 if TYPE_CHECKING:
     from sqlalchemy.types import TypeEngine
 
-__all__ = ["add_taskiq_tables", "taskiq_metadata"]
+__all__ = ["METADATA_INFO_KEY", "add_taskiq_tables", "taskiq_metadata"]
+
+METADATA_INFO_KEY: Final = "taskiq_postgresql"
+"""
+The ``MetaData.info`` key of the table descriptions, a tuple of
+``TableSchema``: Alembic documents ``info`` as the place where autogenerate
+hooks find what they compare.
+"""
 
 _TYPES: Final[Mapping[TypeName, Callable[[ColumnSchema], TypeEngine[Any]]]] = {
     # SQLAlchemy writes SERIAL for an integer primary key that autoincrements.
@@ -79,7 +90,8 @@ def add_taskiq_tables(
     indexes ``run_migrations=True`` creates, under the names PostgreSQL gives
     them, so ``metadata.create_all`` builds the same catalog. A table the
     metadata already holds under the same name is reused when SQLAlchemy would
-    create it with the same DDL.
+    create it with the same DDL. The descriptions go to
+    ``metadata.info[METADATA_INFO_KEY]``, each table once.
 
     Args:
         metadata: The metadata to add the tables to, for example
@@ -103,10 +115,15 @@ def add_taskiq_tables(
         AttributeError: if a path's module has no such object.
     """
     tables: list[Table] = []
+    described = {
+        schema.name: schema for schema in metadata.info.get(METADATA_INFO_KEY, ())
+    }
     for schema in _schemas(targets, app_dir):
         table = _add(metadata, schema)
+        described.setdefault(schema.name, schema)
         if all(table is not kept for kept in tables):
             tables.append(table)
+    metadata.info[METADATA_INFO_KEY] = tuple(described.values())
     return tables
 
 

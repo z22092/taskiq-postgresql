@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import alembic as alembic_package
 import asyncpg
 import pytest
 from sqlalchemy import create_engine
@@ -56,6 +57,7 @@ from taskiq.serializers import JSONSerializer, MSGPackSerializer
 from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend, migrations
 from taskiq_postgresql.cli import PostgresqlCMD
 from taskiq_postgresql.contrib.alembic import alembic_format
+from taskiq_postgresql.contrib.sqlalchemy import add_taskiq_tables
 from taskiq_postgresql.migrations import (
     FormatOptions,
     migration_statements,
@@ -1031,31 +1033,48 @@ def test_when_the_sqlalchemy_examples_run__then_their_metadata_creates_the_table
             SQLModel.metadata.remove(SQLModel.metadata.tables[name])
 
 
-def test_when_the_alembic_env_examples_run__then_autogenerate_agrees(
+def _steps_diffs(schemas: list[migrations.TableSchema]) -> list[tuple[str, str, int]]:
+    """What autogenerate reports for ``schemas`` on an empty database."""
+    return [
+        ("taskiq_postgresql_step", schema.name, step.number)
+        for schema in sorted(schemas, key=lambda table: table.name)
+        for step in schema.steps
+    ]
+
+
+@pytest.mark.alembic
+def test_when_the_alembic_env_examples_run__then_autogenerate_writes_the_steps(
     project: Path,
     scratch_dsn: str,
     ca_file: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with_metadata, with_filter, _ = _section_blocks(ALEMBIC_SECTION)
+    with_metadata, with_hook, with_filter, _ = _section_blocks(ALEMBIC_SECTION)
 
     class Base(DeclarativeBase):
         """Stands for the application's models: there are none."""
 
+    class TablesBase(DeclarativeBase):
+        """The models' base after ``add_taskiq_tables``, as the README shows."""
+
+    add_taskiq_tables(TablesBase.metadata, "app:scheduler")
     models = types.ModuleType("myapp.models")
-    models.Base = Base  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "myapp", types.ModuleType("myapp"))
     monkeypatch.setitem(sys.modules, "myapp.models", models)
 
+    models.Base = Base  # type: ignore[attr-defined]
     target_metadata = _run_block(with_metadata, ca_file)["target_metadata"]
     include_object = _run_block(with_filter, ca_file)["include_object"]
+    models.Base = TablesBase  # type: ignore[attr-defined]
+    hooked = _run_block(with_hook, ca_file)["target_metadata"]
 
-    proposed = autogenerate(scratch_dsn, target_metadata)
-    assert {diff[1].name for diff in proposed if diff[0] == "add_table"} == (
-        DEFAULT_TABLES
-    )
+    steps = _steps_diffs(_default_schemas())
+    assert autogenerate(scratch_dsn, target_metadata) == steps
+    assert hooked is TablesBase.metadata
+    assert autogenerate(scratch_dsn, hooked) == steps
     asyncio.run(run_script(scratch_dsn, "asyncpg", render_sql(_default_schemas())))
     assert autogenerate(scratch_dsn, target_metadata) == []
+    assert autogenerate(scratch_dsn, hooked) == []
     # Left out of target_metadata, the tables would be dropped; the filter
     # keeps them.
     dropped = autogenerate(scratch_dsn, Base.metadata)
@@ -1065,25 +1084,136 @@ def test_when_the_alembic_env_examples_run__then_autogenerate_agrees(
     assert autogenerate(scratch_dsn, Base.metadata, include_object=include_object) == []
 
 
+# The env.py the CI test runs: the README's env.py lines, then Alembic's usual
+# online run. The URL comes from the environment, never from a file.
+_CHECK_ENV_PY = """\
+import os
+
+from alembic import context
+from sqlalchemy import create_engine, pool
+
+{readme_lines}
+
+engine = create_engine(os.environ["TASKIQ_TEST_ALEMBIC_URL"], poolclass=pool.NullPool)
+with engine.connect() as connection:
+    context.configure(connection=connection, target_metadata=target_metadata)
+    with context.begin_transaction():
+        context.run_migrations()
+"""
+
+
+@pytest.mark.alembic
+@pytest.mark.timeout(180)
+def test_when_the_alembic_check_lines_run__then_a_missing_step_fails_them(
+    project: Path,
+    scratch_dsn: str,
+) -> None:
+    with_metadata, *_ = _section_blocks(ALEMBIC_SECTION)
+    lines = [
+        line.split()
+        for line in _shell_lines(ALEMBIC_SECTION)
+        if line.startswith("alembic ")
+    ]
+    assert lines == [["alembic", "upgrade", "head"], ["alembic", "check"]]
+    (project / "myapp").mkdir()
+    (project / "myapp" / "__init__.py").write_text("", encoding="utf-8")
+    (project / "myapp" / "models.py").write_text(
+        "from sqlalchemy.orm import DeclarativeBase\n\n\n"
+        "class Base(DeclarativeBase):\n    pass\n",
+        encoding="utf-8",
+    )
+    (project / "alembic.ini").write_text(
+        "[alembic]\nscript_location = %(here)s/alembic\n",
+        encoding="utf-8",
+    )
+    (project / "alembic" / "versions").mkdir(parents=True)
+    (project / "alembic" / "env.py").write_text(
+        _CHECK_ENV_PY.format(readme_lines=with_metadata.source),
+        encoding="utf-8",
+    )
+    template = Path(alembic_package.__file__).parent / "templates" / "generic"
+    (project / "alembic" / "script.py.mako").write_text(
+        (template / "script.py.mako").read_text(encoding="utf-8"),
+        encoding="utf-8",
+    )
+    environment = {
+        **_environment(scratch_dsn),
+        "TASKIQ_TEST_ALEMBIC_URL": sqlalchemy_url(scratch_dsn).render_as_string(
+            hide_password=False,
+        ),
+    }
+
+    def run(arguments: list[str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603
+            [sys.executable, "-m", *arguments],
+            cwd=project,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=SCRIPT_TIMEOUT,
+            check=False,
+        )
+
+    behind = [run(line) for line in lines]
+    revision = run(["alembic", "revision", "--autogenerate", "-m", "taskiq tables"])
+    migrated = [run(line) for line in lines]
+
+    upgraded, checked = behind
+    assert upgraded.returncode == 0, upgraded.stderr
+    assert checked.returncode != 0
+    message = (
+        "New upgrade operations detected: "
+        "[('taskiq_postgresql_step', 'taskiq_messages', 1)"
+    )
+    assert message in checked.stdout + checked.stderr
+    assert message in _readme_text()
+    assert revision.returncode == 0, revision.stderr
+    assert [result.returncode for result in migrated] == [0, 0], [
+        result.stdout + result.stderr for result in migrated
+    ]
+    assert asyncio.run(_tables(scratch_dsn)) == {*DEFAULT_TABLES, "alembic_version"}
+
+
+@pytest.mark.alembic
 def test_when_the_alembic_revision_examples_run__then_they_create_the_tables(
     project: Path,
     scratch_dsn: str,
     ca_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     *_, revision_block = _section_blocks(ALEMBIC_SECTION)
-    statements = migration_statements(_default_schemas())
+    settings = types.ModuleType("myapp.settings")
+    settings.QUEUE = "staging"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "myapp", types.ModuleType("myapp"))
+    monkeypatch.setitem(sys.modules, "myapp.settings", settings)
+    broker, *others = [
+        table_schema(kind, table_name=f"staging_{suffix}")
+        for kind, suffix in zip(
+            migrations.COMPONENT_KINDS,
+            ("messages", "results", "schedulers"),
+            strict=True,
+        )
+    ]
+    staging = {"staging_messages", "staging_results", "staging_schedulers"}
 
     revision = _run_block(revision_block, ca_file)
 
     assert (revision["revision"], revision["down_revision"]) == ("taskiq_tables", None)
     assert offline_sql(revision["upgrade"]) == "".join(
-        f"{statement};\n\n" for statement in statements
+        f"{statement};\n\n"
+        for statement in [
+            *migration_statements([broker], through=2),
+            *migration_statements(others, through=1),
+        ]
     )
     for _ in range(2):
         run_upgrade(scratch_dsn, "psycopg", revision["upgrade"])
-    assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
+    assert asyncio.run(_tables(scratch_dsn)) == staging
+    asyncio.run(_drop_tables(scratch_dsn, staging))
 
-    (line,) = [line for line in _shell_lines(ALEMBIC_SECTION) if line.strip()]
+    (line,) = [
+        line for line in _shell_lines(ALEMBIC_SECTION) if line.startswith("taskiq ")
+    ]
     command, _, target = line.partition(" > ")
     result = subprocess.run(  # noqa: S603
         _taskiq(command.split()),
@@ -1104,6 +1234,5 @@ def test_when_the_alembic_revision_examples_run__then_they_create_the_tables(
     written.write_text(result.stdout, encoding="utf-8")
     generated: dict[str, Any] = {"__name__": "revision"}
     exec(compile(result.stdout, str(written), "exec"), generated)  # noqa: S102
-    asyncio.run(_drop_tables(scratch_dsn, DEFAULT_TABLES))
     run_upgrade(scratch_dsn, "psycopg", generated["upgrade"])
     assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
