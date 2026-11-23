@@ -17,6 +17,63 @@ Upgrading from 0.4.x:
   a number of seconds; they load unchanged. `get_schedules()` now skips, with a
   warning in the log, any stored schedule it cannot read: check the log after
   upgrading and fix or delete the rows it names.
+- The broker's table gets two columns, `channel` and `not_before`, and an
+  index on them. With `run_migrations=True`, `startup()` adds them, and so do
+  `taskiq postgresql migrate` and the script `taskiq postgresql generate`
+  prints. Otherwise run this once per broker table before deploying (shown for
+  the default `taskiq_messages`):
+
+  ```sql
+  ALTER TABLE taskiq_messages
+    ADD COLUMN IF NOT EXISTS channel VARCHAR,
+    ADD COLUMN IF NOT EXISTS not_before TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW();
+  CREATE INDEX IF NOT EXISTS taskiq_messages_not_before_idx
+    ON taskiq_messages (channel, not_before, id);
+  ```
+
+  Without it, `kick()` fails with
+  `column "channel" of relation "taskiq_messages" does not exist`, and the
+  workers of this version deliver nothing from the table. Each of them logs
+  a failed sweep every `poll_interval`
+  (`Error claiming a due message on channel ...`) and, for every NOTIFY a
+  0.4.x producer sends, a failed claim of that message
+  (`Error claiming message <id> on channel ...`). `ADD COLUMN` does not
+  rewrite the table, but `CREATE INDEX` blocks writes to it while it builds.
+  On a large table, run the upgrade before deploying even with
+  `run_migrations=True`: the `ALTER TABLE` first, then, outside a transaction,
+  `CREATE INDEX CONCURRENTLY IF NOT EXISTS taskiq_messages_not_before_idx ON taskiq_messages (channel, not_before, id);`.
+  `startup()` then finds the columns and the index and runs no DDL. A role
+  that cannot run DDL on the table fails `startup()` with
+  `run_migrations=True` until this SQL has run; after that it starts without
+  DDL.
+- Privileges: a role that sends tasks needs `INSERT` and `SELECT` on the
+  broker's table (the `INSERT` returns the new id) and `USAGE` on its
+  `<table_name>_id_seq` sequence. A worker needs `SELECT`, `UPDATE` and
+  `DELETE` on it. `UPDATE` is new: the sweep locks the row it claims
+  `FOR UPDATE`, which needs it, while a 0.4.x worker only deleted by id. Grant
+  it before deploying the workers, for example
+  `GRANT UPDATE ON taskiq_messages TO <worker_role>;`. `run_migrations=True`
+  needs DDL privileges only until the columns and the index exist.
+- Rows stored before the upgrade, or by a 0.4.x producer at any time, have no
+  channel (`channel IS NULL`). The sweep never takes them; only the NOTIFY of
+  their id delivers them, which a 0.4.x producer sends, so a row whose NOTIFY
+  reached no worker stays in the table until you hand it to a channel. To
+  review them:
+  `SELECT id, task_name, created_at FROM taskiq_messages WHERE channel IS NULL;`
+  To hand them to the workers of a channel:
+  `UPDATE taskiq_messages SET channel = '<channel_name>' WHERE channel IS NULL;`
+  Their `not_before` is the time of the upgrade or of their insert, so the
+  next sweep delivers them at once, whatever their `delay` label said.
+- Rollout order: run the SQL above, or start once with `run_migrations=True`,
+  before starting the workers of this version. Run the `UPDATE` above after
+  the last 0.4.x producer stops, since until then it keeps storing rows
+  without a channel.
+- While 0.4.x and this version run side by side, a 0.4.x worker delivers the
+  messages this version kicks without a delay, but never a delayed one, which
+  gets no NOTIFY: keep at least one worker of this version on each channel.
+- Downgrading to 0.4.x: the columns and the index can stay, 0.4.x ignores
+  them. Delayed messages stored by this version and not delivered yet stay in
+  the table, because 0.4.x delivers only the ids it is notified of.
 
 ### Added
 
@@ -26,10 +83,16 @@ Upgrading from 0.4.x:
   removed, and reads a numeric `cron_offset` (written under pydantic v1) as
   seconds, which taskiq 0.13 would reject.
 - `pydantic>=2.5,<3` as a runtime dependency, the floor taskiq 0.13 requires.
+- `PostgresqlBroker(poll_interval=1.0)`: the seconds between two sweeps of
+  `listen()` for due messages. A running worker that keeps up with its
+  messages claims a delayed one within about this long after it is due. A
+  value that is not a finite number of seconds above zero, or a `bool`, raises
+  `ValueError`.
 - `taskiq postgresql generate` prints the SQL script that creates the tables
-  and indexes, with your table names and `field_for_task_id`, so you can run
-  it yourself (`psql -f`) or add it to Alembic, Django or Flyway
-  (`--no-transaction`). It reads the components from your application
+  and indexes and adds the broker's `channel` and `not_before` columns, so it
+  also upgrades a broker table 0.4.x created. It uses your table names and
+  `field_for_task_id`, so you can run it yourself (`psql -f`) or add it to
+  Alembic, Django or Flyway (`--no-transaction`). It reads the components from your application
   (`app:broker`, `app:scheduler`, as `taskiq worker` does) or, without
   importing it, from `--component`. The script takes the same advisory lock as
   `run_migrations=True` and is safe to run again.
@@ -80,6 +143,37 @@ Upgrading from 0.4.x:
   schema, `SELECT`, `INSERT`, `UPDATE` and `DELETE` on the tables and `USAGE`
   on the broker's sequence can now start with it; every start used to need
   `CREATE` on the schema and ownership of the table.
+- `PostgresqlBroker.kick()` stores, in one `INSERT`, the broker's channel and
+  the time the message is due, computed by the server as `NOW()` plus the
+  `delay` label. It sends a NOTIFY only for a message due at once and no
+  longer schedules a timer on the event loop for a delayed one. When that
+  NOTIFY fails after the `INSERT`, `kick()` logs a warning and returns instead
+  of raising, because the message is stored and the next sweep delivers it; a
+  caller that retried used to send it twice. An error on the `INSERT` is
+  still raised, and nothing is sent again.
+- `PostgresqlBroker.listen()` claims the due messages of its channel, earliest
+  due first, when it starts and then every `poll_interval`, however many
+  NOTIFYs arrive in between, besides the ids it is notified of. A notified id
+  is claimed only once it is due, and only if its row belongs to the broker's
+  channel or to none. Delivery stays at most once: a claimed row is deleted
+  before the task runs.
+- When reading the LISTEN connection ends or fails, `listen()` keeps
+  delivering through the sweep alone for the rest of that call; the
+  connection is opened again only when the broker starts again. With asyncpg
+  and psycopg it logs one warning when that happens. psqlpy's listener gives
+  no sign that its connection ended, so with psqlpy nothing is logged, and the
+  sweep still delivers. A failed claim is logged and tried again at the next
+  sweep. `listen()` returns as soon as `shutdown()` starts, so its sweep does
+  not reopen the pool `shutdown()` closes.
+- With `run_migrations=True`, the startup check that skips the DDL also
+  requires the broker's `channel` and `not_before` columns and their index.
+- The listen drivers (`ListenDriver` subclasses) yield each NOTIFY payload as
+  the `str` the server sent, and the broker reads the message id from it; the
+  bundled drivers used to convert it to `int`. A custom listen driver must
+  yield the payload unparsed.
+- A custom `QueryDriver` must implement `fetch_row(query, *values)`, which
+  returns the first row of a query as a `dict`, or `None`. The broker builds
+  its claim queries itself and runs them through it.
 
 ### Fixed
 
@@ -106,11 +200,28 @@ Upgrading from 0.4.x:
   `min_size=1, max_size=1`). The migration used to hold one connection while it
   waited for a second: asyncpg waited with no timeout, psycopg until its pool
   timeout.
+- A delayed message (a `delay` label, `@broker.task(delay=...)` or
+  `SmartRetryMiddleware`) is delivered even when the process that sent it
+  exits before the delay ends. Its NOTIFY used to come from a timer in that
+  process, so the row stayed in the table for good.
+- A message sent by this version whose NOTIFY reached no worker, because none
+  was listening or the LISTEN connection was down, is delivered by the next
+  sweep; it used to stay in the table.
+- A NOTIFY on the broker's channel whose payload is not a message id is
+  skipped with a warning, and the NOTIFYs after it are still delivered. The
+  drivers parsed the payload in their NOTIFY callback and raised `ValueError`
+  there, so the warning `listen()` logs for such a payload never ran.
+- `taskiq worker` stops on SIGINT or SIGTERM while no message arrives. With the
+  asyncpg and psqlpy drivers its worker processes used to keep running until a
+  message arrived (with asyncpg, until its connection pool's idle timer fired
+  about five minutes later), and the main process waited for them.
 
 ### Removed
 
 - Python 3.9.
 - pydantic v1 support.
+- `QueryDriver.delete_returning()` and `DeleteReturningQuery`, which nothing
+  uses since the broker claims rows through `fetch_row()`.
 - **BREAKING:** the default `dsn` of `PostgresqlBroker`,
   `PostgresqlResultBackend` and `PostgresqlSchedulerSource`, which embedded a
   user name and password for a server on localhost. `dsn` is now a required

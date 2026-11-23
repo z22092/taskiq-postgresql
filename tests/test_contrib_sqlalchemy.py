@@ -328,7 +328,10 @@ def test_names_are_the_ones_postgresql_gives_an_unquoted_name() -> None:
 
     assert table.name == "jobs"
     assert table.primary_key.name == "jobs_pkey"
-    assert [index.name for index in table.indexes] == ["jobs_id_idx"]
+    assert sorted(index.name for index in table.indexes) == [
+        "jobs_id_idx",
+        "jobs_not_before_idx",
+    ]
 
 
 def test_long_names_are_shortened_as_postgresql_shortens_them() -> None:

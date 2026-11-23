@@ -53,6 +53,17 @@ WITHOUT_DRIVERS = (
     "runpy.run_module('taskiq', run_name='__main__', alter_sys=True)\n"
 )
 
+# Runs taskiq's own entry point with the warnings raised outside this package
+# ignored, for the tests that check stderr is empty: on the lowest dependency
+# versions, pydantic 2.5 warns about typing_extensions on import, which says
+# nothing about this package. A warning this package raises still shows.
+WITHOUT_DEPENDENCY_WARNINGS = (
+    "import runpy, sys, warnings\n"
+    "warnings.filterwarnings('ignore', module=r'(?!taskiq_postgresql(\\.|$))')\n"
+    "sys.argv = ['taskiq', *sys.argv[1:]]\n"
+    "runpy.run_module('taskiq', run_name='__main__', alter_sys=True)\n"
+)
+
 APP = """\
 import os
 
@@ -98,6 +109,12 @@ GOLDEN_BROKER = (
     "created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());\n"
     "CREATE INDEX IF NOT EXISTS taskiq_messages_id_idx ON taskiq_messages "
     "USING HASH (id);\n"
+    "ALTER TABLE taskiq_messages\n"
+    "  ADD COLUMN IF NOT EXISTS channel VARCHAR,\n"
+    "  ADD COLUMN IF NOT EXISTS not_before TIMESTAMP WITH TIME ZONE NOT NULL "
+    "DEFAULT NOW();\n"
+    "CREATE INDEX IF NOT EXISTS taskiq_messages_not_before_idx\n"
+    "  ON taskiq_messages (channel, not_before, id);\n"
     "COMMIT;\n"
 )
 
@@ -132,13 +149,15 @@ def taskiq(
     cwd: Optional[Path] = None,
     dsn: str = UNUSED_DSN,
     without_drivers: bool = False,
+    without_dependency_warnings: bool = False,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``taskiq *args`` with this interpreter, as a user would."""
-    command = (
-        [sys.executable, "-c", WITHOUT_DRIVERS, *args]
-        if without_drivers
-        else [sys.executable, "-m", "taskiq", *args]
-    )
+    if without_drivers:
+        command = [sys.executable, "-c", WITHOUT_DRIVERS, *args]
+    elif without_dependency_warnings:
+        command = [sys.executable, "-c", WITHOUT_DEPENDENCY_WARNINGS, *args]
+    else:
+        command = [sys.executable, "-m", "taskiq", *args]
     return subprocess.run(  # noqa: S603
         command,
         cwd=cwd,
@@ -221,7 +240,13 @@ def test_taskiq_finds_the_command() -> None:
 
 
 def test_generate_prints_the_script_of_a_component_without_the_app() -> None:
-    result = taskiq("postgresql", "generate", "--component", "broker")
+    result = taskiq(
+        "postgresql",
+        "generate",
+        "--component",
+        "broker",
+        without_dependency_warnings=True,
+    )
 
     assert result.returncode == 0, result.stderr
     assert result.stdout == golden(GOLDEN_BROKER)
@@ -259,6 +284,7 @@ def test_generate_reads_the_tables_from_the_application(
         "--app-dir",
         str(app_dir),
         cwd=tmp_path,
+        without_dependency_warnings=True,
     )
 
     assert result.returncode == 0, result.stderr

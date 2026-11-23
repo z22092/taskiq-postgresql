@@ -3,7 +3,7 @@ from asyncio import Queue as AsyncQueue
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncIterator, Optional, Sequence, Union
+from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
 from uuid import UUID
 
 from psycopg import AsyncConnection, AsyncCursor, AsyncRawCursor, Notify
@@ -12,7 +12,7 @@ from psycopg_pool import AsyncConnectionPool
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
-from taskiq_postgresql.abc.query import Column
+from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.drivers._json import dumps
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
@@ -33,6 +33,8 @@ class PsycopgDriver(QueryDriver):
         created_at: Optional[Column] = None,
         index_columns: Optional[Sequence[Column]] = None,
         run_migrations: bool = False,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the backend."""
@@ -44,6 +46,8 @@ class PsycopgDriver(QueryDriver):
             created_at,
             index_columns,
             run_migrations,
+            added_columns,
+            added_indexes,
             **connection_kwargs,
         )
 
@@ -168,25 +172,15 @@ class PsycopgDriver(QueryDriver):
                     return next(iter(value))
             return None
 
-    async def delete_returning(
-        self,
-        where_column: Column,
-        value: Any,
-        returning: Sequence[Column],
-    ) -> Optional[dict[str, Any]]:
-        """Atomically delete a row and return requested columns."""
+    async def fetch_row(self, query: str, *values: Any) -> Optional[dict[str, Any]]:
+        """Return the first row of ``query``, see ``QueryDriver.fetch_row``."""
         async with self, self.connection() as connection:
             cursor = connection.cursor(row_factory=dict_row)
-            cursor = await cursor.execute(
-                self.delete_returning_query.make_query(where_column, returning),
-                params=self.__parser_params([where_column], [value]),
-            )
-            if cursor.rownumber is not None:
-                row = await cursor.fetchone()
-                if row is not None:
-                    # row is already a dict thanks to dict_row
-                    return {column.name: row[column.name] for column in returning}
-            return None
+            cursor = await cursor.execute(query, params=values)
+            # A statement without a result set, such as one with no RETURNING.
+            if cursor.rownumber is None:
+                return None
+            return await cursor.fetchone()
 
     async def select(
         self,
@@ -250,9 +244,15 @@ class PsycopgDriver(QueryDriver):
                 connection.transaction(),
             ):
                 cursor: AsyncCursor[TupleRow] = await connection.execute(
-                    self.relations_exist_query.make_query(self.index_columns),
-                    params=self.relations_exist_query.relation_names(
+                    self.relations_exist_query.make_query(
                         self.index_columns,
+                        added_columns=self.added_columns,
+                        added_indexes=self.added_indexes,
+                    ),
+                    params=self.relations_exist_query.params(
+                        self.index_columns,
+                        added_columns=self.added_columns,
+                        added_indexes=self.added_indexes,
                     ),
                 )
                 exists = await cursor.fetchone()
@@ -266,6 +266,13 @@ class PsycopgDriver(QueryDriver):
                 if self.index_columns is not None:
                     await connection.execute(
                         self.create_index_query.make_query(self.index_columns),
+                    )
+                if self.added_columns or self.added_indexes:
+                    await connection.execute(
+                        self.add_columns_query.make_query(
+                            self.added_columns,
+                            self.added_indexes,
+                        ),
                     )
 
     async def on_shutdown(self) -> None:
@@ -297,7 +304,7 @@ class PsycopgListenDriver(ListenDriver):
     ) -> None:
         """Initialize the listen driver."""
         super().__init__(connection_string, channel_name, **connection_kwargs)
-        self._queue: AsyncQueue[int] = AsyncQueue()
+        self._queue: AsyncQueue[str] = AsyncQueue()
 
     async def on_startup(self) -> None:
         """On startup."""
@@ -334,13 +341,14 @@ class PsycopgListenDriver(ListenDriver):
             **payload**: the payload.
         """
         if self._queue is not None:
-            self._queue.put_nowait(int(notify.payload))
+            # Unparsed, see ListenDriver.__aiter__.
+            self._queue.put_nowait(notify.payload)
 
-    async def __aiter__(self) -> AsyncIterator[Any]:
+    async def __aiter__(self) -> AsyncGenerator[str, None]:
         """Iterate over the queue."""
         async for notify in self.connection.notifies():
             yield notify.payload
 
         while not self.connection.closed:
-            message_id = await self._queue.get()
-            yield message_id
+            payload = await self._queue.get()
+            yield payload
