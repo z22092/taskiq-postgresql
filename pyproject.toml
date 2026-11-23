@@ -63,15 +63,30 @@ psqlpy = [
 psycopg = [
     "psycopg[binary,pool]>=3.2.9,<3.4",
 ]
+# The integrations in taskiq_postgresql.contrib. Each extra names sqlalchemy
+# itself, so its range is this package's whichever extra brings it.
+sqlalchemy = [
+    "sqlalchemy>=2.0.36,<2.1",
+]
+sqlmodel = [
+    "sqlalchemy>=2.0.36,<2.1",
+    "sqlmodel>=0.0.22,<0.1",
+]
+alembic = [
+    "alembic>=1.14.0,<1.21",
+    "sqlalchemy>=2.0.36,<2.1",
+]
 
 # `taskiq postgresql ...`: taskiq loads every taskiq_cli entry point.
 [project.entry-points.taskiq_cli]
 postgresql = "taskiq_postgresql.cli:PostgresqlCMD"
 
 # The formats `taskiq postgresql generate --format` can render; other packages
-# add theirs to the same group.
+# add theirs to the same group. A format's optional dependencies are the extra
+# named after it.
 [project.entry-points."taskiq_postgresql.migration_formats"]
 sql = "taskiq_postgresql.migrations:sql_format"
+alembic = "taskiq_postgresql.contrib.alembic:alembic_format"
 
 
 [build-system]
