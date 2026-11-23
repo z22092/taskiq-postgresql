@@ -444,11 +444,14 @@ class PostgresqlBroker(AsyncBroker):
         the sweep of listen(), so it does not depend on this process. A failed
         NOTIFY is logged as a warning, and the sweep delivers that message.
 
-        :param message: Message to send.
-        :raises ValueError: if the ``delay`` label is not a finite number of
-            seconds; nothing is stored then.
-        :raises Exception: whatever the driver raises for the INSERT; the
-            message is not stored then, and not sent again.
+        Args:
+            message: Message to send.
+
+        Raises:
+            ValueError: if the ``delay`` label is not a finite number of
+                seconds; nothing is stored then.
+            Exception: whatever the driver raises for the INSERT; the
+                message is not stored then, and not sent again.
         """
         # Parsed before the insert, so an invalid delay stores nothing.
         delay_value = message.labels.get("delay")
@@ -515,7 +518,8 @@ class PostgresqlBroker(AsyncBroker):
         and psycopg only), is logged and tried again at the next sweep.
         listen() ends once shutdown() starts.
 
-        :yields: AckableMessage instances.
+        Yields:
+            AckableMessage instances.
         """
         loop = get_running_loop()
         stopping = self._stopping
@@ -672,8 +676,13 @@ class PostgresqlBroker(AsyncBroker):
         """
         Run one claim; log a failure instead of raising, so listen() goes on.
 
-        :param what: the claimed message, as the log names it.
-        :return: the message, or None if no row matched or the claim failed.
+        Args:
+            what: the claimed message, as the log names it.
+            query: the claim query, run through ``fetch_row``.
+            values: the query's bind parameters.
+
+        Returns:
+            The message, or None if no row matched or the claim failed.
         """
         try:
             # Not cancelled from here: asyncpg and psycopg bound the claim by
