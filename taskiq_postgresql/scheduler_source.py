@@ -130,7 +130,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
         self,
         dsn: Dsn,
         table_name: str = "taskiq_schedulers",
-        driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
+        driver: Literal["asyncpg", "psqlpy", "psycopg"] = "asyncpg",
         startup_schedule: Optional[dict[str, list[dict[str, Any]]]] = None,
         broker: Optional[AsyncBroker] = None,
         run_migrations: bool = False,

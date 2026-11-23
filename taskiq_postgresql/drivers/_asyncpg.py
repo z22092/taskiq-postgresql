@@ -6,16 +6,15 @@ from contextlib import asynccontextmanager
 from datetime import date, datetime
 from functools import partial
 from types import TracebackType
-from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
-from uuid import UUID
+from typing import Any, AsyncGenerator, Optional, Sequence, Union
 
 from asyncpg import Connection, Pool, connect, create_pool
-from asyncpg.transaction import Transaction
+from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.drivers._health import check_listen
-from taskiq_postgresql.drivers._json import dumps
+from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 logger = logging.getLogger(__name__)
@@ -27,8 +26,7 @@ _NOT_FETCHED: Any = object()
 class AsyncpgDriver(QueryDriver):
     """Asyncpg backend."""
 
-    pool: Pool = None
-    transaction: Transaction = None
+    pool: Optional[Pool] = None
 
     def __init__(
         self,
@@ -57,39 +55,27 @@ class AsyncpgDriver(QueryDriver):
             **connection_kwargs,
         )
 
-    def __parser_query(
-        self,
-        columns: Sequence[Column],
-        values: Sequence[Any],
-    ) -> list[Any]:
-        """Parser query.
-
-        Args:
-            columns (Sequence[Column]): Columns to parse.
-            values (Sequence[Any]): Values to parse.
-
-        Returns:
-            list[Any]: Parsed values.
-        """
-        if not values:
-            return []
-
-        if not columns:
-            return values
-
-        new_values = [*values]
-
-        for index, (column, value) in enumerate(zip(columns, values, strict=True)):
-            if column.type.upper() == "JSONB" and isinstance(value, dict):
-                new_values[index] = dumps(value)
-
-            if column.type.upper() == "UUID" and isinstance(value, UUID):
-                new_values[index] = value.hex
-
-        return new_values
-
     @asynccontextmanager
-    async def connection(self) -> AsyncIterator[Connection]:
+    async def connection(self) -> AsyncGenerator[Connection, None]:
+        """
+        Borrow a connection from the pool for the duration of the block.
+
+        The pool only exists after ``async with driver``, so the query methods
+        enter that first; refusing here keeps a stray call from opening a pool
+        nobody closes.
+
+        Yields:
+            A pooled asyncpg connection, released when the block ends.
+
+        Raises:
+            DatabaseConnectionError: if the pool is not open.
+            asyncio.TimeoutError: if no connection is free within
+                ``query_timeout``.
+        """
+        if self.pool is None:
+            raise DatabaseConnectionError(
+                "The pool is not open: enter `async with driver` first.",
+            )
         # The acquire timeout is also the budget asyncpg gives a cancelled
         # query to finish before it terminates the connection; without one, a
         # connection that never answers keeps the release, and its caller,
@@ -97,7 +83,7 @@ class AsyncpgDriver(QueryDriver):
         async with self.pool.acquire(timeout=self.query_timeout) as connection:
             yield connection
 
-    async def __aenter__(self) -> Connection:
+    async def __aenter__(self) -> Self:
         """Enter the context manager."""
         try:
             if self.pool is None:
@@ -127,7 +113,7 @@ class AsyncpgDriver(QueryDriver):
         async with self, self.connection() as connection:
             return await connection.fetchval(
                 self.insert_query.make_query(columns, returning),
-                *self.__parser_query(columns, values),
+                *encode_params(columns, values),
             )
 
     async def insert_or_update(
@@ -148,7 +134,7 @@ class AsyncpgDriver(QueryDriver):
                         on_conflict_columns,
                         on_conflict_update_columns=on_conflict_update_columns,
                     ),
-                    *self.__parser_query(columns, values),
+                    *encode_params(columns, values),
                 ),
             )
 
@@ -191,7 +177,7 @@ class AsyncpgDriver(QueryDriver):
         async with self, self.connection() as connection:
             rows = await connection.fetch(
                 self.select_query.make_query(columns, where_columns),
-                *self.__parser_query(where_columns, where_values or ()),
+                *encode_params(where_columns, where_values or ()),
             )
 
             return [
@@ -276,7 +262,7 @@ class AsyncpgDriver(QueryDriver):
         finally:
             self.pool = None
 
-    async def execute(self, query: str, *values: Any) -> str:
+    async def execute(self, query: str, *values: Any) -> list[Any]:
         """Execute a query."""
         async with self, self.connection() as connection:
             return await connection.fetch(query, *values)

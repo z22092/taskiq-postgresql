@@ -16,7 +16,7 @@ def get_db_listen_driver(
         "PsqlpyListenDriver",
         "PsycopgListenDriver",
     ]
-]:  # type: ignore
+]:
     """Get the database driver."""
     try:
         if driver == "asyncpg":

@@ -56,6 +56,11 @@ _T = TypeVar("_T")
 
 logger = getLogger("taskiq.asyncpg_broker")
 
+# The most characters of an invalid NOTIFY payload that a log line shows.
+_MAX_LOGGED_PAYLOAD = 64
+# The ids a SERIAL primary key gives, the broker table's id column.
+_MIN_MESSAGE_ID = 1
+_MAX_MESSAGE_ID = 2_147_483_647
 # The ceilings of the first wait before reopening LISTEN and of the longest.
 _FIRST_WAIT = 0.5
 _LONGEST_WAIT = 30.0
@@ -121,9 +126,24 @@ def _parse_message_id(payload: str) -> Optional[int]:
     """Return the message id a NOTIFY carries, or None if it is not one."""
     # The only place a payload is parsed: the drivers yield it unparsed.
     try:
-        return int(payload)
+        message_id = int(payload)
     except ValueError:
         return None
+    # Out of the id column's range, a claim matches no row or fails on the
+    # server, whose error would log the whole payload with a traceback.
+    if not _MIN_MESSAGE_ID <= message_id <= _MAX_MESSAGE_ID:
+        return None
+    return message_id
+
+
+def _payload_excerpt(payload: str) -> str:
+    """Return ``payload`` as a log line may carry it: quoted, cut if long."""
+    # Any role with CONNECT can NOTIFY the channel, and a payload can hold
+    # close to 8 KB, so a log line must not carry it whole.
+    excerpt = repr(payload[:_MAX_LOGGED_PAYLOAD])
+    if len(payload) > _MAX_LOGGED_PAYLOAD:
+        excerpt += f" (truncated, {len(payload)} characters)"
+    return excerpt
 
 
 async def _ack() -> None:
@@ -224,7 +244,7 @@ class PostgresqlBroker(AsyncBroker):
         field_for_task_id: Literal["VarChar", "Text", "Uuid"] = "Uuid",
         channel_name: str = "taskiq",
         table_name: str = "taskiq_messages",
-        driver: Literal["asyncpg", "psqlpy", "psycopg", "pg8000"] = "asyncpg",
+        driver: Literal["asyncpg", "psqlpy", "psycopg"] = "asyncpg",
         max_retry_attempts: int = 5,
         connection_kwargs: dict[str, Any] | None = None,
         pool_kwargs: dict[str, Any] | None = None,
@@ -432,11 +452,14 @@ class PostgresqlBroker(AsyncBroker):
         the sweep of listen(), so it does not depend on this process. A failed
         NOTIFY is logged as a warning, and the sweep delivers that message.
 
-        :param message: Message to send.
-        :raises ValueError: if the ``delay`` label is not a finite number of
-            seconds; nothing is stored then.
-        :raises Exception: whatever the driver raises for the INSERT; the
-            message is not stored then, and not sent again.
+        Args:
+            message: Message to send.
+
+        Raises:
+            ValueError: if the ``delay`` label is not a finite number of
+                seconds; nothing is stored then.
+            Exception: whatever the driver raises for the INSERT; the
+                message is not stored then, and not sent again.
         """
         # Parsed before the insert, so an invalid delay stores nothing.
         delay_value = message.labels.get("delay")
@@ -503,7 +526,8 @@ class PostgresqlBroker(AsyncBroker):
         and psycopg only), is logged and tried again at the next sweep.
         listen() ends once shutdown() starts.
 
-        :yields: AckableMessage instances.
+        Yields:
+            AckableMessage instances.
         """
         loop = get_running_loop()
         stopping = self._stopping
@@ -587,8 +611,8 @@ class PostgresqlBroker(AsyncBroker):
                 message_id = _parse_message_id(payload)
                 if message_id is None:
                     logger.warning(
-                        "Invalid NOTIFY payload %r on channel %s",
-                        payload,
+                        "Invalid NOTIFY payload %s on channel %s",
+                        _payload_excerpt(payload),
                         self.channel_name,
                     )
                 else:
@@ -660,8 +684,13 @@ class PostgresqlBroker(AsyncBroker):
         """
         Run one claim; log a failure instead of raising, so listen() goes on.
 
-        :param what: the claimed message, as the log names it.
-        :return: the message, or None if no row matched or the claim failed.
+        Args:
+            what: the claimed message, as the log names it.
+            query: the claim query, run through ``fetch_row``.
+            values: the query's bind parameters.
+
+        Returns:
+            The message, or None if no row matched or the claim failed.
         """
         try:
             # Not cancelled from here: asyncpg and psycopg bound the claim by

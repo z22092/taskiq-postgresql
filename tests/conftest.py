@@ -1,7 +1,10 @@
 import os
 import random
+import signal
 import string
-from typing import AsyncGenerator, Generator, TypeVar
+import time
+from types import FrameType
+from typing import AsyncGenerator, Generator, Optional, TypeVar
 from urllib.parse import urlsplit
 
 import pytest
@@ -46,9 +49,43 @@ def selected_postgres_major() -> str:
     return os.environ.get("TEST_POSTGRES_MAJOR") or DEFAULT_POSTGRES_MAJOR
 
 
+# make and uv both pass a SIGTERM on, so one stop can reach pytest two or
+# three times within moments.
+SIGTERM_COPIES_WITHIN = 1.0
+
+
+class _InterruptOnSigterm:
+    """
+    Raise ``KeyboardInterrupt`` on the first SIGTERM; end the process on a later one.
+
+    The copies of the first SIGTERM that ``make`` and ``uv`` pass on are
+    ignored, since a second interrupt would cut the teardown short. A SIGTERM
+    after them means the interrupt did not stop the run (a background task
+    can catch it), so it gets the default action, which ends the process.
+    """
+
+    def __init__(self) -> None:
+        self.first_at: Optional[float] = None
+
+    def __call__(self, signum: int, frame: Optional[FrameType]) -> None:
+        now = time.monotonic()
+        if self.first_at is None:
+            self.first_at = now
+            raise KeyboardInterrupt
+        if now - self.first_at < SIGTERM_COPIES_WITHIN:
+            return
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
+        signal.raise_signal(signal.SIGTERM)
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """
     Reject an unsupported ``TEST_POSTGRES_MAJOR`` once, before any test runs.
+
+    Also turns SIGTERM into the ``KeyboardInterrupt`` that SIGINT raises. A
+    process killed by SIGTERM skips fixture teardown, which leaves the
+    PostgreSQL container running when Ryuk is disabled (``make test-lowest``
+    forwards its own SIGTERM this way).
 
     :raises pytest.UsageError: when the value is not a supported major.
     """
@@ -58,6 +95,7 @@ def pytest_configure(config: pytest.Config) -> None:
             f"TEST_POSTGRES_MAJOR={major!r} is not supported; "
             f"use one of {sorted(POSTGRES_IMAGES, key=int)}",
         )
+    signal.signal(signal.SIGTERM, _InterruptOnSigterm())
 
 
 @pytest.fixture(scope="session")
@@ -103,8 +141,15 @@ def postgresql_dsn() -> Generator[str, None, None]:
         return
 
     # The DSN is built from the credentials the container itself holds.
-    with PostgresContainer(POSTGRES_IMAGES[selected_postgres_major()]) as container:
+    container = PostgresContainer(POSTGRES_IMAGES[selected_postgres_major()])
+    # start() inside the try: an interrupt while it waits for the server to
+    # accept connections would otherwise skip the stop of an already created
+    # container, which nothing else removes when Ryuk is disabled.
+    try:
+        container.start()
         yield container.get_connection_url(driver=None)
+    finally:
+        container.stop()
 
 
 @pytest.fixture

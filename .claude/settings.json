@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "Bash(make)",
+      "Bash(make help)",
+      "Bash(make typecheck)",
+      "Bash(make test)",
+      "Bash(make pins)",
+      "Bash(uv run --no-sync pytest)",
+      "Bash(uv run --no-sync pytest tests/unit)",
+      "Bash(uv run --no-sync pytest -k asyncpg)",
+      "Bash(uv run --no-sync pytest -k psqlpy)",
+      "Bash(uv run --no-sync pytest -k psycopg)",
+      "Bash(uv run --no-sync ty check)",
+      "Bash(uv run --no-sync ruff check)",
+      "Bash(uv run --no-sync ruff format --check)",
+      "Bash(uv lock --check)",
+      "Bash(git status)",
+      "Bash(git status --short)",
+      "Bash(git diff)",
+      "Bash(git diff --cached)",
+      "Bash(git diff --stat)",
+      "Bash(git log --oneline -20)",
+      "Bash(git show --stat HEAD)",
+      "Bash(git branch --show-current)"
+    ],
+    "deny": [
+      "Bash(uv publish:*)",
+      "Bash(twine:*)",
+      "Bash(uv run twine:*)",
+      "Bash(uvx twine:*)",
+      "Bash(python -m twine:*)",
+      "Bash(git push --tags:*)",
+      "Bash(git push --follow-tags:*)",
+      "Bash(git push origin --tags:*)",
+      "Bash(gh release:*)",
+      "Bash(gh workflow run:*)",
+      "Read(./.env)",
+      "Read(./.env.*)"
+    ]
+  }
+}

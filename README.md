@@ -167,7 +167,7 @@ once, at startup, for all three components and all drivers; if it returns
 | `field_for_task_id` | `"VarChar"`, `"Text"` or `"Uuid"` | `"Uuid"` | SQL type of the `task_id` column. |
 | `channel_name` | `str` | `"taskiq"` | `LISTEN`/`NOTIFY` channel, also stored with each message: a worker's sweep takes only the messages of its own channel. Use a different one per queue that shares a database. |
 | `table_name` | `str` | `"taskiq_messages"` | Table that holds pending messages. |
-| `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. `"pg8000"` is in the type annotation but raises `ValueError`. |
+| `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. |
 | `max_retry_attempts` | `int` | `5` | Accepted for compatibility, currently unused. |
 | `connection_kwargs` | `dict` or `None` | `None` | Keyword arguments for the driver's pool and for its `LISTEN` connection, so each option must be valid for both. |
 | `pool_kwargs` | `dict` or `None` | `None` | Accepted for compatibility, currently unused. Use `connection_kwargs`. |

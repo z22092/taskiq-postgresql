@@ -67,7 +67,10 @@ def resolve_dsn(dsn: Dsn, component: str) -> str:
         TypeError: if the callable returns ``None``, a non-string, or an
             empty or blank string.
     """
-    if not callable(dsn):
+    # Tested as a str, not as a non-callable: a str subclass could be
+    # callable, so only this test tells a type checker the other branch
+    # holds the Callable[[], str].
+    if isinstance(dsn, str):
         return dsn
     value = dsn()
     if _is_blank(value):

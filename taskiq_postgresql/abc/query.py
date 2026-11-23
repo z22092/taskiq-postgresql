@@ -1,17 +1,12 @@
-from abc import ABC, abstractmethod
 from typing import Any, Final, Literal, NamedTuple, Optional, Sequence
 
 
-class QueryBase(ABC):
+class QueryBase:
     """Base class for all queries."""
 
     def __init__(self, table_name: str) -> None:
         """Initialize the query."""
         self.table_name = table_name
-
-    @abstractmethod
-    def make_query(self, *values: Any) -> str:
-        """Return the query as a string."""
 
 
 class Column(QueryBase):
@@ -240,7 +235,7 @@ class InsertQuery(QueryBase):
         )
 
 
-class InsertOrUpdateQuery(InsertQuery):
+class InsertOrUpdateQuery(QueryBase):
     """Query to insert or update a row into a table."""
 
     def __init__(self, table_name: str) -> None:
@@ -250,18 +245,19 @@ class InsertOrUpdateQuery(InsertQuery):
     def make_query(
         self,
         columns: Sequence[Column],
-        returning: Sequence[Column],
+        returning: Optional[Sequence[Column]],
         on_conflict_columns: Sequence[Column],
         on_conflict_action: Literal["UPDATE", "NOTHING"] = "UPDATE",
         on_conflict_update_columns: Optional[Sequence[Column]] = None,
     ) -> str:
         """Return the query as a string."""
-        insert_query = super().make_query(columns)
+        insert_query = InsertQuery(self.table_name).make_query(columns)
         returning_query = (
             f" RETURNING {', '.join(column.name for column in returning)}"
             if returning is not None
             else ""
         )
+        conflict_query = ", ".join(column.name for column in on_conflict_columns)
         if on_conflict_action == "UPDATE":
             if on_conflict_update_columns is None:
                 raise ValueError(
@@ -273,14 +269,11 @@ class InsertOrUpdateQuery(InsertQuery):
                 f"{column.name} = EXCLUDED.{column.name}"
                 for column in on_conflict_update_columns
             )
-            conflict_query = ", ".join(column.name for column in on_conflict_columns)
             update_query = f"ON CONFLICT ({conflict_query}) DO UPDATE SET {set_query}"
             return f"{insert_query} {update_query} {returning_query}"
 
-        return (
-            f"{insert_query} ON CONFLICT ({', '.join(on_conflict_columns)}) DO NOTHING"
-            + returning_query
-        )
+        nothing_query = f"ON CONFLICT ({conflict_query}) DO NOTHING"
+        return f"{insert_query} {nothing_query}{returning_query}"
 
 
 class DeleteQuery(QueryBase):
