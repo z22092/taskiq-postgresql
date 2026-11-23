@@ -64,6 +64,15 @@ psycopg = [
     "psycopg[binary,pool]>=3.2.9,<3.4",
 ]
 
+# `taskiq postgresql ...`: taskiq loads every taskiq_cli entry point.
+[project.entry-points.taskiq_cli]
+postgresql = "taskiq_postgresql.cli:PostgresqlCMD"
+
+# The formats `taskiq postgresql generate --format` can render; other packages
+# add theirs to the same group.
+[project.entry-points."taskiq_postgresql.migration_formats"]
+sql = "taskiq_postgresql.migrations:sql_format"
+
 
 [build-system]
 # Pinned with sha256 in build-constraint-dependencies under [tool.uv].

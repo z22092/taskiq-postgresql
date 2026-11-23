@@ -76,6 +76,42 @@ async def drop_database(dsn: str, name: str) -> None:
     await _execute_on_server(dsn, f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
 
 
+async def run_script(dsn: str, driver: str, script: str) -> None:
+    """
+    Run a whole SQL script in one call, through ``driver``'s own library.
+
+    This is how a generated script reaches the server from a tool: one simple
+    query with every statement in it, including the script's own ``BEGIN`` and
+    ``COMMIT``.
+    """
+    if driver == "asyncpg":
+        import asyncpg  # noqa: PLC0415
+
+        connection = await asyncpg.connect(dsn)
+        try:
+            await connection.execute(script)
+        finally:
+            await connection.close()
+    elif driver == "psycopg":
+        import psycopg  # noqa: PLC0415
+
+        # Autocommit, so the script's BEGIN opens the only transaction.
+        async with await psycopg.AsyncConnection.connect(
+            dsn,
+            autocommit=True,
+        ) as connection:
+            await connection.execute(script)
+    else:
+        import psqlpy  # noqa: PLC0415
+
+        pool = psqlpy.ConnectionPool(dsn)
+        try:
+            async with pool.acquire() as connection:
+                await connection.execute_batch(script)
+        finally:
+            pool.close()
+
+
 async def drop_and_shutdown(
     component: Union[
         PostgresqlResultBackend[_ReturnType],

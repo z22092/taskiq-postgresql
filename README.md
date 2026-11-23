@@ -79,8 +79,9 @@ created by 0.4.x. Processes that start at the same time, such as the two that
 they create the tables one after the other. Once the tables, indexes and
 columns exist, startup only checks for them, so the application's role needs no
 `CREATE` privilege from then on ([Privileges](#privileges)). `run_migrations`
-is off by default; you can leave it off and create the tables yourself, using
-the layout in [Database schema](#database-schema).
+is off by default; you can leave it off and create the tables yourself, with
+`taskiq postgresql migrate` or the SQL that `taskiq postgresql generate` prints
+(see [Migrations](#migrations)).
 
 Start a worker. It claims a message as soon as the message's `NOTIFY` arrives,
 and it also sweeps the table for due messages when it starts and every
@@ -389,8 +390,8 @@ from the environment or a secret store, or pass a callable as `dsn`.
 
 With `run_migrations=True` the package runs this SQL, shown with the default
 table names and `field_for_task_id="Uuid"`. A test builds the same statements
-from the code and compares them with these blocks. To create the tables
-yourself, run them with your own names.
+from the code and compares them with these blocks. `taskiq postgresql generate`
+prints them for your own names (see [Migrations](#migrations)).
 
 The broker (`taskiq_messages`):
 
@@ -456,6 +457,210 @@ and `USAGE` on its `taskiq_messages_id_seq` sequence. A worker needs `SELECT`,
 the row it claims with `FOR UPDATE SKIP LOCKED`. A worker that also sends
 tasks, for example through `SmartRetryMiddleware`, needs both sets.
 
+## Migrations
+
+There are three ways to create the tables and their indexes:
+
+- `run_migrations=True`, as in the quickstart: each process creates what is
+  missing when it starts.
+- `taskiq postgresql migrate`, once per deploy before the workers start, for
+  example in a release job. The workers then run with `run_migrations=False`.
+- `taskiq postgresql generate`, which prints the SQL so that you run it
+  yourself or hand it to your migration tool.
+
+Both commands take the `module:object` paths that `taskiq worker` and
+`taskiq scheduler` take, and `--app-dir` like them. A broker brings its result
+backend when that is a `PostgresqlResultBackend`, and a `TaskiqScheduler`
+brings its broker and its `PostgresqlSchedulerSource` sources; a table named
+twice is created once. The commands import your module but start nothing:
+`generate` never connects, and `migrate` connects only to create the tables,
+with each component's own DSN and driver. The exit status is 0 on success, 1 on
+an error or when a path holds no component of this package, and 2 on a usage
+error.
+
+### Generate the SQL
+
+```bash
+taskiq postgresql generate app:scheduler > taskiq_tables.sql
+psql "$POSTGRESQL_URL" -v ON_ERROR_STOP=1 -f taskiq_tables.sql
+```
+
+Only the script goes to standard output; messages go to standard error. The
+script starts with a comment that names the package version and the tables,
+then runs in one transaction: it sets a lock timeout for that transaction,
+takes, per table, the advisory lock `run_migrations=True` takes, then creates
+each table and index with `IF NOT EXISTS` and adds the broker's `channel` and
+`not_before` columns and their index the same way, which also upgrades a
+broker table created by 0.4.x. The statements are the ones in
+[Database schema](#database-schema), with your table names and
+`field_for_task_id`.
+
+The script is idempotent: a second run changes nothing, and the advisory lock
+lets it run while workers with `run_migrations=True` are starting. It is not
+lock-free. On a live database it locks the tables even when nothing is
+missing: `CREATE INDEX` waits for every open transaction that wrote to the
+table, and `ALTER TABLE` for every open transaction that used it, before they
+find that the index or the column exists, and every later query on the
+table, the producers' `INSERT` included, waits behind the `ALTER TABLE`. So
+the script starts with `SET LOCAL lock_timeout = '10s'`: a statement that
+waits that long for a lock, the advisory lock included, fails, and the whole
+script rolls back instead of stalling the broker. Run it again once the long
+transaction has ended. `--lock-timeout SECONDS` sets another limit;
+`--lock-timeout 0` leaves the statement out, so the session's own
+`lock_timeout` applies (PostgreSQL's default, 0, waits for ever).
+`taskiq postgresql migrate` checks first and runs no DDL when every table,
+column and index exists, so it takes no table lock on a database that is
+already up to date.
+
+To generate without importing the application, for example where its settings
+are not available, name one component per call. `--table-name` and
+`--field-for-task-id` default to the component's own defaults:
+
+```bash
+taskiq postgresql generate --component broker --table-name taskiq_messages --field-for-task-id Uuid
+```
+
+`--no-transaction` leaves out `BEGIN` and `COMMIT`, and `--no-lock` the lock.
+Without `BEGIN`, `SET LOCAL lock_timeout` is the first statement and lasts
+until the transaction that runs the script ends; outside a transaction
+PostgreSQL ignores it with a warning.
+`--format` picks another output format, when a package has installed one (see
+[Writing a migration format](#writing-a-migration-format)), and
+`--option KEY=VALUE` passes options to it.
+
+### Apply it with migrate
+
+```bash
+taskiq postgresql migrate app:scheduler
+```
+
+`migrate` runs the code `run_migrations=True` runs at startup, whatever the
+components set, then closes its connections. It does not start the broker, so
+nothing listens, and it inserts no `startup_schedule`. To create what is
+missing, the role it connects with needs `CREATE` on the schema, and must own
+a table to add a missing index to it.
+
+From then on the workers can run with `run_migrations=False` and a role that
+only reads and writes rows. With the default table names:
+
+```sql
+GRANT USAGE ON SCHEMA public TO taskiq_worker;
+GRANT SELECT, INSERT, UPDATE, DELETE ON taskiq_messages, taskiq_results, taskiq_schedulers TO taskiq_worker;
+GRANT USAGE ON SEQUENCE taskiq_messages_id_seq TO taskiq_worker;
+```
+
+Such a role can also keep `run_migrations=True`: once every table and index
+exists, startup only checks for them.
+
+### Alembic, Django and Flyway
+
+These tools run each migration in a transaction of their own, so give them the
+script without `BEGIN` and `COMMIT`. The lock and the lock timeout stay, and
+last until their transaction ends. For Flyway, write the script as a versioned
+migration, with the next free version number:
+
+```bash
+taskiq postgresql generate app:scheduler --no-transaction > db/migration/V2__taskiq_tables.sql
+```
+
+In an Alembic migration, build the script with the Python API. Describing the
+tables by component kind keeps the migration from importing your application;
+pass `table_name` and `field_for_task_id` if you changed them:
+
+```python
+from alembic import op
+
+from taskiq_postgresql.migrations import render_sql, table_schema
+
+
+def upgrade() -> None:
+    op.execute(
+        render_sql(
+            [
+                table_schema("broker"),
+                table_schema("result_backend"),
+                table_schema("scheduler_source"),
+            ],
+            transaction=False,
+        ),
+    )
+```
+
+In Django, pass the same string to `migrations.RunSQL` in a migration of your
+own. A Flyway file holds the SQL of the release that generated it, while the
+Alembic example renders the SQL of the installed release each time it runs.
+Either way the script only adds what is missing, so when an upgrade changes
+the tables (the changelog says so), add a new migration with the new script.
+
+### Writing a migration format
+
+`--format NAME` loads the callable registered as `NAME` in the
+`taskiq_postgresql.migration_formats` entry-point group. This package registers
+`sql`; another package adds a format in its own `pyproject.toml`:
+
+```toml
+[project.entry-points."taskiq_postgresql.migration_formats"]
+tables = "my_package.formats:render"
+```
+
+The callable takes the tables and the options, and returns the text that
+`generate` prints. This one lists the tables in Markdown:
+
+```python
+from collections.abc import Sequence
+
+from taskiq_postgresql.migrations import (
+    FormatOptions,
+    MigrationFormatOptionError,
+    TableSchema,
+)
+
+
+def render(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
+    """List each table's columns and indexes in Markdown."""
+    unknown = sorted(set(options.extra) - {"title"})
+    if unknown:
+        raise MigrationFormatOptionError(f"unknown options: {', '.join(unknown)}")
+    lines = [f"# {options.extra.get('title', 'taskiq tables')}"]
+    for table in schemas:
+        lines.append(f"## {table.name} ({table.kind})")
+        for column in table.columns:
+            null = "null" if column.nullable else "not null"
+            lines.append(f"- `{column.name}`: {column.type_name}, {null}")
+        for index in table.indexes:
+            columns = ", ".join(index.columns)
+            lines.append(f"- index `{index.name}`: {index.method} on {columns}")
+    return "\n".join(lines) + "\n"
+```
+
+The contract:
+
+- `schemas` is a sequence of `TableSchema`, one per table: `kind`, `name`,
+  `columns` (`ColumnSchema`: `name`, `sql_type`, `type_name`, `length`,
+  `nullable`, `default`, `primary_key`), `indexes` (`IndexSchema`: `name`,
+  `columns`, `method`) and `steps` (`MigrationStep`: `number`, and the SQL
+  `statements` in the order they run, each idempotent). The columns and
+  indexes are the table's shape after every step, except that `indexes` leaves
+  out the primary key's own index, which `CREATE TABLE` creates and
+  PostgreSQL names (`taskiq_messages_pkey` for `taskiq_messages`). Read the
+  structure instead of parsing SQL; to emit SQL, reuse `render_sql` or the
+  steps' statements as they are.
+- `options` is a `FormatOptions`: `transaction` and `lock` (`False` with
+  `--no-transaction` and `--no-lock`), `lock_timeout` (the seconds of
+  `--lock-timeout`, 10 by default, 0 for none), and `extra`, the
+  `--option KEY=VALUE` pairs. Raise `MigrationFormatOptionError` for an option
+  the format does not accept; `generate` then exits with 2.
+- When the format needs an optional dependency, import it at module level and
+  put it in an extra named after the format. If the import fails, `generate`
+  tells the user to run `pip install '<your-package>[<format>]'`. Listing the
+  formats loads none of them.
+- Pick a name no other package uses. When several installed packages register
+  one name, `generate` refuses it, exits with 2 and names the packages. A name
+  this package registers, such as `sql`, always loads this package's own
+  format, so no other package can replace it.
+
+All these names are importable from `taskiq_postgresql.migrations`.
+
 ## Compatibility
 
 - **Python and dependencies**: the supported Python versions are the
@@ -483,7 +688,8 @@ It is the only upgrade guide.
   environment variable that is not set. For an empty string the message says
   `got ''`.
 - `relation "..." does not exist`: the tables are missing. Start once with
-  `run_migrations=True`, or create them with the layout above.
+  `run_migrations=True`, or create them as described in
+  [Migrations](#migrations).
 - `ImportError: ... is not installed`: install the extra for the driver you
   selected, for example `pip install "taskiq-postgresql[psycopg]"`.
 - `DatabaseConnectionError` on startup: the DSN, the network path or TLS

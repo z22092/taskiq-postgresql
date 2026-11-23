@@ -18,9 +18,10 @@ Upgrading from 0.4.x:
   warning in the log, any stored schedule it cannot read: check the log after
   upgrading and fix or delete the rows it names.
 - The broker's table gets two columns, `channel` and `not_before`, and an
-  index on them. With `run_migrations=True`, `startup()` adds them. Otherwise
-  run this once per broker table before deploying (shown for the default
-  `taskiq_messages`):
+  index on them. With `run_migrations=True`, `startup()` adds them, and so do
+  `taskiq postgresql migrate` and the script `taskiq postgresql generate`
+  prints. Otherwise run this once per broker table before deploying (shown for
+  the default `taskiq_messages`):
 
   ```sql
   ALTER TABLE taskiq_messages
@@ -87,6 +88,28 @@ Upgrading from 0.4.x:
   messages claims a delayed one within about this long after it is due. A
   value that is not a finite number of seconds above zero, or a `bool`, raises
   `ValueError`.
+- `taskiq postgresql generate` prints the SQL script that creates the tables
+  and indexes and adds the broker's `channel` and `not_before` columns, so it
+  also upgrades a broker table 0.4.x created. It uses your table names and
+  `field_for_task_id`, so you can run it yourself (`psql -f`) or add it to
+  Alembic, Django or Flyway (`--no-transaction`). It reads the components from your application
+  (`app:broker`, `app:scheduler`, as `taskiq worker` does) or, without
+  importing it, from `--component`. The script takes the same advisory lock as
+  `run_migrations=True` and is idempotent. It still locks the tables when
+  nothing is missing, so on a live database it starts with
+  `SET LOCAL lock_timeout = '10s'` and fails after that long without a lock
+  instead of stalling the broker; `--lock-timeout SECONDS` changes the limit
+  and `--lock-timeout 0` leaves it out. `migrate` runs no DDL when everything
+  exists.
+- `taskiq postgresql migrate` creates the tables once, with the code
+  `run_migrations=True` runs, whatever the components set. Run it before the
+  workers, which can then use `run_migrations=False` and a role that only reads
+  and writes rows.
+- `taskiq_postgresql.migrations` describes the tables as data (`table_schema`,
+  `collect_schemas`) and renders the script (`render_sql`), for tools that
+  build their own migrations. Other packages can add output formats to
+  `generate --format` through the `taskiq_postgresql.migration_formats` entry
+  point group; the README has the contract.
 - `PostgresqlBroker(health_check_interval=30.0, query_timeout=30.0)`. When the
   LISTEN connection stays silent for `health_check_interval` seconds (with
   psycopg, every `health_check_interval` seconds), the worker sends the same

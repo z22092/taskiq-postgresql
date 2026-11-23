@@ -132,6 +132,19 @@ A concurrent startup waits for the commit, and its `IF NOT EXISTS` then finds
 the objects. The lock key stays the same across releases, so two versions in a
 rolling deploy also wait for each other.
 
+`taskiq_postgresql/migrations.py` describes each table twice, from the same
+builders: as columns and indexes (`TableSchema`), and as the ordered
+statements `on_startup` runs (`MigrationStep`: step 1 is `CREATE TABLE` and
+its indexes; step 2, on the broker's table only, the added columns and their
+index). `taskiq postgresql
+generate` (`cli.py`) renders the steps as a script for another migration tool,
+with the same advisory lock and, by default, a `SET LOCAL lock_timeout` first,
+so that a run against a live database fails instead of queueing behind open
+transactions. `taskiq postgresql migrate` runs the migration of
+`run_migrations=True` once. `tests/test_migration_script.py` checks that the
+steps are the statements the drivers build for `on_startup` and that the
+script builds the catalog `on_startup` builds.
+
 | Table | Columns | Indexes |
 |---|---|---|
 | `taskiq_messages` | `id SERIAL` (PK), `task_id` (type from `field_for_task_id`), `task_name VARCHAR`, `message BYTEA`, `labels JSONB`, `created_at`; added: `channel VARCHAR`, `not_before TIMESTAMP WITH TIME ZONE` | hash on `id`; added: btree `taskiq_messages_not_before_idx` on `(channel, not_before, id)` |
