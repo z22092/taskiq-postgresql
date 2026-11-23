@@ -5,10 +5,13 @@ import base64
 import hashlib
 import hmac
 import secrets
-from typing import TYPE_CHECKING, AsyncGenerator, Optional, Union
+import uuid
+from contextlib import asynccontextmanager
+from typing import TYPE_CHECKING, AsyncGenerator, AsyncIterator, Optional, Union
 from urllib.parse import urlsplit
 
 import pytest
+from taskiq import BrokerMessage
 
 from taskiq_postgresql.abc import query as sql_builders
 from taskiq_postgresql.abc.query import Column
@@ -32,6 +35,16 @@ COMPONENTS = ["broker", "result_backend", "scheduler_source"]
 # only serialize their migrations if both take this exact lock.
 MIGRATION_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))"
 MIGRATION_LOCK_NAMESPACE = "taskiq_postgresql"
+
+# The broker's table and index exactly as 0.4.x creates them, before the
+# claim columns existed.
+BROKER_TABLE_0_4_SQL = (
+    "CREATE TABLE {table} (id SERIAL NOT NULL PRIMARY KEY, "
+    "task_id Uuid NOT NULL, task_name VARCHAR NOT NULL, message BYTEA NOT NULL, "
+    "labels JSONB NOT NULL, "
+    "created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());"
+    "CREATE INDEX {table}_id_idx ON {table} USING HASH (id);"
+)
 
 # The smallest pool each driver accepts. psqlpy refuses fewer than two
 # connections, so the one-connection case only exists for asyncpg and psycopg.
@@ -122,6 +135,26 @@ async def admin(postgresql_dsn: str) -> AsyncGenerator[Connection, None]:
     await connection.close()
 
 
+async def claim_schema(admin: Connection, table: str) -> tuple[list[str], bool]:
+    """
+    Tell which claim columns ``table`` has and whether their index exists.
+
+    :return: the names of the claim columns present, sorted, and whether the
+        index on them exists.
+    """
+    columns = await admin.fetch(
+        "SELECT attname::text FROM pg_attribute WHERE attrelid = to_regclass($1) "
+        "AND attname IN ('channel', 'not_before') AND NOT attisdropped "
+        "ORDER BY attname",
+        table,
+    )
+    index_exists = await admin.fetchval(
+        "SELECT to_regclass($1) IS NOT NULL",
+        f"{table}_not_before_idx",
+    )
+    return [column[0] for column in columns], index_exists
+
+
 async def count_tables(admin: Connection, table: str) -> int:
     return await admin.fetchval(
         "SELECT count(*) FROM pg_class WHERE relname = $1 AND relkind = 'r'",
@@ -178,6 +211,86 @@ def test_fast_path_checks_the_table_and_every_index_it_creates() -> None:
     )
     for index_name in names[1:]:
         assert f"CREATE INDEX IF NOT EXISTS {index_name} ON jobs " in create_index
+
+
+def test_only_the_broker_adds_columns_to_an_existing_table() -> None:
+    broker = PostgresqlBroker(dsn="unused").driver
+    result_backend = PostgresqlResultBackend(dsn="unused").driver
+    scheduler_source = PostgresqlSchedulerSource(dsn="unused").driver
+
+    assert [column.name for column in broker.added_columns] == ["channel", "not_before"]
+    assert [
+        (index.name, [column.name for column in index.columns])
+        for index in broker.added_indexes
+    ] == [("taskiq_messages_not_before_idx", ["channel", "not_before", "id"])]
+    for driver in (result_backend, scheduler_source):
+        assert (tuple(driver.added_columns), tuple(driver.added_indexes)) == ((), ())
+
+
+def test_fast_path_also_checks_the_claim_columns_and_their_index() -> None:
+    driver = PostgresqlBroker(dsn="unused", table_name="jobs").driver
+    index_columns = [Column("id", "SERIAL")]
+    fast_path = sql_builders.RelationsExistQuery("jobs")
+    add_claim_columns = driver.add_columns_query.make_query(
+        driver.added_columns,
+        driver.added_indexes,
+    )
+    added = {
+        "added_columns": driver.added_columns,
+        "added_indexes": driver.added_indexes,
+    }
+
+    names = fast_path.relation_names(
+        index_columns,
+        added_indexes=driver.added_indexes,
+    )
+
+    assert names == ["jobs", "jobs_id_idx", "jobs_not_before_idx"]
+    assert fast_path.params(index_columns, **added) == [
+        *names,
+        "channel",
+        "not_before",
+    ]
+    assert fast_path.make_query(index_columns, **added) == (
+        "SELECT to_regclass($1) IS NOT NULL"
+        " AND to_regclass($2) IS NOT NULL"
+        " AND to_regclass($3) IS NOT NULL"
+        " AND EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1)"
+        " AND attname::text = $4 AND NOT attisdropped)"
+        " AND EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1)"
+        " AND attname::text = $5 AND NOT attisdropped)"
+    )
+    assert f"CREATE INDEX IF NOT EXISTS {names[2]}\n  ON jobs " in add_claim_columns
+
+
+def test_fast_path_without_claim_columns_checks_only_the_relations() -> None:
+    index_columns = [Column("id", "UUID"), Column("task_name", "VARCHAR(100)")]
+    fast_path = sql_builders.RelationsExistQuery("jobs")
+
+    assert fast_path.params(index_columns) == fast_path.relation_names(index_columns)
+    assert fast_path.make_query(index_columns) == (
+        "SELECT to_regclass($1) IS NOT NULL"
+        " AND to_regclass($2) IS NOT NULL"
+        " AND to_regclass($3) IS NOT NULL"
+    )
+
+
+def test_add_claim_columns_query_is_the_upgrade_sql() -> None:
+    driver = PostgresqlBroker(dsn="unused").driver
+
+    query = driver.add_columns_query.make_query(
+        driver.added_columns,
+        driver.added_indexes,
+    )
+
+    assert query == (
+        "ALTER TABLE taskiq_messages\n"
+        "  ADD COLUMN IF NOT EXISTS channel VARCHAR,\n"
+        "  ADD COLUMN IF NOT EXISTS not_before"
+        " TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW();\n"
+        "CREATE INDEX IF NOT EXISTS taskiq_messages_not_before_idx\n"
+        "  ON taskiq_messages (channel, not_before, id);"
+    )
 
 
 @pytest.mark.anyio
@@ -244,6 +357,83 @@ async def test_startup_migrates_with_the_smallest_pool(
         await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
 
 
+@asynccontextmanager
+async def role_with(
+    admin: Connection,
+    postgresql_dsn: str,
+    table: str,
+    name: str,
+    table_privileges: str,
+    *,
+    sequence: bool,
+) -> AsyncIterator[str]:
+    """
+    Create a role with ``table_privileges`` on ``table`` and no DDL privilege.
+
+    It also gets USAGE on the schema and, given ``sequence``, on the table's
+    id sequence. On exit it drops the role.
+
+    :yield: a DSN that logs in as the role.
+    """
+    role = f"{table}_{name}"
+    password = secrets.token_hex(16)
+    schema = await admin.fetchval(
+        "SELECT relnamespace::regnamespace::text FROM pg_class "
+        "WHERE oid = to_regclass($1)",
+        table,
+    )
+    await admin.execute(
+        f"CREATE ROLE {role} LOGIN PASSWORD '{scram_verifier(password)}'",
+    )
+    try:
+        await admin.execute(f"GRANT USAGE ON SCHEMA {schema} TO {role}")
+        await admin.execute(f"GRANT {table_privileges} ON {table} TO {role}")
+        if sequence:
+            await admin.execute(
+                f"GRANT USAGE ON SEQUENCE {table}_id_seq TO {role}",
+            )
+        assert not await admin.fetchval(
+            "SELECT has_schema_privilege($1, $2, 'CREATE')",
+            role,
+            schema,
+        )
+        parts = urlsplit(postgresql_dsn)
+        yield parts._replace(
+            netloc=f"{role}:{password}@{address_of(parts)}",
+        ).geturl()
+    finally:
+        await admin.execute(f"DROP OWNED BY {role}")
+        await admin.execute(f"DROP ROLE {role}")
+
+
+@asynccontextmanager
+async def dml_role(
+    admin: Connection,
+    postgresql_dsn: str,
+    table: str,
+    kind: str,
+) -> AsyncIterator[str]:
+    """
+    Create a role that can use ``table`` but run no DDL on it.
+
+    On exit it drops the role, then ``table``.
+
+    :yield: a DSN that logs in as the role.
+    """
+    try:
+        async with role_with(
+            admin,
+            postgresql_dsn,
+            table,
+            "dml",
+            "SELECT, INSERT, UPDATE, DELETE",
+            sequence=kind == "broker",
+        ) as role_dsn:
+            yield role_dsn
+    finally:
+        await admin.execute(f"DROP TABLE IF EXISTS {table}")
+
+
 @pytest.mark.anyio
 @pytest.mark.parametrize("kind", COMPONENTS)
 async def test_startup_needs_no_ddl_privilege_once_the_tables_exist(
@@ -257,43 +447,229 @@ async def test_startup_needs_no_ddl_privilege_once_the_tables_exist(
     await owner.startup()
     await close_component(owner)
 
-    role = f"{postgres_table}_dml"
-    password = secrets.token_hex(16)
-    schema = await admin.fetchval(
-        "SELECT relnamespace::regnamespace::text FROM pg_class "
-        "WHERE oid = to_regclass($1)",
-        postgres_table,
-    )
-    await admin.execute(
-        f"CREATE ROLE {role} LOGIN PASSWORD '{scram_verifier(password)}'",
-    )
-    try:
-        await admin.execute(f"GRANT USAGE ON SCHEMA {schema} TO {role}")
-        await admin.execute(
-            f"GRANT SELECT, INSERT, UPDATE, DELETE ON {postgres_table} TO {role}",
-        )
-        if kind == "broker":
-            await admin.execute(
-                f"GRANT USAGE ON SEQUENCE {postgres_table}_id_seq TO {role}",
-            )
-        assert not await admin.fetchval(
-            "SELECT has_schema_privilege($1, $2, 'CREATE')",
-            role,
-            schema,
-        )
-        parts = urlsplit(postgresql_dsn)
-        role_dsn = parts._replace(
-            netloc=f"{role}:{password}@{address_of(parts)}",
-        ).geturl()
+    async with dml_role(admin, postgresql_dsn, postgres_table, kind) as role_dsn:
         limited = build_component(kind, role_dsn, postgres_table, driver)
         try:
             await limited.startup()
+            if isinstance(limited, PostgresqlBroker):
+                await limited.kick(
+                    BrokerMessage(
+                        task_id=uuid.uuid4().hex,
+                        task_name="limited_task",
+                        message=b"limited",
+                        labels={},
+                    ),
+                )
+                # The sweep locks the row FOR UPDATE, which needs UPDATE.
+                claimed = await limited._claim_due()
+                assert claimed is not None
+                assert claimed.data == b"limited"
         finally:
             await close_component(limited)
+
+
+def privileges_message(payload: bytes) -> BrokerMessage:
+    return BrokerMessage(
+        task_id=uuid.uuid4().hex,
+        task_name="privileges_task",
+        message=payload,
+        labels={},
+    )
+
+
+@pytest.mark.anyio
+async def test_the_documented_privileges_split_between_producer_and_worker(
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: Connection,
+) -> None:
+    """Each role has exactly what the docs list for it, and lacks the other's."""
+    owner = build_component("broker", postgresql_dsn, postgres_table, driver)
+    await owner.startup()
+    await close_component(owner)
+
+    try:
+        async with (
+            # INSERT returns the new id, so a producer also needs SELECT.
+            role_with(
+                admin,
+                postgresql_dsn,
+                postgres_table,
+                "producer",
+                "INSERT, SELECT",
+                sequence=True,
+            ) as producer_dsn,
+            role_with(
+                admin,
+                postgresql_dsn,
+                postgres_table,
+                "worker",
+                "SELECT, UPDATE, DELETE",
+                sequence=False,
+            ) as worker_dsn,
+        ):
+            producer = build_component("broker", producer_dsn, postgres_table, driver)
+            worker = build_component("broker", worker_dsn, postgres_table, driver)
+            try:
+                await producer.startup()
+                await worker.startup()
+                await producer.kick(privileges_message(b"swept"))
+                await producer.kick(privileges_message(b"notified"))
+                notified_id = await admin.fetchval(
+                    f"SELECT max(id) FROM {postgres_table}",  # noqa: S608
+                )
+                swept = await worker._claim_due()
+                notified = await worker._claim_notified(notified_id)
+
+                with pytest.raises(Exception, match="permission denied"):
+                    await worker.kick(privileges_message(b"from-worker"))
+                with pytest.raises(Exception, match="permission denied"):
+                    await producer.driver.fetch_row(
+                        producer._claim_due_query,
+                        producer.channel_name,
+                    )
+            finally:
+                await close_component(producer)
+                await close_component(worker)
     finally:
         await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
-        await admin.execute(f"DROP OWNED BY {role}")
-        await admin.execute(f"DROP ROLE {role}")
+
+    assert swept is not None
+    assert notified is not None
+    assert (swept.data, notified.data) == (b"swept", b"notified")
+
+
+@pytest.mark.anyio
+async def test_startup_without_ddl_privilege_fails_on_a_0_4_table(
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: Connection,
+) -> None:
+    await admin.execute(BROKER_TABLE_0_4_SQL.format(table=postgres_table))
+
+    async with dml_role(admin, postgresql_dsn, postgres_table, "broker") as role_dsn:
+        limited = build_component("broker", role_dsn, postgres_table, driver)
+        try:
+            with pytest.raises(Exception, match=r"permission denied|must be owner"):
+                await limited.startup()
+        finally:
+            await close_component(limited)
+
+        # The failed migration left the table as it was.
+        assert await claim_schema(admin, postgres_table) == ([], False)
+
+
+@pytest.mark.anyio
+async def test_startup_adds_the_claim_columns_to_a_0_4_table(
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: Connection,
+) -> None:
+    await admin.execute(BROKER_TABLE_0_4_SQL.format(table=postgres_table))
+    await admin.execute(
+        f"INSERT INTO {postgres_table} (task_id, task_name, message, labels) "  # noqa: S608
+        "VALUES (gen_random_uuid(), 'old_task', 'old', '{}')",
+    )
+    broker = build_component("broker", postgresql_dsn, postgres_table, driver)
+    try:
+        await asyncio.wait_for(broker.startup(), WAIT_SECONDS)
+
+        assert await claim_schema(admin, postgres_table) == (
+            ["channel", "not_before"],
+            True,
+        )
+        assert await admin.fetchval(
+            "SELECT pg_get_indexdef(to_regclass($1))",
+            f"{postgres_table}_not_before_idx",
+        ) == (
+            f"CREATE INDEX {postgres_table}_not_before_idx ON public.{postgres_table}"
+            " USING btree (channel, not_before, id)"
+        )
+        rows = await admin.fetch(
+            f"SELECT message, channel IS NULL AS legacy, not_before <= NOW() AS due "  # noqa: S608
+            f"FROM {postgres_table}",
+        )
+        assert [tuple(row) for row in rows] == [(b"old", True, True)]
+    finally:
+        await close_component(broker)
+        await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
+
+
+@pytest.mark.anyio
+async def test_startup_after_the_upgrade_takes_the_fast_path(
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: Connection,
+) -> None:
+    asyncpg = pytest.importorskip("asyncpg")
+    await admin.execute(BROKER_TABLE_0_4_SQL.format(table=postgres_table))
+    first = build_component("broker", postgresql_dsn, postgres_table, driver)
+    try:
+        await first.startup()
+    finally:
+        await close_component(first)
+
+    second = build_component("broker", postgresql_dsn, postgres_table, driver)
+    blocker = await asyncpg.connect(postgresql_dsn)
+    try:
+        transaction = blocker.transaction()
+        await transaction.start()
+        await blocker.execute(
+            MIGRATION_LOCK_SQL,
+            MIGRATION_LOCK_NAMESPACE,
+            postgres_table,
+        )
+
+        # A startup that took the lock would wait for the blocker forever.
+        await asyncio.wait_for(second.startup(), WAIT_SECONDS)
+
+        assert await claim_schema(admin, postgres_table) == (
+            ["channel", "not_before"],
+            True,
+        )
+    finally:
+        await blocker.close()
+        await close_component(second)
+        await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
+
+
+@pytest.mark.anyio
+async def test_concurrent_startups_upgrade_a_0_4_table(
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: Connection,
+) -> None:
+    await admin.execute(BROKER_TABLE_0_4_SQL.format(table=postgres_table))
+    components = [
+        build_component("broker", postgresql_dsn, postgres_table, driver)
+        for _ in range(8)
+    ]
+    for component in components:
+        component.driver.connection_kwargs = SMALL_POOL[driver]
+    try:
+        outcomes = await asyncio.gather(
+            *(component.startup() for component in components),
+            return_exceptions=True,
+        )
+    finally:
+        for component in components:
+            await close_component(component)
+
+    try:
+        assert [
+            repr(outcome) for outcome in outcomes if isinstance(outcome, BaseException)
+        ] == []
+        assert await claim_schema(admin, postgres_table) == (
+            ["channel", "not_before"],
+            True,
+        )
+    finally:
+        await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
 
 
 @pytest.mark.anyio

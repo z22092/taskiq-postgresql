@@ -1,17 +1,35 @@
 from __future__ import annotations
 
 import math
+from asyncio import Event, create_task, gather, get_running_loop, wait_for
 from asyncio import Queue as AsyncQueue
-from asyncio import Task, get_running_loop
-from contextlib import contextmanager, suppress
+from asyncio import TimeoutError as AsyncTimeoutError
+from contextlib import suppress
 from dataclasses import dataclass
 from logging import getLogger
-from typing import TYPE_CHECKING, Any, Callable, Literal, Optional, TypeVar
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Literal,
+    Optional,
+    TypeVar,
+)
 
 from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessage
 
 from taskiq_postgresql.abc.driver import ListenDriver
-from taskiq_postgresql.abc.query import Column, CreatedAtColumn, PrimaryKeyColumn
+from taskiq_postgresql.abc.query import (
+    AddedIndex,
+    ClaimByIdQuery,
+    ClaimColumns,
+    ClaimDueQuery,
+    Column,
+    CreatedAtColumn,
+    NotBeforeColumn,
+    PrimaryKeyColumn,
+    index_name,
+)
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
@@ -22,45 +40,12 @@ from taskiq_postgresql.utils import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterator
+    from collections.abc import AsyncGenerator
 
 
 _T = TypeVar("_T")
 
 logger = getLogger("taskiq.asyncpg_broker")
-
-# Upper bound on how long a stop request waits while listen() is idle.
-_LISTEN_WAKE_UP_INTERVAL = 1.0
-
-
-@contextmanager
-def _wake_up_periodically(interval: float) -> Iterator[None]:
-    """
-    Keep a timer due every ``interval`` seconds on the running event loop.
-
-    ``taskiq worker`` stops on SIGINT or SIGTERM by setting an
-    ``asyncio.Event`` from a ``signal.signal`` handler. That only queues the
-    callbacks of the event's waiters: it does not wake a loop blocked in
-    ``select()``, so a worker whose channel gets no notification would never
-    run them. A due timer wakes the loop, and the loop then runs them.
-
-    Args:
-        interval: seconds between two wake-ups.
-
-    Yields:
-        Nothing; the timer is cancelled when the block exits.
-    """
-    loop = get_running_loop()
-
-    def wake_up() -> None:
-        nonlocal handle
-        handle = loop.call_later(interval, wake_up)
-
-    handle = loop.call_later(interval, wake_up)
-    try:
-        yield
-    finally:
-        handle.cancel()
 
 
 def _parse_delay(value: Any) -> float:
@@ -84,12 +69,58 @@ def _parse_delay(value: Any) -> float:
         # OverflowError: float() of an int beyond the float range.
         with suppress(TypeError, ValueError, OverflowError):
             seconds = float(value)
-            # Neither NaN nor infinity is a time the event loop can schedule,
-            # so the stored message would never be notified.
+            # Neither NaN nor infinity is a delay the server can add to NOW(),
+            # so the message would never be due.
             if math.isfinite(seconds):
                 return max(seconds, 0.0)
     msg = f"The 'delay' label must be a finite number of seconds, got {value!r:.50}"
     raise ValueError(msg)
+
+
+def _parse_poll_interval(value: Any) -> float:
+    """
+    Check the ``poll_interval`` argument of the broker.
+
+    Args:
+        value: the ``poll_interval`` given to the broker.
+
+    Returns:
+        The interval in seconds.
+
+    Raises:
+        ValueError: if it is not a finite number of seconds above zero.
+    """
+    # bool is an int subclass, so True would silently mean 1 second.
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        # OverflowError: float() of an int beyond the float range.
+        with suppress(OverflowError):
+            seconds = float(value)
+            if math.isfinite(seconds) and seconds > 0:
+                return seconds
+    msg = (
+        "poll_interval must be a finite number of seconds above zero, "
+        f"got {value!r:.50}"
+    )
+    raise ValueError(msg)
+
+
+def _parse_message_id(payload: str) -> Optional[int]:
+    """Return the message id a NOTIFY carries, or None if it is not one."""
+    # The only place a payload is parsed: the drivers yield it unparsed.
+    try:
+        return int(payload)
+    except ValueError:
+        return None
+
+
+async def _ack() -> None:
+    """Do nothing: the row was deleted when the message was claimed."""
+
+
+async def _wake_when_set(event: Event, queue: AsyncQueue[Optional[int]]) -> None:
+    """Put None in ``queue`` once ``event`` is set, to wake whoever waits on it."""
+    await event.wait()
+    queue.put_nowait(None)
 
 
 @dataclass
@@ -114,6 +145,14 @@ class Table:
         type_="JSONB",
     )
     created_at = CreatedAtColumn()
+    # Added to the table by the upgrade step, never by CREATE TABLE, so a new
+    # table and one created by 0.4.x end up with the same columns.
+    channel = Column(
+        name="channel",
+        type_="VARCHAR",
+        nullable=True,
+    )
+    not_before = NotBeforeColumn()
 
 
 class PostgresqlBroker(AsyncBroker):
@@ -132,6 +171,7 @@ class PostgresqlBroker(AsyncBroker):
         connection_kwargs: dict[str, Any] | None = None,
         pool_kwargs: dict[str, Any] | None = None,
         run_migrations: bool = False,
+        poll_interval: float = 1.0,
     ) -> None:
         """
         Construct a new broker.
@@ -160,11 +200,18 @@ class PostgresqlBroker(AsyncBroker):
                 Additional arguments for asyncpg pool creation.
             run_migrations (bool, optional): \
                 Create the tables and indexes on startup. Defaults to False.
+            poll_interval (float, optional): \
+                Seconds between two sweeps of listen() for due messages, so \
+                a delayed message goes out at most this long after it is \
+                due. Defaults to 1.0.
 
         Raises:
             TypeError: if ``dsn`` is ``None``, empty or blank.
+            ValueError: if ``poll_interval`` is not a finite number of \
+                seconds above zero.
         """
         dsn = require_dsn(dsn, type(self).__name__)
+        self.poll_interval: float = _parse_poll_interval(poll_interval)
         super().__init__(
             result_backend=result_backend,
             task_id_generator=task_id_generator,
@@ -178,8 +225,16 @@ class PostgresqlBroker(AsyncBroker):
         self.pool_kwargs: dict[str, Any] = pool_kwargs if pool_kwargs else {}
         self.max_retry_attempts: int = max_retry_attempts
         self._queue: AsyncQueue[str] | None = None
+        # Set by shutdown(), so a running listen() ends instead of reopening
+        # the pool the drivers just closed. startup() makes a new one rather
+        # than clearing it: an Event belongs to the loop that first waits on it.
+        self._stopping = Event()
 
         self.columns = Table(task_id=Column(name="task_id", type_=field_for_task_id))
+        claim_columns = ClaimColumns(
+            channel=self.columns.channel,
+            not_before=self.columns.not_before,
+        )
 
         self.driver = get_db_driver(driver)(
             connection_string=dsn_before_startup(dsn),
@@ -194,7 +249,25 @@ class PostgresqlBroker(AsyncBroker):
             created_at=self.columns.created_at,
             index_columns=[self.columns.primary_key],
             run_migrations=run_migrations,
+            added_columns=claim_columns,
+            added_indexes=[
+                AddedIndex(
+                    name=index_name(self.table_name, self.columns.not_before),
+                    columns=[*claim_columns, self.columns.primary_key],
+                ),
+            ],
             **self.connection_kwargs,
+        )
+        returning = [self.columns.message]
+        self._claim_due_query = ClaimDueQuery(self.table_name).make_query(
+            self.columns.primary_key,
+            claim_columns,
+            returning,
+        )
+        self._claim_by_id_query = ClaimByIdQuery(self.table_name).make_query(
+            self.columns.primary_key,
+            claim_columns,
+            returning,
         )
         self.listen_driver: ListenDriver = get_db_listen_driver(driver)(
             connection_string=dsn_before_startup(dsn),
@@ -227,9 +300,11 @@ class PostgresqlBroker(AsyncBroker):
 
         await self.driver.on_startup()
         await self.listen_driver.on_startup()
+        self._stopping = Event()
 
     async def shutdown(self) -> None:
-        """Close all connections on shutdown."""
+        """Close all connections on shutdown; a running listen() then ends."""
+        self._stopping.set()
         await super().shutdown()
         await self.driver.on_shutdown()
         await self.listen_driver.on_shutdown()
@@ -238,16 +313,21 @@ class PostgresqlBroker(AsyncBroker):
         """
         Send message to the channel.
 
-        Inserts the message into the database and sends a NOTIFY.
+        Inserts the message with the channel and the time it is due, which the
+        server computes from its own clock and the ``delay`` label. A message
+        due at once is also announced with a NOTIFY; a delayed one is left to
+        the sweep of listen(), so it does not depend on this process. A failed
+        NOTIFY is logged as a warning, and the sweep delivers that message.
 
         :param message: Message to send.
         :raises ValueError: if the ``delay`` label is not a finite number of
             seconds; nothing is stored then.
+        :raises Exception: whatever the driver raises for the INSERT; the
+            message is not stored then, and not sent again.
         """
-        # Parsed before the insert: a delay that fails here would otherwise
-        # leave a row that no NOTIFY ever announces.
+        # Parsed before the insert, so an invalid delay stores nothing.
         delay_value = message.labels.get("delay")
-        delay_seconds = None if delay_value is None else _parse_delay(delay_value)
+        delay_seconds = 0.0 if delay_value is None else _parse_delay(delay_value)
 
         message_inserted_id = await self.driver.insert(
             [
@@ -255,107 +335,166 @@ class PostgresqlBroker(AsyncBroker):
                 self.columns.task_name,
                 self.columns.message,
                 self.columns.labels,
+                self.columns.channel,
+                self.columns.not_before,
             ],
             [
                 message.task_id,
                 message.task_name,
                 message.message,
                 message.labels,
+                self.channel_name,
+                delay_seconds,
             ],
             [
                 self.columns.primary_key,
             ],
         )
 
-        if delay_seconds is not None:
-            return await self._schedule_notification(message_inserted_id, delay_seconds)
-
-        return await self._send_notification(message_inserted_id)
+        # No NOTIFY for a delayed message: a 0.4.x worker claims any id it is
+        # notified of, so it would deliver the message early.
+        if delay_seconds == 0.0:
+            await self._send_notification(message_inserted_id)
 
     async def _send_notification(self, message_id: int) -> None:
         """Send a notification with the message ID as payload."""
         try:
             await self.driver.execute(f"NOTIFY {self.channel_name}, '{message_id}'")
         except Exception as error:
-            logger.exception("Error sending notification: %s", error)
-            raise
-
-    async def _schedule_notification(
-        self,
-        message_id: int,
-        delay_seconds: float,
-    ) -> None:
-        """Schedules the next task based on the schedule object."""
-        loop = get_running_loop()
-
-        loop_now = loop.time()
-        when = loop_now + delay_seconds
-
-        loop.call_at(
-            when,
-            lambda: Task(
-                self._send_notification(message_id),
-                loop=loop,
-            ),
-        )
+            # The row is committed and the sweep delivers it: raising would
+            # make a caller that retries send the task twice.
+            logger.warning(
+                "NOTIFY of message %s on channel %s failed (%r): it will be "
+                "delivered by the next sweep",
+                message_id,
+                self.channel_name,
+                error,
+            )
 
     async def listen(self) -> AsyncGenerator[AckableMessage, None]:
         """
         Listen to the channel.
 
-        Yields messages as they are received.
+        Yields the due messages of the channel. A sweep claims them one by one,
+        oldest first, when listen() starts and then every ``poll_interval``
+        seconds, however many NOTIFYs arrive in between. A NOTIFY claims its
+        message at once if it is due. Each claim is an atomic DELETE ...
+        RETURNING, so a message reaches one worker only, and at most once: a
+        claimed row is gone even if its processing never ends.
 
-        This method atomically claims messages using DELETE ... RETURNING, ensuring
-        that only a single worker processes each message even though NOTIFY is
-        broadcast to all listeners.
+        Once reading the LISTEN connection ends or fails, a warning is logged
+        and this listen() delivers by the sweep alone; only startup() opens
+        the connection again. A failed claim is logged and tried again at the
+        next sweep. listen() ends once shutdown() starts.
 
         :yields: AckableMessage instances.
         """
-        # A timer rather than a timeout on each read: the read stays in the
-        # caller's task, so cancelling it, as taskiq does on shutdown, cannot
-        # lose a notification that arrives at the same moment.
-        with _wake_up_periodically(_LISTEN_WAKE_UP_INTERVAL):
-            while True:
-                try:
-                    async for message_id in self.listen_driver:
-                        # Normalize payload to integer ID
-                        # (psycopg may yield string payloads).
-                        try:
-                            normalized_id = int(message_id)  # type: ignore[arg-type]
-                        except (TypeError, ValueError):
-                            logger.warning(
-                                "Invalid NOTIFY payload %r on channel %s",
-                                message_id,
-                                self.channel_name,
-                            )
-                            continue
-
-                        # Atomically claim the message row. If None is returned,
-                        # another worker has already claimed it.
-                        row = await self.driver.delete_returning(
-                            self.columns.primary_key,
-                            normalized_id,
-                            [self.columns.message],
+        loop = get_running_loop()
+        stopping = self._stopping
+        # The ids of the NOTIFYs; None only wakes the loop up for shutdown().
+        notified: AsyncQueue[Optional[int]] = AsyncQueue()
+        helpers = (
+            create_task(self._queue_notified_ids(notified, stopping)),
+            create_task(_wake_when_set(stopping, notified)),
+        )
+        message_id: Optional[int] = None
+        next_sweep = loop.time()
+        try:
+            # The only shutdown check, so every claim comes right after it.
+            while not stopping.is_set():
+                if message_id is not None:
+                    message = await self._claim_notified(message_id)
+                    message_id = None
+                elif loop.time() >= next_sweep:
+                    message = await self._claim_due()
+                    if message is None:
+                        next_sweep = loop.time() + self.poll_interval
+                else:
+                    # Cancel-safe: a cancelled Queue.get() leaves the id queued.
+                    with suppress(AsyncTimeoutError):
+                        message_id = await wait_for(
+                            notified.get(),
+                            next_sweep - loop.time(),
                         )
-
-                        if row is None:
-                            # Claimed elsewhere or missing; skip.
-                            continue
-
-                        message: Optional[bytes] = row.get(self.columns.message.name)
-
-                        if message is None:
-                            logger.warning(
-                                "Message with id %s has no payload.",
-                                message_id,
-                            )
-                            continue
-
-                        async def ack(*, _message_id: int = message_id) -> None:
-                            # No-op: the row was already deleted when claimed.
-                            return None
-
-                        yield AckableMessage(data=message, ack=ack)
-                except Exception as error:
-                    logger.exception("Error processing message: %s", error)
                     continue
+                if message is not None:
+                    yield message
+        finally:
+            for helper in helpers:
+                helper.cancel()
+            await gather(*helpers, return_exceptions=True)
+
+    async def _queue_notified_ids(
+        self,
+        notified: AsyncQueue[Optional[int]],
+        stopping: Event,
+    ) -> None:
+        """
+        Queue the message id of each NOTIFY until reading LISTEN ends.
+
+        It is read once per listen(): reopening the connection is up to the
+        ListenDriver, so once it ends this warns and returns, and the sweep
+        delivers alone.
+        """
+        reason = "its iterator ended"
+        try:
+            async for payload in self.listen_driver:
+                message_id = _parse_message_id(payload)
+                if message_id is None:
+                    logger.warning(
+                        "Invalid NOTIFY payload %r on channel %s",
+                        payload,
+                        self.channel_name,
+                    )
+                else:
+                    notified.put_nowait(message_id)
+        except Exception as error:
+            reason = repr(error)
+        # shutdown() closes the connection itself.
+        if not stopping.is_set():
+            logger.warning(
+                "LISTEN on channel %s stopped (%s): delivering only by polling "
+                "every %s s; the LISTEN connection is not reopened until the "
+                "worker restarts",
+                self.channel_name,
+                reason,
+                self.poll_interval,
+            )
+
+    async def _claim_due(self) -> Optional[AckableMessage]:
+        """Claim the oldest due message of the channel, see ``ClaimDueQuery``."""
+        return await self._claim(
+            "a due message",
+            self._claim_due_query,
+            self.channel_name,
+        )
+
+    async def _claim_notified(self, message_id: int) -> Optional[AckableMessage]:
+        """Claim the message a NOTIFY named, see ``ClaimByIdQuery``."""
+        return await self._claim(
+            f"message {message_id}",
+            self._claim_by_id_query,
+            self.channel_name,
+            message_id,
+        )
+
+    async def _claim(
+        self,
+        what: str,
+        query: str,
+        *values: Any,
+    ) -> Optional[AckableMessage]:
+        """
+        Run one claim; log a failure instead of raising, so listen() goes on.
+
+        :param what: the claimed message, as the log names it.
+        :return: the message, or None if no row matched or the claim failed.
+        """
+        try:
+            row = await self.driver.fetch_row(query, *values)
+        except Exception:
+            logger.exception("Error claiming %s on channel %s", what, self.channel_name)
+            return None
+        if row is None:
+            return None
+        return AckableMessage(data=row[self.columns.message.name], ack=_ack)

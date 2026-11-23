@@ -2,14 +2,14 @@ from asyncio import Queue as AsyncQueue
 from contextlib import asynccontextmanager
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncIterator, Optional, Sequence, Union
+from typing import Any, AsyncGenerator, AsyncIterator, Optional, Sequence, Union
 from uuid import UUID
 
 from asyncpg import Connection, Pool, connect, create_pool
 from asyncpg.transaction import Transaction
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
-from taskiq_postgresql.abc.query import Column
+from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.drivers._json import dumps
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
@@ -29,6 +29,8 @@ class AsyncpgDriver(QueryDriver):
         created_at: Optional[Column] = None,
         index_columns: Optional[Sequence[Column]] = None,
         run_migrations: bool = False,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the backend."""
@@ -40,6 +42,8 @@ class AsyncpgDriver(QueryDriver):
             created_at,
             index_columns,
             run_migrations,
+            added_columns,
+            added_indexes,
             **connection_kwargs,
         )
 
@@ -142,21 +146,11 @@ class AsyncpgDriver(QueryDriver):
                 value,
             )
 
-    async def delete_returning(
-        self,
-        where_column: Column,
-        value: Any,
-        returning: Sequence[Column],
-    ) -> Optional[dict[str, Any]]:
-        """Atomically delete a row and return requested columns."""
+    async def fetch_row(self, query: str, *values: Any) -> Optional[dict[str, Any]]:
+        """Return the first row of ``query``, see ``QueryDriver.fetch_row``."""
         async with self, self.connection() as connection:
-            row = await connection.fetchrow(
-                self.delete_returning_query.make_query(where_column, returning),
-                value,
-            )
-            if row is None:
-                return None
-            return {column.name: row[column.name] for column in returning}
+            row = await connection.fetchrow(query, *values)
+            return None if row is None else dict(row)
 
     async def select(
         self,
@@ -205,8 +199,16 @@ class AsyncpgDriver(QueryDriver):
                 connection.transaction(),
             ):
                 if await connection.fetchval(
-                    self.relations_exist_query.make_query(self.index_columns),
-                    *self.relations_exist_query.relation_names(self.index_columns),
+                    self.relations_exist_query.make_query(
+                        self.index_columns,
+                        added_columns=self.added_columns,
+                        added_indexes=self.added_indexes,
+                    ),
+                    *self.relations_exist_query.params(
+                        self.index_columns,
+                        added_columns=self.added_columns,
+                        added_indexes=self.added_indexes,
+                    ),
                 ):
                     return
                 await connection.execute(
@@ -217,6 +219,13 @@ class AsyncpgDriver(QueryDriver):
                 if self.index_columns is not None:
                     await connection.execute(
                         self.create_index_query.make_query(self.index_columns),
+                    )
+                if self.added_columns or self.added_indexes:
+                    await connection.execute(
+                        self.add_columns_query.make_query(
+                            self.added_columns,
+                            self.added_indexes,
+                        ),
                     )
 
     async def on_shutdown(self) -> None:
@@ -241,7 +250,8 @@ class AsyncpgListenDriver(ListenDriver):
     ) -> None:
         """Initialize the listen driver."""
         super().__init__(connection_string, channel_name, **connection_kwargs)
-        self._queue: AsyncQueue[int] = AsyncQueue()
+        # None: a connection closed, see _termination_handler.
+        self._queue: AsyncQueue[Optional[str]] = AsyncQueue()
 
     async def on_startup(self) -> None:
         """On startup."""
@@ -254,6 +264,7 @@ class AsyncpgListenDriver(ListenDriver):
                 self.channel_name,
                 self._notification_handler,
             )
+            self.connection.add_termination_listener(self._termination_handler)
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
 
@@ -270,7 +281,7 @@ class AsyncpgListenDriver(ListenDriver):
         con_ref: object,
         pid: int,
         channel: str,
-        payload: object,
+        payload: str,
         /,
     ) -> None:
         """
@@ -284,10 +295,19 @@ class AsyncpgListenDriver(ListenDriver):
             **payload**: the payload.
         """
         if self._queue is not None:
-            self._queue.put_nowait(int(payload))
+            # Unparsed, see ListenDriver.__aiter__.
+            self._queue.put_nowait(payload)
 
-    async def __aiter__(self) -> AsyncIterator[Any]:
-        """Iterate over the queue."""
+    def _termination_handler(self, connection: object, /) -> None:
+        """Wake ``__aiter__`` up when the connection closes, so that it ends."""
+        # Otherwise a connection the server ended leaves __aiter__ waiting on
+        # the queue for good, and nobody learns that LISTEN stopped.
+        self._queue.put_nowait(None)
+
+    async def __aiter__(self) -> AsyncGenerator[str, None]:
+        """Iterate over the queue until the connection closes."""
         while not self.connection.is_closed():
-            message_id = await self._queue.get()
-            yield message_id
+            payload = await self._queue.get()
+            # A None left by an earlier connection is stale: keep reading.
+            if payload is not None:
+                yield payload
