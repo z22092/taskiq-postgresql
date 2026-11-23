@@ -18,7 +18,9 @@ pip install "taskiq-postgresql[psycopg]"
 pip install "taskiq-postgresql[psqlpy]"
 ```
 
-With uv: `uv add "taskiq-postgresql[asyncpg]"`.
+With uv: `uv add "taskiq-postgresql[asyncpg]"`. The integrations with
+SQLAlchemy, SQLModel and Alembic are extras too (see
+[Integrations](#integrations)).
 
 ## Quickstart
 
@@ -370,6 +372,9 @@ There are three ways to create the tables and their indexes:
 - `taskiq postgresql generate`, which prints the SQL so that you run it
   yourself or hand it to your migration tool.
 
+SQLAlchemy, SQLModel and Alembic can also hold the tables (see
+[Integrations](#integrations)).
+
 Both commands take the `module:object` paths that `taskiq worker` and
 `taskiq scheduler` take, and `--app-dir` like them. A broker brings its result
 backend when that is a `PostgresqlResultBackend`, and a `TaskiqScheduler`
@@ -444,34 +449,16 @@ with the next free version number:
 taskiq postgresql generate app:scheduler --no-transaction > db/migration/V2__taskiq_tables.sql
 ```
 
-In an Alembic migration, build the script with the Python API. Describing the
-tables by component kind keeps the migration from importing your application;
-pass `table_name` and `field_for_task_id` if you changed them:
-
-```python
-from alembic import op
-
-from taskiq_postgresql.migrations import render_sql, table_schema
-
-
-def upgrade() -> None:
-    op.execute(
-        render_sql(
-            [
-                table_schema("broker"),
-                table_schema("result_backend"),
-                table_schema("scheduler_source"),
-            ],
-            transaction=False,
-        ),
-    )
-```
-
-In Django, pass the same string to `migrations.RunSQL` in a migration of your
-own. A Flyway file holds the SQL of the release that generated it, while the
-Alembic example renders the SQL of the installed release each time it runs.
-Either way the script only adds what is missing, so when an upgrade changes
-the tables (the changelog says so), add a new migration with the new script.
+For Alembic, install the `alembic` extra: [Alembic](#alembic) shows a helper
+for a revision of your own and a format that writes the revision file. In
+Django, pass `render_sql(..., transaction=False)` from
+`taskiq_postgresql.migrations` to `migrations.RunSQL` in a migration of your
+own; describing the tables by component kind (`table_schema("broker")` and so
+on) keeps the migration from importing your application. A Flyway file holds
+the SQL of the release that generated it, while such a Django migration
+renders the SQL of the installed release each time it runs. Either way the
+script only adds what is missing, so when an upgrade changes the tables (the
+changelog says so), add a new migration with the new script.
 
 ### Writing a migration format
 
@@ -535,13 +522,158 @@ The contract:
 
 All these names are importable from `taskiq_postgresql.migrations`.
 
+## Integrations
+
+SQLAlchemy, SQLModel and Alembic can hold the tables too. Each integration is
+an extra, installed with the extra of your driver:
+
+```bash
+pip install "taskiq-postgresql[asyncpg,sqlalchemy]"
+pip install "taskiq-postgresql[asyncpg,sqlmodel]"
+pip install "taskiq-postgresql[asyncpg,alembic]"
+```
+
+`sqlmodel` and `alembic` bring SQLAlchemy with them. The integrations build the
+tables from the description that `generate` renders as SQL, so the columns,
+types, defaults, indexes and their names are the ones `run_migrations=True`
+creates.
+Like the commands, they take `module:object` paths (with `app_dir=` for
+`--app-dir`), components, brokers and schedulers. They also take
+`table_schema(...)` descriptions, which need neither your application nor a
+DSN.
+
+### SQLAlchemy and SQLModel
+
+`add_taskiq_tables` adds the tables to a `MetaData` as SQLAlchemy `Table`
+objects and returns them:
+
+```python
+# models.py
+from sqlalchemy.orm import DeclarativeBase
+
+from taskiq_postgresql.contrib.sqlalchemy import add_taskiq_tables
+
+
+class Base(DeclarativeBase):
+    """The base class of your models."""
+
+
+# The quickstart's app:scheduler brings its broker, the broker's result
+# backend and the scheduler source.
+taskiq_tables = add_taskiq_tables(Base.metadata, "app:scheduler")
+```
+
+`Base.metadata.create_all(engine)` then creates them along with your models. A
+table that the metadata already holds under the same name is reused if it is
+the same table; otherwise `ValueError` is raised. `taskiq_metadata(...)`
+returns a new `MetaData` that holds only these tables. The tables are not
+models: read and write them through the components.
+
+With SQLModel, the tables go to `SQLModel.metadata`, or to the `metadata=` you
+pass:
+
+```python
+from taskiq_postgresql.contrib.sqlmodel import add_taskiq_tables
+
+add_taskiq_tables("app:scheduler")
+```
+
+### Alembic
+
+For autogenerate, put the tables in `target_metadata`. Alembic then proposes
+them for a database that lacks them, and nothing once they exist, whatever
+created them:
+
+```python
+# alembic/env.py
+from myapp.models import Base
+
+from taskiq_postgresql.contrib.alembic import taskiq_metadata
+
+target_metadata = [Base.metadata, taskiq_metadata("app:scheduler")]
+```
+
+If your models' metadata already holds the tables, as after
+`add_taskiq_tables` above, `target_metadata = Base.metadata` is enough.
+
+If the workers keep `run_migrations=True` and Alembic should leave the tables
+alone, keep them out of `target_metadata` and filter them out instead;
+otherwise autogenerate proposes `op.drop_table` for each of them:
+
+```python
+# alembic/env.py
+from taskiq_postgresql.contrib.alembic import exclude_taskiq_tables
+
+include_object = exclude_taskiq_tables("app:scheduler")
+```
+
+Pass it as `context.configure(..., include_object=include_object)`. It hides
+the tables, their columns and their indexes. Alembic does not compare
+sequences, so the broker's sequence needs no filter. If you already have an
+`include_object`, include an object only when both do.
+
+To create the tables in a revision of your own, call `create_taskiq_tables`
+from `upgrade()`. It runs the statements that `generate` prints, one at a time
+and in the revision's transaction, so the advisory lock holds until Alembic
+commits; `alembic upgrade --sql` prints them:
+
+```python
+# alembic/versions/taskiq_tables.py
+from alembic import op
+
+from taskiq_postgresql.contrib.alembic import create_taskiq_tables
+from taskiq_postgresql.migrations import table_schema
+
+revision = "taskiq_tables"
+down_revision = None
+
+
+def upgrade() -> None:
+    create_taskiq_tables(
+        op,
+        table_schema("broker"),
+        table_schema("result_backend"),
+        table_schema("scheduler_source"),
+    )
+
+
+def downgrade() -> None:
+    pass
+```
+
+Describing the tables by component kind keeps the revision from importing
+your application; pass `table_name` and `field_for_task_id` if you changed
+them. This revision runs the statements of the installed release each time it
+runs. `generate --format alembic` writes a revision file that holds the
+statements of the release that generated it instead:
+
+```bash
+taskiq postgresql generate app:scheduler --format alembic --option revision=taskiq_tables > alembic/versions/taskiq_tables.py
+```
+
+The format takes these options:
+
+- `revision`: the revision id, made of letters, digits and `_`. By default,
+  the first 12 hex digits of the SHA-256 of the statements, so the same tables
+  give the same id.
+- `down_revision`: the revision it follows, usually your current head. By
+  default there is none: it is a first revision.
+- `downgrade`: `none` (the default) leaves `downgrade()` empty; `drop` makes it
+  drop the tables with `DROP TABLE IF EXISTS`.
+
+The file has no `BEGIN` or `COMMIT`, because Alembic runs each revision in its
+own transaction, so `--no-transaction` changes nothing; `--no-lock` leaves
+out the lock. Any other option, or a value the format does not accept, exits
+with 2. Every statement only adds what is missing, so when an upgrade changes
+the tables, add a revision with the new statements.
+
 ## Compatibility
 
 - **Python and dependencies**: the supported Python versions are the
   `requires-python` field of
   [`pyproject.toml`](https://github.com/z22092/taskiq-postgresql/blob/main/pyproject.toml);
-  its `dependencies` and driver extras hold the supported ranges of taskiq,
-  pydantic and the drivers.
+  its `dependencies` and extras hold the supported ranges of taskiq,
+  pydantic, the drivers, SQLAlchemy, SQLModel and Alembic.
 - **PostgreSQL**: the test suite runs on PostgreSQL 17 and 18.
 - **Drivers**: asyncpg, psycopg 3 and psqlpy, selected with the `driver`
   argument. The test suite runs against all three.

@@ -6,9 +6,11 @@ table that disagrees with the signatures, is a bug a user hits first. The
 quickstart scripts (marked ``# app.py``, ``# kick.py`` and ``# schedule.py`` on
 their first line) run as separate processes, with the README's own ``taskiq``
 commands, once per installed driver. Every other Python block is executed as
-written, except the Alembic example, which runs against a stand-in for
-``alembic.op``. The shell lines of the Migrations section run as written too,
-with the quickstart's ``app.py``.
+written, except the Integrations examples, which run in a directory that holds
+the quickstart's ``app.py`` and are then put to work: their metadata creates
+the tables, autogenerate compares them, the revisions run. The shell lines of
+the Migrations and Integrations sections run as written too, with the
+quickstart's ``app.py``.
 
 Every test that touches a database does so in a database of its own, created
 and dropped here, because the README examples use the default table names and
@@ -36,19 +38,29 @@ import uuid
 from collections import Counter
 from collections.abc import Iterator
 from dataclasses import dataclass
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
+from sqlalchemy import create_engine
+from sqlalchemy.orm import DeclarativeBase
+from sqlmodel import SQLModel
 from taskiq import BrokerMessage, ScheduledTask, TaskiqResult
 from taskiq.abc.serializer import TaskiqSerializer
 from taskiq.serializers import JSONSerializer, MSGPackSerializer
 
 from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend, migrations
 from taskiq_postgresql.cli import PostgresqlCMD
-from taskiq_postgresql.migrations import render_sql, table_schema
+from taskiq_postgresql.contrib.alembic import alembic_format
+from taskiq_postgresql.migrations import (
+    FormatOptions,
+    migration_statements,
+    render_sql,
+    table_schema,
+)
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from tests.helpers import (
     address_of,
@@ -57,6 +69,8 @@ from tests.helpers import (
     in_database,
     run_script,
 )
+from tests.test_contrib_alembic import autogenerate, offline_sql, run_upgrade
+from tests.test_contrib_sqlalchemy import sqlalchemy_url
 from tests.test_migrations import scram_verifier
 
 README = Path(__file__).resolve().parent.parent / "README.md"
@@ -73,6 +87,9 @@ GENERATE_SECTION = "generate-the-sql"
 MIGRATE_SECTION = "apply-it-with-migrate"
 TOOLS_SECTION = "alembic-django-and-flyway"
 FORMAT_SECTION = "writing-a-migration-format"
+INTEGRATIONS_SECTION = "integrations"
+SQLALCHEMY_SECTION = "sqlalchemy-and-sqlmodel"
+ALEMBIC_SECTION = "alembic"
 DEFAULT_TABLES = {"taskiq_messages", "taskiq_results", "taskiq_schedulers"}
 README_ROLE = "taskiq_worker"
 
@@ -131,11 +148,13 @@ def _scripts() -> dict[str, str]:
 
 
 def _other_blocks() -> list[Block]:
-    # The Alembic example imports alembic, which only its own test stands in for.
+    # The Integrations examples import the quickstart's app, which only their
+    # own tests provide.
     return [
         block
         for block in _blocks("python")
-        if block.id not in SCRIPTS and block.section != TOOLS_SECTION
+        if block.id not in SCRIPTS
+        and block.section not in {SQLALCHEMY_SECTION, ALEMBIC_SECTION}
     ]
 
 
@@ -851,26 +870,6 @@ def test_when_the_grants_are_applied__then_a_dml_only_role_runs_the_components(
     asyncio.run(_as_a_dml_only_role(scratch_dsn, driver, grants))
 
 
-def test_when_the_alembic_example_runs__then_its_sql_creates_the_tables(
-    driver: str,
-    scratch_dsn: str,
-    ca_file: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    executed: list[str] = []
-    alembic = types.ModuleType("alembic")
-    alembic.op = types.SimpleNamespace(execute=executed.append)  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "alembic", alembic)
-
-    _run_block(_block("python", TOOLS_SECTION), ca_file)["upgrade"]()
-
-    (sql,) = executed
-    assert sql == render_sql(_default_schemas(), transaction=False)
-    # Alembic runs it inside the migration's own transaction.
-    asyncio.run(run_script(scratch_dsn, driver, f"BEGIN;\n{sql}COMMIT;\n"))
-    assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
-
-
 def test_when_the_format_example_is_installed__then_generate_prints_it(
     ca_file: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -907,3 +906,153 @@ def test_when_the_format_example_is_installed__then_generate_prints_it(
     )
     assert PostgresqlCMD().exec([*command, "--option", "color=red"]) == 2  # noqa: PLR2004
     assert "unknown options: color" in capsys.readouterr().err
+
+
+# --- Integrations -------------------------------------------------------------
+
+
+def _section_blocks(section: str) -> list[Block]:
+    return [block for block in _blocks("python") if block.section == section]
+
+
+@pytest.fixture
+def project(
+    tmp_path: Path,
+    scratch_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Path]:
+    """
+    The working directory of a project that holds the quickstart's ``app.py``.
+
+    The examples name ``"app:scheduler"``, which is imported from the working
+    directory, as ``taskiq worker`` imports it; building its components
+    connects to nothing.
+    """
+    _write_app(tmp_path, "asyncpg")
+    monkeypatch.setenv("POSTGRESQL_URL", scratch_dsn)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    sys.modules.pop("app", None)
+    yield tmp_path
+    sys.modules.pop("app", None)
+
+
+def test_when_the_integration_install_lines_are_read__then_each_extra_exists() -> None:
+    lines = _shell_lines(INTEGRATIONS_SECTION)
+    installs = [
+        re.fullmatch(r'pip install "taskiq-postgresql\[(?P<extras>[\w,]+)\]"', line)
+        for line in lines
+    ]
+    assert all(installs), lines
+    named = {extra for line in installs if line for extra in line["extras"].split(",")}
+    provided = set(
+        importlib_metadata.metadata("taskiq-postgresql").get_all("Provides-Extra") or []
+    )
+    assert {"sqlalchemy", "sqlmodel", "alembic"} <= named <= provided
+
+
+def test_when_the_sqlalchemy_examples_run__then_their_metadata_creates_the_tables(
+    project: Path,
+    scratch_dsn: str,
+    ca_file: Path,
+) -> None:
+    models, with_sqlmodel = _section_blocks(SQLALCHEMY_SECTION)
+    assert models.source.startswith("# models.py\n")
+
+    namespace = _run_block(models, ca_file)
+
+    assert [table.name for table in namespace["taskiq_tables"]] == [
+        schema.name for schema in _default_schemas()
+    ]
+    engine = create_engine(sqlalchemy_url(scratch_dsn))
+    try:
+        namespace["Base"].metadata.create_all(engine)
+    finally:
+        engine.dispose()
+    assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
+
+    before = set(SQLModel.metadata.tables)
+    try:
+        _run_block(with_sqlmodel, ca_file)
+        assert set(SQLModel.metadata.tables) - before == DEFAULT_TABLES
+    finally:
+        for name in set(SQLModel.metadata.tables) - before:
+            SQLModel.metadata.remove(SQLModel.metadata.tables[name])
+
+
+def test_when_the_alembic_env_examples_run__then_autogenerate_agrees(
+    project: Path,
+    scratch_dsn: str,
+    ca_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with_metadata, with_filter, _ = _section_blocks(ALEMBIC_SECTION)
+
+    class Base(DeclarativeBase):
+        """Stands for the application's models: there are none."""
+
+    models = types.ModuleType("myapp.models")
+    models.Base = Base  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "myapp", types.ModuleType("myapp"))
+    monkeypatch.setitem(sys.modules, "myapp.models", models)
+
+    target_metadata = _run_block(with_metadata, ca_file)["target_metadata"]
+    include_object = _run_block(with_filter, ca_file)["include_object"]
+
+    proposed = autogenerate(scratch_dsn, target_metadata)
+    assert {diff[1].name for diff in proposed if diff[0] == "add_table"} == (
+        DEFAULT_TABLES
+    )
+    asyncio.run(run_script(scratch_dsn, "asyncpg", render_sql(_default_schemas())))
+    assert autogenerate(scratch_dsn, target_metadata) == []
+    # Left out of target_metadata, the tables would be dropped; the filter
+    # keeps them.
+    dropped = autogenerate(scratch_dsn, Base.metadata)
+    assert {diff[1].name for diff in dropped if diff[0] == "remove_table"} == (
+        DEFAULT_TABLES
+    )
+    assert autogenerate(scratch_dsn, Base.metadata, include_object=include_object) == []
+
+
+def test_when_the_alembic_revision_examples_run__then_they_create_the_tables(
+    project: Path,
+    scratch_dsn: str,
+    ca_file: Path,
+) -> None:
+    *_, revision_block = _section_blocks(ALEMBIC_SECTION)
+    statements = migration_statements(_default_schemas())
+
+    revision = _run_block(revision_block, ca_file)
+
+    assert (revision["revision"], revision["down_revision"]) == ("taskiq_tables", None)
+    assert offline_sql(revision["upgrade"]) == "".join(
+        f"{statement};\n\n" for statement in statements
+    )
+    for _ in range(2):
+        run_upgrade(scratch_dsn, "psycopg", revision["upgrade"])
+    assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
+
+    (line,) = [line for line in _shell_lines(ALEMBIC_SECTION) if line.strip()]
+    command, _, target = line.partition(" > ")
+    result = subprocess.run(  # noqa: S603
+        _taskiq(command.split()),
+        cwd=project,
+        env=_environment(scratch_dsn),
+        capture_output=True,
+        text=True,
+        timeout=SCRIPT_TIMEOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == alembic_format(
+        _default_schemas(),
+        FormatOptions(extra={"revision": "taskiq_tables"}),
+    )
+    written = project / target
+    written.parent.mkdir(parents=True)
+    written.write_text(result.stdout, encoding="utf-8")
+    generated: dict[str, Any] = {"__name__": "revision"}
+    exec(compile(result.stdout, str(written), "exec"), generated)  # noqa: S102
+    asyncio.run(_drop_tables(scratch_dsn, DEFAULT_TABLES))
+    run_upgrade(scratch_dsn, "psycopg", generated["upgrade"])
+    assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES

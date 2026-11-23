@@ -38,10 +38,24 @@ Upgrading from 0.4.x:
   workers, which can then use `run_migrations=False` and a role that only reads
   and writes rows.
 - `taskiq_postgresql.migrations` describes the tables as data (`table_schema`,
-  `collect_schemas`) and renders the script (`render_sql`), for tools that
-  build their own migrations. Other packages can add output formats to
-  `generate --format` through the `taskiq_postgresql.migration_formats` entry
-  point group; the README has the contract.
+  `collect_schemas`) and renders the script (`render_sql`), or its statements
+  one by one (`migration_statements`), for tools that build their own
+  migrations. Other packages can add output formats to `generate --format`
+  through the `taskiq_postgresql.migration_formats` entry point group; the
+  README has the contract.
+- SQLAlchemy, SQLModel and Alembic integrations, each installed as an extra:
+  `pip install "taskiq-postgresql[sqlalchemy]"`, `[sqlmodel]` or `[alembic]`.
+  `taskiq_postgresql.contrib.sqlalchemy.add_taskiq_tables` adds the tables to
+  a `MetaData` (and `taskiq_metadata` returns a new one) with the columns,
+  defaults, primary key and indexes `run_migrations=True` creates, under the
+  same names, so `create_all` builds the same tables;
+  `taskiq_postgresql.contrib.sqlmodel.add_taskiq_tables` puts them on
+  `SQLModel.metadata`. `taskiq_postgresql.contrib.alembic` gives Alembic
+  `taskiq_metadata` for `target_metadata`, `exclude_taskiq_tables` for
+  `include_object` (without it, autogenerate proposes dropping tables that
+  `run_migrations=True` created), `create_taskiq_tables(op, ...)` for a
+  revision's `upgrade()`, and `taskiq postgresql generate --format alembic`,
+  which writes a revision file.
 
 ### Changed
 
