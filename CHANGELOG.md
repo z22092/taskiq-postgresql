@@ -197,6 +197,10 @@ Upgrading from 0.4.x:
   skipped with a warning, and the NOTIFYs after it are still delivered. The
   drivers parsed the payload in their NOTIFY callback and raised `ValueError`
   there, so the warning `listen()` logs for such a payload never ran.
+- `taskiq worker` stops on SIGINT or SIGTERM while no message arrives. With the
+  asyncpg and psqlpy drivers its worker processes used to keep running until a
+  message arrived (with asyncpg, until its connection pool's idle timer fired
+  about five minutes later), and the main process waited for them.
 
 ### Removed
 
