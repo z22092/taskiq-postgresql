@@ -98,6 +98,12 @@ GOLDEN_BROKER = (
     "created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());\n"
     "CREATE INDEX IF NOT EXISTS taskiq_messages_id_idx ON taskiq_messages "
     "USING HASH (id);\n"
+    "ALTER TABLE taskiq_messages\n"
+    "  ADD COLUMN IF NOT EXISTS channel VARCHAR,\n"
+    "  ADD COLUMN IF NOT EXISTS not_before TIMESTAMP WITH TIME ZONE NOT NULL "
+    "DEFAULT NOW();\n"
+    "CREATE INDEX IF NOT EXISTS taskiq_messages_not_before_idx\n"
+    "  ON taskiq_messages (channel, not_before, id);\n"
     "COMMIT;\n"
 )
 

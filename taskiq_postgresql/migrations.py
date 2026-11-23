@@ -28,6 +28,7 @@ from typing import (
     Any,
     Final,
     Literal,
+    NamedTuple,
     Optional,
     Union,
     cast,
@@ -36,6 +37,9 @@ from typing import (
 
 from taskiq_postgresql.abc.query import (
     MIGRATION_LOCK_NAMESPACE,
+    AddColumnsQuery,
+    AddedIndex,
+    ClaimColumns,
     Column,
     CreatedAtColumn,
     CreateIndexQuery,
@@ -255,6 +259,9 @@ def table_schema(
         driver.create_table_query,
         driver.create_index_query,
         driver.index_columns or (),
+        add_columns=driver.add_columns_query,
+        added_columns=driver.added_columns,
+        added_indexes=driver.added_indexes,
     )
 
 
@@ -336,8 +343,8 @@ def render_sql(
             after the other. The lock lasts until the transaction ends.
 
     Returns:
-        The script: a header comment, then one statement per line, each ending
-        with a semicolon.
+        The script: a header comment, then each statement, starting on a new
+        line and ending with a semicolon. A statement may span several lines.
 
     Raises:
         ValueError: if ``schemas`` is empty or a table name cannot be written
@@ -556,35 +563,79 @@ def _schema(
     create_table: CreateTableQuery,
     create_index: CreateIndexQuery,
     index_columns: Sequence[Column],
+    *,
+    add_columns: AddColumnsQuery,
+    added_columns: Sequence[Column],
+    added_indexes: Sequence[AddedIndex],
 ) -> TableSchema:
     name = create_table.table_name
     _check_table_name(name)
-    return TableSchema(
-        kind=kind,
-        name=name,
-        columns=tuple(_column_schema(column) for column in create_table.columns),
-        indexes=tuple(
-            IndexSchema(
-                name=index_name(name, column),
-                columns=(column.name,),
-                method="hash",
-            )
-            for column in index_columns
-        ),
-        steps=(
-            MigrationStep(
-                number=1,
-                statements=(
-                    create_table.make_query(),
-                    # One statement per index; make_query ends each with ";".
-                    *(
-                        create_index.make_query([column]).removesuffix(";")
-                        for column in index_columns
-                    ),
+    steps = [
+        MigrationStep(
+            number=1,
+            statements=(
+                create_table.make_query(),
+                # One statement per index; make_query ends each with ";".
+                *(
+                    create_index.make_query([column]).removesuffix(";")
+                    for column in index_columns
                 ),
             ),
         ),
+    ]
+    if added_columns or added_indexes:
+        # What the driver runs after the CREATEs, so a table an older release
+        # created gets it too.
+        steps.append(
+            MigrationStep(
+                number=2,
+                statements=_added_statements(add_columns, added_columns, added_indexes),
+            ),
+        )
+    return TableSchema(
+        kind=kind,
+        name=name,
+        # ADD COLUMN appends, so the added columns come last in the table.
+        columns=tuple(
+            _column_schema(column) for column in (*create_table.columns, *added_columns)
+        ),
+        indexes=(
+            *(
+                IndexSchema(
+                    name=index_name(name, column),
+                    columns=(column.name,),
+                    method="hash",
+                )
+                for column in index_columns
+            ),
+            *(
+                IndexSchema(
+                    name=index.name,
+                    columns=tuple(column.name for column in index.columns),
+                    method="btree",
+                )
+                for index in added_indexes
+            ),
+        ),
+        steps=tuple(steps),
     )
+
+
+def _added_statements(
+    add_columns: AddColumnsQuery,
+    added_columns: Sequence[Column],
+    added_indexes: Sequence[AddedIndex],
+) -> tuple[str, ...]:
+    # The driver runs make_query(added_columns, added_indexes) as one string:
+    # the ALTER TABLE, then each CREATE INDEX, each ending with ";". Built one
+    # statement at a time from the same query, so the text stays the same.
+    statements = []
+    if added_columns:
+        statements.append(add_columns.make_query(added_columns).removesuffix(";"))
+    statements.extend(
+        add_columns.make_query((), [index]).removesuffix(";") for index in added_indexes
+    )
+    return tuple(statements)
 
 
 def _component_classes() -> dict[ComponentKind, type]:
@@ -643,65 +694,93 @@ def _schema_of_kind(
                 "the scheduler source has no task_id column; "
                 "field_for_task_id does not apply to it",
             )
-        columns, index_columns = _scheduler_source_columns()
+        parts = _scheduler_source_parts()
     else:
         task_id_type = field_for_task_id or _default(
             component_class,
             "field_for_task_id",
         )
-        columns, index_columns = (
-            _broker_columns(task_id_type)
+        parts = (
+            _broker_parts(name, task_id_type)
             if component_kind == "broker"
-            else _result_backend_columns(task_id_type)
+            else _result_backend_parts(task_id_type)
         )
     return _schema(
         component_kind,
-        CreateTableQuery(name, columns),
+        CreateTableQuery(name, parts.columns),
         CreateIndexQuery(name),
-        index_columns,
+        parts.index_columns,
+        add_columns=AddColumnsQuery(name),
+        added_columns=parts.added_columns,
+        added_indexes=parts.added_indexes,
     )
 
 
-# Each builder below hands the CREATE TABLE the columns in the order the
-# component hands them to its driver: primary key, columns, created_at.
+class _TableParts(NamedTuple):
+    """What a component hands its driver, for a table described by kind."""
+
+    columns: list[Column]
+    index_columns: list[Column]
+    added_columns: Sequence[Column] = ()
+    added_indexes: Sequence[AddedIndex] = ()
+
+
+# Each builder below hands the driver what the component hands it: the
+# CREATE TABLE columns in its order (primary key, columns, created_at), the
+# hash-indexed columns, and the columns and indexes added after the CREATEs.
 # test_a_kind_describes_the_same_table_as_a_component pins them to it.
 
 
-def _broker_columns(task_id_type: str) -> tuple[list[Column], list[Column]]:
+def _broker_parts(table_name: str, task_id_type: str) -> _TableParts:
     from taskiq_postgresql.broker import Table  # noqa: PLC0415
 
     table = Table(task_id=Column(name="task_id", type_=task_id_type))
-    columns = [
-        table.primary_key,
-        table.task_id,
-        table.task_name,
-        table.message,
-        table.labels,
-        table.created_at,
-    ]
-    return columns, [table.primary_key]
+    claim_columns = ClaimColumns(channel=table.channel, not_before=table.not_before)
+    return _TableParts(
+        columns=[
+            table.primary_key,
+            table.task_id,
+            table.task_name,
+            table.message,
+            table.labels,
+            table.created_at,
+        ],
+        index_columns=[table.primary_key],
+        added_columns=claim_columns,
+        added_indexes=[
+            AddedIndex(
+                name=index_name(table_name, table.not_before),
+                columns=[*claim_columns, table.primary_key],
+            ),
+        ],
+    )
 
 
-def _result_backend_columns(task_id_type: str) -> tuple[list[Column], list[Column]]:
+def _result_backend_parts(task_id_type: str) -> _TableParts:
     from taskiq_postgresql.result_backend import Table  # noqa: PLC0415
 
     table = Table(primary_key=PrimaryKeyColumn(name="task_id", type_=task_id_type))
     # The result backend leaves created_at to the driver's default.
-    return [table.primary_key, table.result, CreatedAtColumn()], [table.primary_key]
+    return _TableParts(
+        columns=[table.primary_key, table.result, CreatedAtColumn()],
+        index_columns=[table.primary_key],
+    )
 
 
-def _scheduler_source_columns() -> tuple[list[Column], list[Column]]:
+def _scheduler_source_parts() -> _TableParts:
     from taskiq_postgresql.scheduler_source import Table  # noqa: PLC0415
 
     table = Table()
-    columns = [
-        table.primary_key,
-        table.task_name,
-        table.schedule,
-        table.updated_at,
-        table.created_at,
-    ]
-    return columns, [table.primary_key, table.task_name]
+    return _TableParts(
+        columns=[
+            table.primary_key,
+            table.task_name,
+            table.schedule,
+            table.updated_at,
+            table.created_at,
+        ],
+        index_columns=[table.primary_key, table.task_name],
+    )
 
 
 def _collect(

@@ -18,9 +18,10 @@ Upgrading from 0.4.x:
   warning in the log, any stored schedule it cannot read: check the log after
   upgrading and fix or delete the rows it names.
 - The broker's table gets two columns, `channel` and `not_before`, and an
-  index on them. With `run_migrations=True`, `startup()` adds them. Otherwise
-  run this once per broker table before deploying (shown for the default
-  `taskiq_messages`):
+  index on them. With `run_migrations=True`, `startup()` adds them, and so do
+  `taskiq postgresql migrate` and the script `taskiq postgresql generate`
+  prints. Otherwise run this once per broker table before deploying (shown for
+  the default `taskiq_messages`):
 
   ```sql
   ALTER TABLE taskiq_messages
@@ -88,9 +89,10 @@ Upgrading from 0.4.x:
   value that is not a finite number of seconds above zero, or a `bool`, raises
   `ValueError`.
 - `taskiq postgresql generate` prints the SQL script that creates the tables
-  and indexes, with your table names and `field_for_task_id`, so you can run
-  it yourself (`psql -f`) or add it to Alembic, Django or Flyway
-  (`--no-transaction`). It reads the components from your application
+  and indexes and adds the broker's `channel` and `not_before` columns, so it
+  also upgrades a broker table 0.4.x created. It uses your table names and
+  `field_for_task_id`, so you can run it yourself (`psql -f`) or add it to
+  Alembic, Django or Flyway (`--no-transaction`). It reads the components from your application
   (`app:broker`, `app:scheduler`, as `taskiq worker` does) or, without
   importing it, from `--component`. The script takes the same advisory lock as
   `run_migrations=True` and is safe to run again.

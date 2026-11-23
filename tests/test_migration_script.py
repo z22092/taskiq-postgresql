@@ -48,6 +48,7 @@ from tests.helpers import (
     run_script,
 )
 from tests.test_migrations import (
+    BROKER_TABLE_0_4_SQL,
     close_component,
     scram_verifier,
     wait_until_blocked_by,
@@ -160,7 +161,7 @@ async def catalog(
 
 
 @pytest.mark.parametrize(("kind", "field"), SHAPES, ids=SHAPE_IDS)
-def test_step_one_is_the_sql_run_migrations_executes(
+def test_the_steps_are_the_sql_run_migrations_executes(
     kind: str,
     field: Optional[str],
     driver: str,
@@ -170,19 +171,36 @@ def test_step_one_is_the_sql_run_migrations_executes(
 
     schema = table_schema(component)
 
-    (step,) = schema.steps
+    step, *later_steps = schema.steps
     create_table, *create_indexes = step.statements
     assert step.number == 1
     assert create_table == runtime.create_table_query.make_query()
     assert "\n".join(f"{statement};" for statement in create_indexes) == (
         runtime.create_index_query.make_query(runtime.index_columns)
     )
-    # The startup fast path checks exactly the relations the step creates.
+    # Only the broker's table got columns after its first release.
+    if kind == "broker":
+        (upgrade,) = later_steps
+        assert upgrade.number == 2  # noqa: PLR2004
+        assert "\n".join(f"{statement};" for statement in upgrade.statements) == (
+            runtime.add_columns_query.make_query(
+                runtime.added_columns,
+                runtime.added_indexes,
+            )
+        )
+    else:
+        assert later_steps == []
+        assert (runtime.added_columns, runtime.added_indexes) == ((), ())
+    # The startup fast path checks exactly the relations the steps create.
     assert [schema.name, *(index.name for index in schema.indexes)] == (
-        runtime.relations_exist_query.relation_names(runtime.index_columns)
+        runtime.relations_exist_query.relation_names(
+            runtime.index_columns,
+            added_indexes=runtime.added_indexes,
+        )
     )
     assert [column.name for column in schema.columns] == [
-        column.name for column in runtime.create_table_query.columns
+        column.name
+        for column in (*runtime.create_table_query.columns, *runtime.added_columns)
     ]
 
 
@@ -232,9 +250,28 @@ def test_columns_and_indexes_are_described_without_sql_text() -> None:
             "NOW()",
             False,
         ),
+        # Added by step 2, so they come last in the table.
+        ColumnSchema("channel", "VARCHAR", "varchar", None, True, None, False),
+        ColumnSchema(
+            "not_before",
+            "TIMESTAMP WITH TIME ZONE",
+            "timestamptz",
+            None,
+            False,
+            "NOW()",
+            False,
+        ),
     )
     assert broker.primary_key == broker.columns[0]
-    assert broker.indexes == (IndexSchema("taskiq_messages_id_idx", ("id",), "hash"),)
+    assert broker.indexes == (
+        IndexSchema("taskiq_messages_id_idx", ("id",), "hash"),
+        IndexSchema(
+            "taskiq_messages_not_before_idx",
+            ("channel", "not_before", "id"),
+            "btree",
+        ),
+    )
+    assert [step.number for step in broker.steps] == [1, 2]
 
     scheduler = table_schema("scheduler_source")
     task_name = next(c for c in scheduler.columns if c.name == "task_name")
@@ -398,7 +435,8 @@ def test_an_import_path_is_loaded_the_way_taskiq_worker_loads_it(
 def test_the_script_has_a_header_and_ends_every_statement() -> None:
     schemas = [table_schema("broker"), table_schema("result_backend")]
 
-    lines = render_sql(schemas).splitlines()
+    script = render_sql(schemas)
+    lines = script.splitlines()
 
     assert lines[:2] == [
         f"-- taskiq-postgresql {version('taskiq-postgresql')}",
@@ -406,13 +444,24 @@ def test_the_script_has_a_header_and_ends_every_statement() -> None:
     ]
     assert lines[2] == "BEGIN;"
     assert lines[-1] == "COMMIT;"
-    assert all(line.endswith(";") for line in lines[2:])
-    assert [line for line in lines if line.startswith("CREATE")] == [
-        f"{statement};"
-        for schema in schemas
-        for step in schema.steps
-        for statement in step.statements
-    ]
+    # A statement may span lines (step 2's ALTER TABLE does), so the script is
+    # checked whole: each statement on lines of its own, ending with ";".
+    assert script == "\n".join(
+        [
+            *lines[:2],
+            "BEGIN;",
+            *lock_lines(script),
+            *(
+                f"{statement};"
+                for schema in schemas
+                for step in schema.steps
+                for statement in step.statements
+            ),
+            "COMMIT;",
+            "",
+        ],
+    )
+    assert len(lock_lines(script)) == len(schemas)
     assert render_sql(schemas) == render_sql(
         [table_schema("broker"), table_schema("result_backend")],
     )
@@ -571,6 +620,48 @@ async def test_the_script_runs_twice(
         "AND relname = ANY($1::text[])",
         [schema.name for schema in schemas],
     ) == len(KINDS)
+
+
+@pytest.mark.anyio
+async def test_the_script_brings_a_0_4_broker_table_up_to_date(
+    driver: str,
+    empty_dsn: str,
+    inspector: asyncpg.Connection,
+    postgres_table: str,
+) -> None:
+    upgraded, started = f"{postgres_table}_script", f"{postgres_table}_startup"
+    await inspector.execute(BROKER_TABLE_0_4_SQL.format(table=upgraded))
+    await inspector.execute(
+        f"INSERT INTO {upgraded} (task_id, task_name, message, labels) "  # noqa: S608
+        "VALUES (gen_random_uuid(), 'old_task', 'old', '{}')",
+    )
+    script = render_sql([table_schema("broker", table_name=upgraded)])
+    rows_query = (
+        "SELECT message, channel IS NULL AS no_channel,"  # noqa: S608
+        " not_before >= created_at AND not_before <= NOW() AS due,"
+        f" not_before FROM {upgraded}"
+    )
+
+    await run_script(empty_dsn, driver, script)
+    first = [tuple(row) for row in await inspector.fetch(rows_query)]
+    await run_script(empty_dsn, driver, script)
+    second = [tuple(row) for row in await inspector.fetch(rows_query)]
+    component = build_component(
+        "broker",
+        dsn=empty_dsn,
+        table_name=started,
+        driver=driver,
+    )
+    try:
+        await component.startup()
+    finally:
+        await close_component(component)
+
+    # The old row is kept, without a channel, due since the upgrade.
+    assert [row[:3] for row in first] == [(b"old", True, True)]
+    # The second run changed nothing, not even the default it filled in.
+    assert second == first
+    assert await catalog(inspector, upgraded) == await catalog(inspector, started)
 
 
 @pytest.mark.anyio

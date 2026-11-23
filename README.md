@@ -450,7 +450,9 @@ Only the script goes to standard output; messages go to standard error. The
 script starts with a comment that names the package version and the tables,
 then runs in one transaction: it takes, per table, the advisory lock
 `run_migrations=True` takes, then creates each table and index with
-`IF NOT EXISTS`. So it is safe to run again, and safe while workers with
+`IF NOT EXISTS` and adds the broker's `channel` and `not_before` columns and
+their index the same way, which also upgrades a broker table created by 0.4.x.
+So it is safe to run again, and safe while workers with
 `run_migrations=True` are starting. The statements are the ones in
 [Database schema](#database-schema), with your table names and
 `field_for_task_id`.

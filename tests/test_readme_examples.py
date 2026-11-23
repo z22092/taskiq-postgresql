@@ -501,8 +501,11 @@ def test_when_the_schema_blocks_are_read__then_they_match_the_generated_sql() ->
     for kind in migrations.COMPONENT_KINDS:
         schema = table_schema(kind)
         script = render_sql([schema], transaction=False, lock=False)
+        # Step 2's statements span lines, so the lines are joined with a break.
         generated[schema.name] = _normalized_sql(
-            "".join(line for line in script.splitlines() if not line.startswith("--")),
+            "\n".join(
+                line for line in script.splitlines() if not line.startswith("--")
+            ),
         )
     documented = {}
     for block in _blocks("sql"):
