@@ -399,9 +399,11 @@ Use the feature request template and include:
 tests/
 ├── conftest.py                 # Fixtures: postgresql_dsn, drivers, teardown
 ├── helpers.py                  # Shared helpers: teardown, scratch databases, DSN and port utilities
+├── silent_proxy.py             # TCP proxy that makes a connection go silent, refuse or drop
 ├── test_dsn.py                 # DSN validation tests
 ├── test_readme_examples.py     # Runs the README's examples and checks its tables
 ├── test_broker.py              # Broker functionality tests
+├── test_listen_recovery.py     # Lost and silent connections: reopening LISTEN, bounded waits
 ├── test_result_backend.py      # Result backend tests
 └── test_scheduler_source.py    # Scheduler tests
 ```

@@ -42,7 +42,11 @@ async def get_first_task(
 
 
 @pytest.mark.parametrize(
-    "poll_interval",
+    "argument",
+    ["poll_interval", "health_check_interval", "query_timeout"],
+)
+@pytest.mark.parametrize(
+    "value",
     [
         pytest.param(0, id="zero"),
         pytest.param(-1, id="negative"),
@@ -52,11 +56,12 @@ async def get_first_task(
         pytest.param("1", id="str"),
     ],
 )
-def test_when_poll_interval_is_not_a_positive_number__then_broker_refuses_it(
-    poll_interval: object,
+def test_when_a_duration_is_not_a_positive_number__then_broker_refuses_it(
+    argument: str,
+    value: object,
 ) -> None:
-    with pytest.raises(ValueError, match="poll_interval"):
-        PostgresqlBroker(dsn="postgresql://localhost/db", poll_interval=poll_interval)
+    with pytest.raises(ValueError, match=argument):
+        PostgresqlBroker(dsn="postgresql://localhost/db", **{argument: value})
 
 
 def test_poll_interval_defaults_to_one_second() -> None:
@@ -66,6 +71,15 @@ def test_poll_interval_defaults_to_one_second() -> None:
     assert (
         PostgresqlBroker(dsn="postgresql://localhost/db", poll_interval=quarter_second)
     ).poll_interval == quarter_second
+
+
+def test_when_no_recovery_setting_is_given__then_the_drivers_get_30_seconds() -> None:
+    broker = PostgresqlBroker(dsn="postgresql://localhost/db")
+    half_minute = 30.0
+
+    assert broker.driver.query_timeout == half_minute
+    assert broker.listen_driver.health_check_interval == half_minute
+    assert broker.listen_driver.query_timeout == half_minute
 
 
 async def test_failure_connection_database(
@@ -270,30 +284,26 @@ async def insert_due_later(
 
 async def test_when_the_listen_connection_is_closed__then_the_sweep_still_delivers(
     broker: PostgresqlBroker,
-    driver: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Without LISTEN the worker keeps delivering by polling, without a busy loop."""
+    """Without LISTEN the worker keeps delivering, warns once and does not spin."""
     loop = asyncio.get_running_loop()
     message = immediate_message(b"polled")
+    # listen() reopens it; the fixture's teardown closes the reopened one.
     await broker.listen_driver.on_shutdown()
-    try:
-        worker_task = asyncio.create_task(get_first_task(broker))
-        await asyncio.sleep(0.2)
-        await broker.kick(message)
+    worker_task = asyncio.create_task(get_first_task(broker))
+    await asyncio.sleep(0.2)
+    await broker.kick(message)
 
-        # A listen() spinning without awaiting would hold this sleep back.
-        slept_from = loop.time()
-        await asyncio.sleep(0.05)
-        assert loop.time() - slept_from < RESPONSIVE_WITHIN
+    # A listen() spinning without awaiting would hold this sleep back.
+    slept_from = loop.time()
+    await asyncio.sleep(0.05)
+    assert loop.time() - slept_from < RESPONSIVE_WITHIN
 
-        received = await asyncio.wait_for(
-            worker_task,
-            timeout=broker.poll_interval + 3,
-        )
-    finally:
-        # The fixture's teardown closes a running LISTEN connection.
-        await broker.listen_driver.on_startup()
+    received = await asyncio.wait_for(
+        worker_task,
+        timeout=broker.poll_interval + 3,
+    )
 
     assert received.data == message.message
     polling_warnings = [
@@ -301,12 +311,7 @@ async def test_when_the_listen_connection_is_closed__then_the_sweep_still_delive
         for record in caplog.records
         if record.levelname == "WARNING" and "polling" in record.getMessage()
     ]
-    # psqlpy's listen driver waits on its queue in a `while True` loop, so its
-    # iterator never ends when the connection closes and listen() never sees
-    # LISTEN stop; the sweep delivers all the same. A limitation of that
-    # driver, outside this broker's code.
-    expected_warnings = 0 if driver == "psqlpy" else 1
-    assert len(polling_warnings) == expected_warnings
+    assert len(polling_warnings) == 1
 
 
 async def test_when_a_notify_is_not_a_message_id__then_listen_warns_and_keeps_listening(
@@ -354,7 +359,7 @@ async def test_when_the_server_ends_the_listen_connection__then_listen_backs_off
     driver: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """Once LISTEN dies, listen() warns once and does not spin; sweeps deliver."""
+    """Once LISTEN dies, listen() warns once, does not spin and still delivers."""
     loop = asyncio.get_running_loop()
     # A channel of its own, so only this worker's LISTEN backend is ended.
     channel = f"{broker.channel_name}_ended"
@@ -392,7 +397,9 @@ async def test_when_the_server_ends_the_listen_connection__then_listen_backs_off
             f"%LISTEN%{channel}%",
         )
         ticking = asyncio.create_task(slowest_tick())
-        # LISTEN is gone, so only a sweep can deliver this message.
+        # Long enough for LISTEN to be reopened, about half a second after it
+        # died: the message comes by NOTIFY or by a sweep, and either way the
+        # loop must neither spin nor flood the log meanwhile.
         await asyncio.sleep(0.5)
         await worker.kick(message)
         slowest = await asyncio.wait_for(ticking, timeout=TICKS * 0.05 + 3)
@@ -417,10 +424,7 @@ async def test_when_the_server_ends_the_listen_connection__then_listen_backs_off
         for record in logged
         if "LISTEN on channel" in record.getMessage()
     ]
-    # psqlpy's listener never ends its iterator when the server ends the
-    # connection, so listen() cannot tell; the sweep delivers all the same.
-    # Fixing that driver is outside this change (a follow-up).
-    assert len(listen_stopped) == (0 if driver == "psqlpy" else 1)
+    assert len(listen_stopped) == 1
     assert received == [message.message]
 
 
