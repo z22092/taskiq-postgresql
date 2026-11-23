@@ -639,7 +639,8 @@ def test_migrate_in_process_creates_the_tables_and_closes_its_pools(
         False,
     ]
     assert [component.driver.pool for component in components] == [None, None, None]
-    assert not hasattr(app.broker.listen_driver, "connection")
+    # No LISTEN connection was opened: the listen driver starts with None.
+    assert getattr(app.broker.listen_driver, "connection", None) is None
 
 
 def test_migrate_fails_with_1_when_the_database_is_unreachable(
