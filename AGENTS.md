@@ -95,8 +95,10 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   whose payload is the integer id the broker's own INSERT returned. Table,
   column names come from configuration and are emitted unquoted. Channel
   names are unquoted in `NOTIFY` and in psycopg's and psqlpy's `LISTEN`, but
-  asyncpg sends `LISTEN "<channel>"` quoted, so a channel name with upper case
-  letters is lost on asyncpg and psqlpy: keep `channel_name` lower case.
+  asyncpg sends `LISTEN "<channel>"` quoted, so with a channel name that has
+  upper case letters an asyncpg worker gets no `NOTIFY` and delivers only
+  through the sweep, up to `poll_interval` seconds late (psqlpy and psycopg
+  get the `NOTIFY`): keep `channel_name` lower case.
 - **Schema.** Tables are created with `CREATE TABLE IF NOT EXISTS` when
   `run_migrations=True`, so existing deployments keep their tables. Columns
   added later (the broker's `channel` and `not_before` and their index) come

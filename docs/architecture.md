@@ -93,14 +93,18 @@ PostgreSQL folds them to lower case. Channel names are not handled the same by
 every driver (measured with `log_statement=all`): the broker sends
 `NOTIFY <channel>, '<id>'` unquoted, which folds the name; psycopg and psqlpy
 send `LISTEN <channel>` unquoted too, but asyncpg's `add_listener` sends
-`LISTEN "<channel>"` quoted, which keeps the case. A channel name with upper
-case letters therefore delivers on psycopg only; asyncpg and psqlpy never
-receive the message. Use a lower-case `channel_name`. Two statements are
-formatted outside the builders: `LISTEN` in the listen drivers (psycopg's
-`LISTEN <channel>` that subscribes, and in all three the health check, which
-repeats the statement that registered the channel, quoting included), and
-`NOTIFY <channel>, '<id>'` in the broker, whose payload is the integer id its
-own INSERT returned.
+`LISTEN "<channel>"` quoted, which keeps the case. With a channel name that
+has upper case letters, an asyncpg worker therefore gets no `NOTIFY`: the
+message waits for the next sweep, which compares the stored channel as is and
+delivers it within `poll_interval` seconds. psqlpy and psycopg workers get
+the `NOTIFY`. Use a lower-case `channel_name`, so that every driver delivers
+at once.
+
+Two statements are formatted outside the builders: `LISTEN` in the listen
+drivers (psycopg's `LISTEN <channel>` that subscribes, and in all three the
+health check, which repeats the statement that registered the channel,
+quoting included), and `NOTIFY <channel>, '<id>'` in the broker, whose
+payload is the integer id its own INSERT returned.
 
 ### Tables
 
@@ -178,11 +182,13 @@ sequenceDiagram
    once gets a `NOTIFY` with the new row id; a delayed one waits in the table
    for a sweep, so its delivery does not depend on the producer's process. A
    failed `NOTIFY` is logged as a warning, and the sweep delivers the message.
-2. `listen()` runs one task that reads the listen driver and queues the id the
-   broker parses from each payload. Its loop claims a notified id at once
-   (`ClaimByIdQuery`), and sweeps the channel for due messages
-   (`ClaimDueQuery`) when it starts and then every `poll_interval` seconds,
-   however many notifications arrive in between.
+2. `listen()` starts two tasks: one reads the listen driver, queues the id the
+   broker parses from each payload and reopens the connection when it is lost
+   (`_queue_notified_ids`); the other waits for `shutdown()` and then wakes
+   the loop up (`_end_on_shutdown`). The loop of `listen()` itself claims a
+   notified id at once (`ClaimByIdQuery`), and sweeps the channel for due
+   messages (`ClaimDueQuery`) when it starts and then every `poll_interval`
+   seconds, however many notifications arrive in between.
 3. Each claim is one `DELETE ... RETURNING`; PostgreSQL gives the row to one
    worker, and the others get no row and move on. The message is yielded as an
    `AckableMessage` whose `ack` is a no-op, because the row is already gone.
