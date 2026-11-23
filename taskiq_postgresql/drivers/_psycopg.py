@@ -73,6 +73,10 @@ async def _answered_within(
     if timeout is None:
         return await answer
     task = ensure_future(answer)
+    # A second cancellation, such as shutdown() and then the end of listen(),
+    # can stop _give_up() before it gathers the task; asyncio would then report
+    # the error of an answer nobody waits for any more as never retrieved.
+    task.add_done_callback(_read_outcome)
     try:
         done, _ = await wait({task}, timeout=timeout)
     finally:
@@ -81,6 +85,12 @@ async def _answered_within(
     if not done:
         raise AsyncTimeoutError
     return task.result()
+
+
+def _read_outcome(task: Future[Any]) -> None:
+    """Mark the error of ``task``, if any, as read."""
+    if not task.cancelled():
+        task.exception()
 
 
 async def _give_up(connection: AsyncConnection[Any], task: Future[Any]) -> None:

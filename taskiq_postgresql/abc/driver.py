@@ -250,7 +250,12 @@ class ListenDriver(_ConnectionStringHolder, ABC):
 
     @abstractmethod
     async def on_startup(self) -> None:
-        """On startup."""
+        """
+        Open the connection and LISTEN on the channel.
+
+        Return only once LISTEN is in effect: the iterator must yield every
+        NOTIFY sent after this returns, even one sent before anything iterates.
+        """
 
     @abstractmethod
     async def on_shutdown(self) -> None:

@@ -10,6 +10,7 @@ from taskiq.utils import maybe_awaitable
 
 from taskiq_postgresql import PostgresqlBroker
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+from tests.helpers import NOTIFY_DELIVERS_WITHIN
 
 pytestmark = pytest.mark.anyio
 
@@ -19,8 +20,6 @@ RESPONSIVE_WITHIN = 0.5
 NOTIFY_FLOOD_SECONDS = 3
 # A poll_interval no test waits for, so a message received came by NOTIFY.
 SWEEP_OUT_OF_THE_WAY = 60.0
-# How long a listening worker may take to claim a message it is notified of.
-NOTIFY_DELIVERS_WITHIN = 3
 # A poll_interval short enough for many retries within a two-second test.
 FAST_SWEEP = 0.2
 # Sleeps of 0.05 s in a row beside listen(): two seconds of them.

@@ -335,6 +335,13 @@ class PsqlpyListenDriver(ListenDriver):
             listener = self.listener = pool.listener()
             await listener.add_callback(self.channel_name, _ignore_notify)
             await listener.startup()
+            # psqlpy (0.13.1 at least) sends its own LISTEN only once
+            # iterating starts, so a NOTIFY before that would be lost: listen
+            # before returning (psqlpy-python/psqlpy#179).
+            await wait_for(
+                listener.connection.execute(self._listen_statement),
+                self.query_timeout,
+            )
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
         self._reader = create_task(self._read(listener, self._queue))

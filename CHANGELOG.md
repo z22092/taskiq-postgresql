@@ -326,6 +326,9 @@ Upgrading from 0.4.x:
   seconds (asyncpg may take up to about twice that) and logged, and asyncpg
   now drops that connection from the pool instead of waiting on it until the
   operating system gives up on the socket.
+- With psqlpy, a NOTIFY sent right after a worker starts, or right after its
+  LISTEN connection is reopened, is delivered at once. psqlpy sends `LISTEN`
+  only once reading begins, so such a NOTIFY could reach no listener.
 
 ### Removed
 

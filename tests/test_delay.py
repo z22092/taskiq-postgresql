@@ -13,6 +13,7 @@ from taskiq_postgresql import PostgresqlBroker
 from taskiq_postgresql import broker as broker_module
 from taskiq_postgresql.abc import query as sql_builders
 from taskiq_postgresql.abc.query import Column, PrimaryKeyColumn
+from tests.helpers import NOTIFY_DELIVERS_WITHIN
 
 pytestmark = pytest.mark.anyio
 
@@ -410,8 +411,6 @@ async def test_when_delay_label_is_negative__then_message_is_delivered_at_once(
 
 # A poll_interval no test waits for, so a message received came by NOTIFY.
 SWEEP_OUT_OF_THE_WAY = 60.0
-# How soon a listening worker claims a message once its NOTIFY is sent.
-NOTIFY_DELIVERS_WITHIN = 0.5
 
 
 @pytest.mark.parametrize("delay", ["0", "-1"])
