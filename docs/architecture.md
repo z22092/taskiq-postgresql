@@ -145,6 +145,44 @@ transactions. `taskiq postgresql migrate` runs the migration of
 steps are the statements the drivers build for `on_startup` and that the
 script builds the catalog `on_startup` builds.
 
+The same module compares a database with that description. Each step also
+names what it creates (`MigrationStep.objects`, a `StepObjects`: whether it
+creates the table, its columns, its indexes). `catalog_query` is one read-only
+`SELECT` with the names written in as literals, so every driver runs it as it
+is; it resolves each table and index name with `to_regclass` and returns, as
+one JSON text value, the relation's kind and columns (`pg_attribute`, with
+`format_type`) and, per index name, whether it is an index of that table,
+`indisvalid`, its access method, columns, uniqueness and predicate.
+`CatalogState.from_json` reads it, and `plan_migration` compares it with the
+steps: a step whose table, column or index is absent is pending (`required`
+when the table or a column is missing, `advisory` when only an index is), and
+since every statement is `IF NOT EXISTS`, running the whole step again
+completes it. What `IF NOT EXISTS` would skip becomes a `SchemaProblem`
+instead, never DDL: a name another relation took, an index on another table,
+an invalid index, an index of another shape, a column of another type, or a
+missing column that only a step's `CREATE TABLE` creates, which skips a table
+that exists. A released step never changes; `tests/golden/migration_steps.sql`
+pins them.
+
+`contrib/alembic.py` puts that engine into Alembic's autogenerate. Importing it
+registers `compare_taskiq_steps` as a schema comparator that runs after
+Alembic's own. It finds the descriptions `taskiq_metadata` and
+`add_taskiq_tables` (`contrib/sqlalchemy.py`) leave in `MetaData.info`, runs
+`catalog_query` on autogenerate's connection, and calls `plan_migration`. It
+removes the `create_table`, `add_column` and `create_index` operations Alembic
+proposed for objects of the pending steps, keeps every other operation (a type
+change still shows), and adds one `TaskiqStepOp` per pending step; problems
+become warnings in the log. A `TaskiqStepOp` renders as `op.execute(...)`
+calls holding the step's SQL, so a revision runs the statements
+`run_migrations=True` runs without importing the package; its downgrade does
+nothing, the DDL being additive. Unless configured to `0`, each step sets its
+own `lock_timeout` (`SET LOCAL`) before it takes the same advisory lock, and
+ends by giving
+Alembic's transaction back the `lock_timeout` it had, so the user's own
+migrations in that transaction keep theirs. `upgrade_taskiq_tables` runs the same steps, up to a given step
+number, from a hand-written revision, and `alembic check` fails while a step
+is missing because `TaskiqStepOp` is an upgrade operation.
+
 | Table | Columns | Indexes |
 |---|---|---|
 | `taskiq_messages` | `id SERIAL` (PK), `task_id` (type from `field_for_task_id`), `task_name VARCHAR`, `message BYTEA`, `labels JSONB`, `created_at`; added: `channel VARCHAR`, `not_before TIMESTAMP WITH TIME ZONE` | hash on `id`; added: btree `taskiq_messages_not_before_idx` on `(channel, not_before, id)` |
