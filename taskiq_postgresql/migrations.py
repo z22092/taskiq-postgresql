@@ -37,6 +37,7 @@ from typing import (
     Literal,
     NamedTuple,
     Optional,
+    TypeVar,
     Union,
     get_args,
 )
@@ -85,6 +86,7 @@ __all__ = [
     "MigrationStep",
     "PendingStep",
     "ProblemCode",
+    "RenderedStep",
     "SchemaProblem",
     "Severity",
     "StepObjects",
@@ -95,14 +97,22 @@ __all__ = [
     "UnknownMigrationFormatError",
     "available_formats",
     "catalog_query",
+    "check_comment",
+    "check_lock_timeout",
+    "check_plain_identifier",
     "collect_components",
     "collect_schemas",
     "load_format",
     "migration_statements",
+    "package_version",
+    "parse_target",
     "plan_migration",
     "read_catalog",
     "render_sql",
+    "render_steps",
+    "scoped_lock_timeout",
     "sql_format",
+    "step_statements",
     "table_schema",
 ]
 
@@ -165,6 +175,134 @@ _TYPE_NAMES: Final[Mapping[str, TypeName]] = {
     "TIMESTAMPTZ": "timestamptz",
 }
 _SIZED_TYPE: Final = re.compile(r"(?P<name>VARCHAR)\((?P<length>[1-9][0-9]*)\)")
+# The SQL writes table and index names unquoted. A name made of these
+# characters stays one name; any other could name two tables, or end the
+# statement, where a migration file writes it.
+_PLAIN_IDENTIFIER: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
+# PEP 263: on one of the first two lines of a Python file, a comment that
+# matches this declares the encoding Python decodes the whole file with.
+# Matched without regard to case, wider than Python's own pattern.
+_ENCODING_DECLARATION: Final = re.compile(r"coding[:=]\s*[-\w.]+", re.IGNORECASE)
+_T = TypeVar("_T")
+
+
+def check_plain_identifier(name: str) -> str:
+    """
+    Refuse a table or index name that a migration file cannot write unquoted.
+
+    The SQL names tables and indexes without quotes, so a name made of other
+    characters could name two tables, or end a statement.
+
+    Args:
+        name: The name.
+
+    Returns:
+        ``name``, unchanged.
+
+    Raises:
+        ValueError: if ``name`` is not letters, digits, ``_`` and ``$``,
+            starting with a letter or ``_``.
+    """
+    if _PLAIN_IDENTIFIER.fullmatch(name) is None:
+        raise ValueError(
+            f"{name!r} is not a plain SQL identifier (letters, digits, _ and $, "
+            "not starting with a digit), and the SQL writes it unquoted",
+        )
+    return name
+
+
+def check_comment(text: str) -> str:
+    """
+    Refuse text that a comment line of a migration file cannot hold.
+
+    A line break would end the comment and leave the rest of it as code, a
+    NUL reaches neither PostgreSQL nor Python, and an encoding declaration
+    (PEP 263, such as ``coding: utf-7``) on one of the first two lines of a
+    Python file changes how Python reads the whole file.
+
+    Args:
+        text: The comment, without its comment marker.
+
+    Returns:
+        ``text``, unchanged.
+
+    Raises:
+        ValueError: if ``text`` holds a line break, a NUL or an encoding
+            declaration.
+    """
+    if any(character in text for character in "\0\r\n"):
+        raise ValueError(
+            f"comment {text!r} cannot be written in a migration file: it holds "
+            "a line break or a NUL",
+        )
+    declaration = _ENCODING_DECLARATION.search(text)
+    if declaration is not None:
+        raise ValueError(
+            f"comment {text!r} cannot be written in a migration file: "
+            f"{declaration[0]!r} is an encoding declaration, which Python reads "
+            "on the first two lines of a file",
+        )
+    return text
+
+
+def check_lock_timeout(seconds: int) -> int:
+    """
+    Refuse a lock timeout that no migration could set.
+
+    Args:
+        seconds: The seconds a statement waits for a lock; ``0`` for none.
+
+    Returns:
+        ``seconds``, unchanged.
+
+    Raises:
+        ValueError: if ``seconds`` is not a whole number from 0 to 2147483
+            (the server keeps it as milliseconds in an int).
+    """
+    # A bool is an int, and True would read as one second.
+    if (
+        isinstance(seconds, bool)
+        or not isinstance(seconds, int)
+        or not 0 <= seconds <= _MAX_LOCK_TIMEOUT
+    ):
+        raise ValueError(
+            "lock_timeout must be a whole number of seconds from 0 to "
+            f"{_MAX_LOCK_TIMEOUT}, got {seconds!r}",
+        )
+    return seconds
+
+
+def parse_target(spec: str) -> tuple[str, str]:
+    """
+    Split a ``"module:object"`` path, without importing anything.
+
+    Args:
+        spec: The path, such as ``"app:broker"``.
+
+    Returns:
+        The module name and the object name.
+
+    Raises:
+        ValueError: if ``spec`` is not ``"module:object"``.
+    """
+    module_name, _, attribute = spec.partition(":")
+    if not module_name or not attribute or ":" in attribute:
+        raise ValueError(f"{spec!r} is not a 'module:object' path")
+    return module_name, attribute
+
+
+def package_version() -> str:
+    """
+    Return the installed version of taskiq-postgresql.
+
+    Returns:
+        The version, or ``unknown`` in a source tree that was never installed,
+        which has no package metadata.
+    """
+    try:
+        return version(_DISTRIBUTION)
+    except PackageNotFoundError:
+        return "unknown"
 
 
 @dataclass(frozen=True)
@@ -370,7 +508,11 @@ def collect_components(
         ImportError: if a path's module cannot be imported.
         AttributeError: if a path's module has no such object.
     """
-    return [component for component, _ in _collect(targets, app_dir)]
+    return _one_per_table(
+        (component, table_schema(component))
+        for target in targets
+        for component in _components_of(target, app_dir)
+    )
 
 
 def collect_schemas(
@@ -378,22 +520,34 @@ def collect_schemas(
     app_dir: Optional[str] = None,
 ) -> list[TableSchema]:
     """
-    Describe the tables behind brokers, schedulers and import paths.
+    Describe the tables behind brokers, schedulers, import paths and descriptions.
 
     Args:
-        *targets: As for ``collect_components``.
+        *targets: As for ``collect_components``, or ``TableSchema``
+            descriptions such as ``table_schema("broker")``, which are kept as
+            they are and need neither the application nor a DSN.
         app_dir: As for ``collect_components``.
 
     Returns:
-        One description per table, in target order.
+        One description per table, in target order: a table that two targets
+        describe with the same columns comes once.
 
     Raises:
-        ValueError: as ``collect_components`` does.
+        ValueError: as ``collect_components`` does, also when a description
+            and a component describe one table with different columns.
         LookupError: as ``collect_components`` does.
         ImportError: as ``collect_components`` does.
         AttributeError: as ``collect_components`` does.
     """
-    return [schema for _, schema in _collect(targets, app_dir)]
+    return _one_per_table(
+        (schema, schema)
+        for target in targets
+        for schema in (
+            [target]
+            if isinstance(target, TableSchema)
+            else map(table_schema, _components_of(target, app_dir))
+        )
+    )
 
 
 def render_sql(
@@ -477,15 +631,108 @@ def migration_statements(
         ValueError: if ``schemas`` is empty, a table name cannot be written in
             a script, or a table has no step ``through``.
     """
-    tables = list(schemas)
-    if not tables:
-        raise ValueError("a migration script needs at least one table schema")
-    for table in tables:
-        _check_table_name(table.name)
+    tables = _checked_tables(schemas)
     return _script_statements(
         [(table.name, _steps_through(table, through)) for table in tables],
         lock=lock,
     )
+
+
+def step_statements(
+    schemas: Iterable[TableSchema],
+    *,
+    step: Optional[int] = None,
+    through: Optional[int] = None,
+    lock: bool = True,
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+) -> list[str]:
+    """
+    Return the statements that run steps in a transaction other statements share.
+
+    For a tool that runs the steps inside a transaction of its own, such as an
+    Alembic revision or a Django migration: the statements of
+    ``migration_statements``, with their lock waits bounded by
+    ``scoped_lock_timeout``, so the statements after them wait for locks as
+    before.
+
+    Args:
+        schemas: The tables, in the order their statements run.
+        step: Only this step, for each table that has it; a table without it
+            adds nothing.
+        through: Steps 1 to this one, as for ``migration_statements``.
+        lock: Start with the advisory locks, as ``render_sql`` does.
+        lock_timeout: Seconds a statement waits for a lock, the advisory lock
+            included; ``0`` bounds nothing.
+
+    Returns:
+        The statements, in the order they run; none when ``step`` is given and
+        no table has it.
+
+    Raises:
+        TypeError: if both ``step`` and ``through`` are given.
+        ValueError: if ``lock_timeout`` is not a whole number of seconds from
+            0 to 2147483, ``schemas`` is empty, a table name cannot be written
+            in a script, or a table has no step ``through``.
+    """
+    if step is not None and through is not None:
+        raise TypeError("give step or through, not both")
+    check_lock_timeout(lock_timeout)
+    tables = _checked_tables(schemas)
+    if step is None:
+        selected = [(table.name, _steps_through(table, through)) for table in tables]
+    else:
+        selected = [
+            (table.name, (found,))
+            for table in tables
+            for found in table.steps
+            if found.number == step
+        ]
+        if not selected:
+            return []
+    return scoped_lock_timeout(_script_statements(selected, lock=lock), lock_timeout)
+
+
+def scoped_lock_timeout(statements: Sequence[str], lock_timeout: int) -> list[str]:
+    """
+    Bound the lock waits of statements that share a transaction with others.
+
+    The statements run with ``lock_timeout``; those after them, such as the
+    rest of an Alembic revision, get back the value the transaction had.
+    ``SET LOCAL lock_timeout TO DEFAULT`` would not do that: ``DEFAULT`` is
+    "whatever value it would have had if no SET had been executed in the
+    current session" (https://www.postgresql.org/docs/current/sql-set.html),
+    so a value the session or the transaction set would be lost.
+
+    Args:
+        statements: The statements to bound.
+        lock_timeout: Seconds each of them waits for a lock; ``0`` returns
+            them as they are.
+
+    Returns:
+        A statement that keeps the transaction's ``lock_timeout``, ``SET LOCAL
+        lock_timeout``, the statements, and one that gives the kept value
+        back.
+
+    Raises:
+        ValueError: if ``lock_timeout`` is not a whole number of seconds from
+            0 to 2147483.
+    """
+    bounded = _lock_timeout_first(statements, lock_timeout)
+    if not lock_timeout:
+        return bounded
+    saved = _sql_literal(_SAVED_LOCK_TIMEOUT)
+    # missing_ok and NULLIF turn a value this transaction never saved (missing
+    # or empty) into NULL, which set_config reads as a reset, instead of an
+    # error.
+    restore = (
+        "SELECT set_config('lock_timeout', "
+        f"NULLIF(current_setting({saved}, true), ''), true)"
+    )
+    return [
+        f"SELECT set_config({saved}, current_setting('lock_timeout'), true)",
+        *bounded,
+        restore,
+    ]
 
 
 # --- comparing a database with the description -------------------------------
@@ -798,11 +1045,12 @@ class MigrationPlan:
 
         Raises:
             ValueError: if ``lock_timeout`` is not a whole number of seconds
-                from 0 to 2147483, or a comment holds a line break or a NUL.
+                from 0 to 2147483, or a comment is one ``check_comment``
+                refuses.
         """
         statements = _lock_timeout_first(self.statements(lock=lock), lock_timeout)
         for comment in comments:
-            _check_comment(comment)
+            check_comment(comment)
         if not self.pending:
             return ""
         pending = ", ".join(
@@ -957,7 +1205,7 @@ class FormatOptions:
 
     def __post_init__(self) -> None:
         """Refuse a ``lock_timeout`` no format could write."""
-        _check_lock_timeout(self.lock_timeout)
+        check_lock_timeout(self.lock_timeout)
 
 
 MigrationFormat = Callable[[Sequence[TableSchema], FormatOptions], str]
@@ -991,6 +1239,173 @@ class AmbiguousMigrationFormatError(LookupError):
 
 class MigrationFormatOptionError(ValueError):
     """A migration format got an ``--option`` it does not accept."""
+
+
+@dataclass(frozen=True)
+class RenderedStep:
+    """
+    One step of one table, as a migration file writes it.
+
+    The table, the kind and the step number go into the step's comments, so
+    the step refuses what a comment line could not hold.
+
+    Attributes:
+        table: The table name.
+        kind: The component that owns the table.
+        number: The step number.
+        comments: What the step does and needs, one line each, to write as
+            comments before its statements, without a comment marker.
+        statements: The statements of ``step_statements`` for this step of
+            this table: the bound on lock waits around the advisory lock and
+            the step's own statements.
+
+    Raises:
+        ValueError: if ``table`` is empty or holds a line break or a NUL,
+            ``kind`` is not one of ``COMPONENT_KINDS``, or ``number`` is not
+            positive.
+        TypeError: if ``number`` is not an ``int``.
+    """
+
+    table: str
+    kind: ComponentKind
+    number: int
+    comments: tuple[str, ...]
+    statements: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        """Refuse a table, kind or step number a comment line cannot hold."""
+        _check_table_name(self.table)
+        _component_kind(self.kind)
+        # A bool is an int, and a step number of True means nothing.
+        if type(self.number) is not int:
+            raise TypeError(
+                f"the step number must be an int, got {type(self.number).__name__}",
+            )
+        if self.number < 1:
+            raise ValueError(f"the step number must be positive, got {self.number}")
+
+    @classmethod
+    def of(
+        cls,
+        table: str,
+        kind: ComponentKind,
+        step: MigrationStep,
+        *,
+        transaction_note: str,
+        lock: bool = True,
+        lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+        notes: Sequence[str] = (),
+    ) -> RenderedStep:
+        """
+        Lay out one step of one table.
+
+        Args:
+            table: The table name.
+            kind: The component that owns the table.
+            step: The step.
+            transaction_note: What the step needs of the tool's transaction,
+                written after the line that says what the step runs.
+            lock: Start with the advisory lock ``run_migrations=True`` takes.
+            lock_timeout: Seconds a statement of the step waits for a lock;
+                ``0`` bounds nothing.
+            notes: The locks the step takes, such as ``PendingStep.notes``,
+                one sentence each.
+
+        Returns:
+            The step.
+
+        Raises:
+            ValueError: if ``lock_timeout`` is not a whole number of seconds
+                from 0 to 2147483, or as the class does.
+            TypeError: as the class does.
+        """
+        statements = scoped_lock_timeout(
+            _script_statements([(table, (step,))], lock=lock),
+            lock_timeout,
+        )
+        bound = (
+            f"Lock waits end after {lock_timeout} s; the last statement restores "
+            "the transaction's lock timeout."
+        )
+        title = f"step {step.number} of the {kind} table {table}"
+        return cls(
+            table=table,
+            kind=kind,
+            number=step.number,
+            comments=(
+                f"taskiq-postgresql {title}: the SQL run_migrations=True runs,",
+                "and each statement only adds what is missing.",
+                transaction_note,
+                *(f"{note}." for note in notes),
+                *([bound] if lock_timeout else []),
+            ),
+            statements=tuple(statements),
+        )
+
+
+def render_steps(
+    schemas: Sequence[TableSchema],
+    options: FormatOptions,
+    *,
+    format_name: str,
+    accepted: Sequence[str],
+    transaction_note: str,
+    comments: Sequence[str] = (),
+) -> list[RenderedStep]:
+    """
+    Check what a migration format was given, and lay out every step it writes.
+
+    A format that writes a migration file of a tool's own, such as
+    ``alembic`` or ``django``, starts here and keeps only its template and the
+    way it writes a statement. Each step runs in the tool's transaction with
+    the advisory lock when ``options.lock`` is set, and with its lock waits
+    bounded by ``options.lock_timeout`` (see ``step_statements``).
+
+    Args:
+        schemas: The tables.
+        options: The options of ``taskiq postgresql generate``; ``extra`` may
+            only hold ``accepted`` keys.
+        format_name: The format's name, for the error about an option.
+        accepted: The options of ``extra`` the format takes.
+        transaction_note: What every step needs of the tool's transaction,
+            one line written with each step.
+        comments: The lines the format writes as comments at the top of its
+            file.
+
+    Returns:
+        Each step of each table, the tables by name, each table's steps in
+        their order.
+
+    Raises:
+        MigrationFormatOptionError: if ``options.extra`` holds a key that is
+            not in ``accepted``.
+        ValueError: if a comment holds a line break, a NUL or an encoding
+            declaration, a table name is not a plain SQL identifier, or as
+            ``RenderedStep`` does.
+        TypeError: as ``RenderedStep`` does.
+    """
+    for comment in comments:
+        check_comment(comment)
+    unknown = [key for key in options.extra if key not in accepted]
+    if unknown:
+        raise MigrationFormatOptionError(
+            f"the {format_name} format takes {', '.join(accepted)}; unknown "
+            f"option{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}",
+        )
+    for schema in schemas:
+        check_plain_identifier(schema.name)
+    return [
+        RenderedStep.of(
+            schema.name,
+            schema.kind,
+            step,
+            transaction_note=transaction_note,
+            lock=options.lock,
+            lock_timeout=options.lock_timeout,
+        )
+        for schema in sorted(schemas, key=lambda table: table.name)
+        for step in schema.steps
+    ]
 
 
 def sql_format(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
@@ -1107,14 +1522,6 @@ def _install_hint(entry_point: Any, error: ImportError) -> str:
     )
 
 
-def _package_version() -> str:
-    try:
-        return version(_DISTRIBUTION)
-    except PackageNotFoundError:
-        # A source tree that was never installed has no metadata.
-        return "unknown"
-
-
 def _check_table_name(name: str) -> None:
     # The name appears in a header comment, which a line break would end, and
     # a NUL cannot be sent to PostgreSQL at all.
@@ -1125,26 +1532,23 @@ def _check_table_name(name: str) -> None:
         )
 
 
-def _check_comment(text: str) -> None:
-    # A line break would end the comment and leave the rest of it as SQL.
-    if any(character in text for character in "\0\r\n"):
-        raise ValueError(
-            f"comment {text!r} cannot be written in a SQL script: it holds a "
-            "line break or a NUL",
-        )
+def _component_kind(kind: object) -> ComponentKind:
+    for known in COMPONENT_KINDS:
+        if kind == known:
+            return known
+    raise ValueError(
+        f"unknown component kind {kind!r}; expected one of "
+        f"{', '.join(COMPONENT_KINDS)}",
+    )
 
 
-def _check_lock_timeout(seconds: int) -> None:
-    # A bool is an int, and True would read as one second.
-    if (
-        isinstance(seconds, bool)
-        or not isinstance(seconds, int)
-        or not 0 <= seconds <= _MAX_LOCK_TIMEOUT
-    ):
-        raise ValueError(
-            "lock_timeout must be a whole number of seconds from 0 to "
-            f"{_MAX_LOCK_TIMEOUT}, got {seconds!r}",
-        )
+def _checked_tables(schemas: Iterable[TableSchema]) -> list[TableSchema]:
+    tables = list(schemas)
+    if not tables:
+        raise ValueError("a migration script needs at least one table schema")
+    for table in tables:
+        _check_table_name(table.name)
+    return tables
 
 
 def _sql_literal(value: str) -> str:
@@ -1212,7 +1616,7 @@ def _script_text(
     if transaction:
         statements = ["BEGIN", *statements, "COMMIT"]
     lines = [
-        f"-- taskiq-postgresql {_package_version()}",
+        f"-- taskiq-postgresql {package_version()}",
         *header,
         *(f"{statement};" for statement in statements),
     ]
@@ -1220,40 +1624,11 @@ def _script_text(
 
 
 def _lock_timeout_first(statements: Sequence[str], lock_timeout: int) -> list[str]:
-    _check_lock_timeout(lock_timeout)
+    check_lock_timeout(lock_timeout)
     if not lock_timeout:
         return list(statements)
     # First, so that it also bounds the wait for the advisory lock.
     return [f"SET LOCAL lock_timeout = '{lock_timeout}s'", *statements]
-
-
-def _scoped_lock_timeout(statements: Sequence[str], lock_timeout: int) -> list[str]:
-    """
-    Bound the lock waits of statements that share a transaction with others.
-
-    The statements run with ``lock_timeout``; those after them, such as the
-    rest of an Alembic revision, get back the value the transaction had.
-    ``SET LOCAL lock_timeout TO DEFAULT`` would not do that: ``DEFAULT`` is
-    "whatever value it would have had if no SET had been executed in the
-    current session" (https://www.postgresql.org/docs/current/sql-set.html),
-    so a value the session or the transaction set would be lost.
-    """
-    bounded = _lock_timeout_first(statements, lock_timeout)
-    if not lock_timeout:
-        return bounded
-    saved = _sql_literal(_SAVED_LOCK_TIMEOUT)
-    # missing_ok and NULLIF turn a value this transaction never saved (missing
-    # or empty) into NULL, which set_config reads as a reset, instead of an
-    # error.
-    restore = (
-        "SELECT set_config('lock_timeout', "
-        f"NULLIF(current_setting({saved}, true), ''), true)"
-    )
-    return [
-        f"SELECT set_config({saved}, current_setting('lock_timeout'), true)",
-        *bounded,
-        restore,
-    ]
 
 
 # The type format_type() reports for each TypeName. SERIAL is an integer
@@ -1627,17 +2002,12 @@ def _schema_of_kind(
     table_name: Optional[str],
     field_for_task_id: Optional[str],
 ) -> TableSchema:
-    if kind not in COMPONENT_KINDS:
-        raise ValueError(
-            f"unknown component kind {kind!r}; expected one of "
-            f"{', '.join(COMPONENT_KINDS)}",
-        )
+    component_kind = _component_kind(kind)
     if field_for_task_id is not None and field_for_task_id not in TASK_ID_TYPES:
         raise ValueError(
             f"field_for_task_id must be one of {', '.join(TASK_ID_TYPES)}, "
             f"got {field_for_task_id!r}",
         )
-    component_kind: ComponentKind = kind
     component_class = _component_classes()[component_kind]
     name = _default(component_class, "table_name") if table_name is None else table_name
     if component_kind == "scheduler_source":
@@ -1735,29 +2105,28 @@ def _scheduler_source_parts() -> _TableParts:
     )
 
 
-def _collect(
-    targets: Sequence[object],
-    app_dir: Optional[str],
-) -> list[tuple[Component, TableSchema]]:
-    found: dict[str, tuple[Component, TableSchema]] = {}
-    for target in targets:
-        loaded = _load_target(target, app_dir) if isinstance(target, str) else target
-        components = _components_in(loaded)
-        if not components:
-            raise LookupError(
-                f"{_describe(target)} holds no taskiq-postgresql component: "
-                "expected a component, or a broker or TaskiqScheduler that "
-                "uses one",
+def _components_of(target: object, app_dir: Optional[str]) -> list[Component]:
+    loaded = _load_target(target, app_dir) if isinstance(target, str) else target
+    components = _components_in(loaded)
+    if not components:
+        raise LookupError(
+            f"{_describe(target)} holds no taskiq-postgresql component: "
+            "expected a component, or a broker or TaskiqScheduler that uses one",
+        )
+    return components
+
+
+def _one_per_table(described: Iterable[tuple[_T, TableSchema]]) -> list[_T]:
+    """Keep the first item of each table; refuse a table described two ways."""
+    found: dict[str, tuple[_T, TableSchema]] = {}
+    for item, schema in described:
+        _, kept = found.setdefault(schema.name, (item, schema))
+        if kept != schema:
+            raise ValueError(
+                f"the table {schema.name!r} is described twice, with different "
+                "columns: give each component a table of its own",
             )
-        for component in components:
-            schema = table_schema(component)
-            _, kept = found.setdefault(schema.name, (component, schema))
-            if kept != schema:
-                raise ValueError(
-                    f"two components use the table {schema.name!r} with "
-                    "different columns",
-                )
-    return list(found.values())
+    return [item for item, _ in found.values()]
 
 
 def _describe(target: object) -> str:
@@ -1765,9 +2134,7 @@ def _describe(target: object) -> str:
 
 
 def _load_target(spec: str, app_dir: Optional[str]) -> object:
-    module_name, _, attribute = spec.partition(":")
-    if not module_name or not attribute or ":" in attribute:
-        raise ValueError(f"{spec!r} is not a 'module:object' path")
+    module_name, attribute = parse_target(spec)
     # As taskiq worker does: app_dir stays on sys.path, the working directory
     # only while the module is imported.
     if app_dir is not None and app_dir not in sys.path:

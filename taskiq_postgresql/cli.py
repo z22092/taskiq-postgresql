@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import re
 import sys
@@ -332,9 +333,12 @@ def _add_output(parser: argparse.ArgumentParser, migrations: ModuleType) -> None
 
 
 def _target(text: str) -> str:
-    module, _, attribute = text.partition(":")
-    if not module or not attribute or ":" in attribute:
-        raise argparse.ArgumentTypeError(f"{text!r} is not a 'module:object' path")
+    from taskiq_postgresql.migrations import parse_target  # noqa: PLC0415
+
+    try:
+        parse_target(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
     return text
 
 
@@ -510,12 +514,28 @@ def _plan_script(
         )
     _say(f"note: {database.header}")
     schemas = plan.pending_schemas(database.schemas)
-    alembic_format = _alembic_format(render)
-    if alembic_format is not None:
-        # The revision names the database too: on another database, which
-        # may have the table, its downgrade=drop would drop that table.
-        return alembic_format(schemas, options, comments=[database.header])
+    commented = _commented(render)
+    if commented is not None:
+        # The file names the database too: the plan is wrong for another
+        # database, and an alembic revision's downgrade=drop there would
+        # drop a table the revision did not create.
+        return commented(schemas, options, comments=[database.header])
     return render(schemas, options)
+
+
+def _commented(render: MigrationFormat) -> Callable[..., str] | None:
+    """Return ``render`` if it takes a keyword-only ``comments``, else ``None``."""
+    # A capability the format declares, so any package's format can take the
+    # header, whatever its name or module.
+    try:
+        parameters = inspect.signature(render).parameters
+    except (TypeError, ValueError):
+        # A callable without a signature Python can read takes no keyword.
+        return None
+    comments = parameters.get("comments")
+    if comments is None or comments.kind is not inspect.Parameter.KEYWORD_ONLY:
+        return None
+    return render
 
 
 def _alembic_format(render: MigrationFormat) -> Callable[..., str] | None:
@@ -689,9 +709,18 @@ def _say_up_to_date(schemas: Sequence[TableSchema]) -> None:
 
 
 def _shown(text: str) -> str:
+    from taskiq_postgresql.migrations import check_comment  # noqa: PLC0415
+
     # A name from the server goes into a comment line of the script, which a
-    # line break would end.
-    return text if text.isprintable() else repr(text)
+    # line break would end, and of a migration file, whose first two lines
+    # Python reads an encoding declaration from (PEP 263).
+    shown = text if text.isprintable() else repr(text)
+    try:
+        check_comment(shown)
+    except ValueError:
+        # Without its ":" or "=", "coding: utf-7" declares nothing.
+        return repr(text).replace(":", "\\x3a").replace("=", "\\x3d")
+    return shown
 
 
 def _say(text: str) -> None:

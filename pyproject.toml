@@ -76,9 +76,10 @@ alembic = [
     "alembic>=1.14.0,<1.21",
     "sqlalchemy>=2.0.36,<2.1",
 ]
-# Django 6 needs Python 3.12, so on 3.10 and 3.11 the range resolves to 5.2
-# LTS. The floor is the 5.2 patch current when the extra was added: Django
-# ships security fixes only as new patches.
+# The floor is the 5.2 patch the tests pin: 5.2 LTS is the oldest Django line
+# the app supports, and the newest that runs on Python 3.10. The ceiling is
+# the next minor of the newest locked Django, as for every runtime range.
+# Django 6 needs Python 3.12, so on 3.10 and 3.11 the range resolves to 5.2.
 django = [
     "django>=5.2.19,<6.2",
 ]
@@ -93,7 +94,7 @@ postgresql = "taskiq_postgresql.cli:PostgresqlCMD"
 [project.entry-points."taskiq_postgresql.migration_formats"]
 sql = "taskiq_postgresql.migrations:sql_format"
 alembic = "taskiq_postgresql.contrib.alembic:alembic_format"
-django = "taskiq_postgresql.contrib.django.formats:django_format"
+django = "taskiq_postgresql.contrib.django_format:django_format"
 
 
 [build-system]
