@@ -162,14 +162,31 @@ database's catalog, in one `SELECT` that also returns `current_database()`
 and `current_schemas(false)`, through the driver of a component (or a
 throwaway one with `--component`): `plan` prints `MigrationPlan.render_sql`
 with a comment naming that database, or hands the tables cut down to their
-pending steps (`MigrationPlan.pending_schemas`) to another format, and to the
-alembic format the same comment, as the revision's first line; `check`
-reports, exits with 3 for a missing table or column and 4 for a problem, and
-prints JSON with `--json`. `plan` lets the format refuse its options before it
-connects, by rendering no table, and refuses the alembic format's
-`downgrade=drop` when a pending step's table already exists, since the
-revision would drop a table it did not create. It tells the alembic format by
-the callable `load_format` returns, not by the name given to `--format`.
+pending steps (`MigrationPlan.pending_schemas`) to another format, and the same
+comment, as the file's first line, to any format that declares a keyword-only
+`comments` parameter (`inspect.signature`), whichever package registers it;
+`check` reports, exits with 3 for a missing table or column and 4 for a
+problem, and prints JSON with `--json`. The database name and `search_path`
+come from the server, so the comment writes them escaped (`repr`) when they
+hold a line break or an encoding declaration (PEP 263, which Python reads on
+the first two lines of a file), with `:` and `=` escaped in the latter. `plan`
+lets the format refuse its options before it connects, by rendering no table,
+and refuses the alembic format's `downgrade=drop` when a pending step's table
+already exists, since the revision would drop a table it did not create. It
+tells the alembic format by the callable `load_format` returns, not by the
+name given to `--format`.
+
+A format that writes a migration file of another tool starts from one
+pipeline in `migrations.py`: `render_steps` refuses a comment `check_comment`
+refuses (a line break, a NUL, an encoding declaration), an option the format
+does not take, and a table name `check_plain_identifier` refuses, then lays out
+each step of each table as a `RenderedStep`, whose own checks refuse an
+unknown kind and a step number that is not a positive `int`. A `RenderedStep`
+holds the step's comment lines and its statements, from `step_statements`: the
+advisory lock and the step's SQL inside `scoped_lock_timeout`, which keeps the
+transaction's `lock_timeout`, sets its own with `SET LOCAL`, and restores the
+kept value in its last statement. The `alembic` and `django` formats keep only
+their file template and how they write a statement.
 An error raised while a driver reads or connects with a connection string
 reaches `_fail` tagged with that string: the message leaves out the string and
 its password, and when the driver could not read the string at all (asyncpg's
@@ -209,13 +226,39 @@ change still shows), and adds one `TaskiqStepOp` per pending step; problems
 become warnings in the log. A `TaskiqStepOp` renders as `op.execute(...)`
 calls holding the step's SQL, so a revision runs the statements
 `run_migrations=True` runs without importing the package; its downgrade does
-nothing, the DDL being additive. Unless configured to `0`, each step sets its
-own `lock_timeout` (`SET LOCAL`) before it takes the same advisory lock, and
-ends by giving
-Alembic's transaction back the `lock_timeout` it had, so the user's own
-migrations in that transaction keep theirs. `upgrade_taskiq_tables` runs the same steps, up to a given step
-number, from a hand-written revision, and `alembic check` fails while a step
-is missing because `TaskiqStepOp` is an upgrade operation.
+nothing, the DDL being additive. Unless configured to `0`, each step keeps the
+transaction's `lock_timeout`, sets its own (`SET LOCAL`) before it takes the
+same advisory lock, and ends by giving Alembic's transaction back the kept
+value, so the user's own migrations in that transaction keep theirs; the step
+is laid out as a `RenderedStep`, as the `alembic` format lays out its steps.
+`upgrade_taskiq_tables` runs the same steps, up to a given step number, from a
+hand-written revision (`step_statements(..., through=N)`), and `alembic check`
+fails while a step is missing because `TaskiqStepOp` is an upgrade operation.
+
+`contrib/django/` is a Django app (label `taskiq_postgresql`) with
+migrations and no models. Its migration `000N` holds one `RunTaskiqStep(N)`
+(`operations.py`): when `migrate` applies it, the operation reads
+`TASKIQ_POSTGRESQL_TARGETS` (`conf.py`: `module:object` paths and dicts given
+to `table_schema`, all resolved by `collect_schemas`, which describes each
+table once) and `TASKIQ_POSTGRESQL_LOCK_TIMEOUT`, and runs
+`step_statements(..., step=N)` for the configured tables through the schema
+editor, one statement at a time and without parameters, in the migration's
+transaction: the advisory locks in name order and the steps' statements,
+bounded as the Alembic steps are. So `sqlmigrate` shows the SQL, a router's
+`allow_migrate` decides as for any operation, a database that is not
+PostgreSQL raises `NotSupportedError`, and the reverse runs nothing. Missing or
+empty targets, and a table name that is not a plain SQL identifier, raise
+`ImproperlyConfigured` before any statement runs; the app's `ready()` registers
+a system check (`taskiq_postgresql.E001`, `E002`) that reads the settings, and
+the names of the dicts, without importing the paths (`parse_target` only
+checks their form). Because the migrations are static and read the settings
+when they run, a step added by a release needs a new migration file;
+`tests/test_contrib_django.py` pins one migration per step.
+`contrib/django_format.py` is the `django` migration format: one
+`migrations.RunSQL` per step and table with the SQL written out, so the file
+imports only Django, `RunSQL.noop` as reverse, and the option `dependencies`
+checked against `app_label.migration_name` before it is written. It imports no
+Django itself, so `generate --format django` works without the extra.
 
 | Table | Columns | Indexes |
 |---|---|---|
