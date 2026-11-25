@@ -82,8 +82,10 @@ they create the tables one after the other. Once the tables, indexes and
 columns exist, startup only checks for them, so the application's role needs no
 `CREATE` privilege from then on ([Privileges](#privileges)). `run_migrations`
 is off by default; you can leave it off and create the tables yourself, with
-`taskiq postgresql migrate` or the SQL that `taskiq postgresql generate` prints
-(see [Migrations](#migrations)).
+`taskiq postgresql migrate` or the SQL that `taskiq postgresql generate` or
+`taskiq postgresql plan` prints (see [Migrations](#migrations)). A component
+that does not migrate still checks its table when it starts, and refuses to
+start without it ([Check at startup](#check-at-startup)).
 
 Start a worker. It claims a message as soon as the message's `NOTIFY` arrives,
 and it also sweeps the table for due messages when it starts and every
@@ -174,7 +176,7 @@ once, at startup, for all three components and all drivers; if it returns
 | `max_retry_attempts` | `int` | `5` | Accepted for compatibility, currently unused. |
 | `connection_kwargs` | `dict` or `None` | `None` | Keyword arguments for the driver's pool and for its `LISTEN` connection, so each option must be valid for both. |
 | `pool_kwargs` | `dict` or `None` | `None` | Accepted for compatibility, currently unused. Use `connection_kwargs`. |
-| `run_migrations` | `bool` | `False` | Create the table and index on startup, and add the `channel` and `not_before` columns with their index. |
+| `run_migrations` | `bool` | `False` | Create the table and index on startup, and add the `channel` and `not_before` columns with their index. Off, startup only checks them; see [Check at startup](#check-at-startup). |
 | `poll_interval` | `float` | `1.0` | Seconds between two sweeps of the table for due messages; see [Delivery](#delivery). A value that is not a finite number above zero raises `ValueError`. |
 | `health_check_interval` | `float` | `30.0` | Seconds the `LISTEN` connection may stay silent before the worker checks it; see [Lost connections](#lost-connections). A value that is not a finite number above zero raises `ValueError`. |
 | `query_timeout` | `float` | `30.0` | Seconds the worker waits for that check, for a claim (not with psqlpy) and for a close before it gives the connection up; see [Lost connections](#lost-connections). A value that is not a finite number above zero raises `ValueError`. |
@@ -189,7 +191,7 @@ once, at startup, for all three components and all drivers; if it returns
 | `field_for_task_id` | `"VarChar"`, `"Text"` or `"Uuid"` | `"Uuid"` | SQL type of the `task_id` column. |
 | `serializer` | `TaskiqSerializer` or `None` | `None` | Result serializer; `None` means `PickleSerializer()`; see the note below before changing it. |
 | `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. |
-| `run_migrations` | `bool` | `False` | Create the table and index on startup. |
+| `run_migrations` | `bool` | `False` | Create the table and index on startup. Off, startup only checks them; see [Check at startup](#check-at-startup). |
 | `**connect_kwargs` | `Any` | none | Keyword arguments for the driver's connection pool. |
 
 Results are stored with pickle, and unpickling can run code. Treat the results
@@ -211,7 +213,7 @@ one, so they cannot replace pickle here.
 | `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. |
 | `startup_schedule` | `dict[str, list[dict]]` or `None` | `None` | Schedules to insert on startup, keyed by task name. Each entry needs `cron` or `time` and may have `args`, `kwargs` and `cron_offset`. A task that already has a stored schedule is skipped, and so is a task the broker does not know. |
 | `broker` | `AsyncBroker` or `None` | `None` | Needed only with `startup_schedule`, to look the tasks up. |
-| `run_migrations` | `bool` | `False` | Create the table and indexes on startup. |
+| `run_migrations` | `bool` | `False` | Create the table and indexes on startup. Off, startup only checks them; see [Check at startup](#check-at-startup). |
 | `**connect_kwargs` | `Any` | none | Keyword arguments for the driver's connection pool. |
 
 The source implements taskiq's `ScheduleSource` (`get_schedules`,
@@ -468,20 +470,27 @@ There are three ways to create the tables and their indexes:
 - `taskiq postgresql migrate`, once per deploy before the workers start, for
   example in a release job. The workers then run with `run_migrations=False`.
 - `taskiq postgresql generate`, which prints the SQL so that you run it
-  yourself or hand it to your migration tool.
+  yourself or hand it to your migration tool, or `taskiq postgresql plan`,
+  which prints only the SQL one database still lacks.
+
+`taskiq postgresql check` tells whether a database has every table, column and
+index, so that a deploy can stop before the workers start; a component that
+does not migrate runs the same check when it starts
+([Check at startup](#check-at-startup)).
 
 SQLAlchemy, SQLModel and Alembic can also hold the tables (see
 [Integrations](#integrations)).
 
-Both commands take the `module:object` paths that `taskiq worker` and
+The commands take the `module:object` paths that `taskiq worker` and
 `taskiq scheduler` take, and `--app-dir` like them. A broker brings its result
 backend when that is a `PostgresqlResultBackend`, and a `TaskiqScheduler`
 brings its broker and its `PostgresqlSchedulerSource` sources; a table named
 twice is created once. The commands import your module but start nothing:
-`generate` never connects, and `migrate` connects only to create the tables,
-with each component's own DSN and driver. The exit status is 0 on success, 1 on
-an error or when a path holds no component of this package, and 2 on a usage
-error.
+`generate` never connects, `migrate` connects only to create the tables, and
+`plan` and `check` only to read the catalog, with each component's own DSN and
+driver. The exit status is 0 on success, 1 on an error or when a path holds no
+component of this package, and 2 on a usage error; `plan` and `check` also
+exit with 3 or 4 ([Plan and check](#plan-and-check)).
 
 ### Generate the SQL
 
@@ -515,7 +524,8 @@ transaction has ended. `--lock-timeout SECONDS` sets another limit;
 `lock_timeout` applies (PostgreSQL's default, 0, waits for ever).
 `taskiq postgresql migrate` checks first and runs no DDL when every table,
 column and index exists, so it takes no table lock on a database that is
-already up to date.
+already up to date, and `taskiq postgresql plan` prints only the steps a
+database still lacks ([Plan and check](#plan-and-check)).
 
 To generate without importing the application, for example where its settings
 are not available, name one component per call. `--table-name` and
@@ -556,6 +566,86 @@ GRANT USAGE ON SEQUENCE taskiq_messages_id_seq TO taskiq_worker;
 
 Such a role can also keep `run_migrations=True`: once every table and index
 exists, startup only checks for them.
+
+### Plan and check
+
+`plan` reads the catalog of one database, in one read-only query, and prints
+the SQL of the migration steps that database still lacks, and only that: on a
+database that has every step it prints nothing. On a broker table that 0.4.x
+created, that is the step that adds `channel` and `not_before`:
+
+```bash
+taskiq postgresql plan app:scheduler > taskiq_pending.sql
+psql "$POSTGRESQL_URL" -v ON_ERROR_STOP=1 -f taskiq_pending.sql
+```
+
+The script is the one `generate` writes, with the same lock timeout and
+advisory lock and the same options (`--lock-timeout`, `--no-transaction`,
+`--no-lock`, `--format`), for the pending steps only. A comment after the
+version line names the database and `search_path` the plan was computed for:
+it is right for that database at that moment, and each statement still only
+adds what is missing. The locks each step takes (`note:` lines) and what no
+step fixes (`problem:` lines), such as an invalid index or an index name that
+another table took, go to standard error, each with what to do.
+`--format alembic` writes a revision file with only the pending steps. A plan
+is for one database: when the components use different connection strings,
+pass `--dsn`, or plan one table at a time with `--component`.
+
+`check` reads the same catalog and changes nothing. It reports each pending
+step and each problem on standard error, and `--json` also prints the report
+on standard output, as one object with the keys `current`, `pending` (each
+with `table`, `kind`, `step`, `severity` and what is `missing`: `table`,
+`columns`, `indexes`), `problems` (each with `table`, `code`, `severity` and
+`detail`) and `advisory_only`:
+
+```bash
+taskiq postgresql check app:scheduler --json
+```
+
+Both commands take `--dsn` to read another database than the components'
+own, and, like `generate`, `--component` with `--table-name` and
+`--field-for-task-id` to describe one table without importing the application;
+`--component` needs `--dsn`, and reads with the first driver installed of
+asyncpg, psycopg and psqlpy. Their
+query reads only `pg_catalog`, which every role can read by default, so a role
+without DDL privileges can run them. The exit status says what to do:
+
+| Exit status | `plan` | `check` |
+|---|---|---|
+| 0 | The plan is printed, or no step is pending. | Up to date; a missing index alone only warns. |
+| 1 | An error: the connection, the import of the application, a path without a component. | The same. |
+| 2 | A usage error. | The same. |
+| 3 | Not used. | A table or a column is missing: a step is pending. |
+| 4 | A problem no step fixes needs a person; the plan, if any, is still printed. | The same; it wins over 3. |
+
+So a deploy can check the database before it starts the workers, with the
+workers' own configuration, and stop when a migration was forgotten: exit
+status 3 or 4 fails the step.
+
+```bash
+# In the deploy job, before the workers start.
+taskiq postgresql check app:scheduler
+```
+
+### Check at startup
+
+A component with `run_migrations=False`, the default, reads the catalog once
+when it starts, with the query `check` runs, through its own connection pool,
+and compares its table with what this release needs. It runs no DDL. When the
+table, or a column that a step adds, is missing, `startup()` raises
+`SchemaNotReadyError` (from `taskiq_postgresql.exceptions`) before anything
+else starts, naming what is missing and how to create it. On a broker table
+that 0.4.x created:
+
+```text
+taskiq_messages is not ready and run_migrations is off: step 2 has not run (missing columns: channel, not_before). Create what is missing with `taskiq postgresql migrate <module>:<object>`, with the SQL `taskiq postgresql plan <module>:<object>` prints, or with an Alembic revision (`alembic revision --autogenerate`); or start once with run_migrations=True.
+```
+
+A missing index, or an index no step can fix (an invalid one, or one whose
+name another table took), logs a warning instead: the component works, if more
+slowly. With
+`run_migrations=True` startup reads the catalog the same way, and takes the
+migration lock and runs the DDL only when a step is pending.
 
 ### Alembic, Django and Flyway
 
@@ -869,6 +959,9 @@ The file has no `BEGIN` or `COMMIT`, because Alembic runs each revision in its
 own transaction, so `--no-transaction` changes nothing; `--no-lock` leaves
 out the locks, and `--lock-timeout` sets each step's bound on lock waits as
 above. Any other option, or a value the format does not accept, exits with 2.
+`plan --format alembic` takes the same options and writes the same file with
+only the steps that the database it reads still lacks
+([Plan and check](#plan-and-check)).
 
 ## Compatibility
 
@@ -896,6 +989,13 @@ It is the only upgrade guide.
   'dsn', but got None.`: the value you passed is `None` or empty, usually an
   environment variable that is not set. For an empty string the message says
   `got ''`.
+- `SchemaNotReadyError: ... is not ready and run_migrations is off` on
+  startup: the table, or a column this release adds, is missing in the
+  database the component connects to. The message names them. Create them with
+  `taskiq postgresql migrate`, with the SQL `taskiq postgresql plan` prints or
+  with an Alembic revision, or start once with `run_migrations=True`;
+  `taskiq postgresql check` shows what is missing
+  ([Plan and check](#plan-and-check)).
 - `relation "..." does not exist`: the tables are missing. Start once with
   `run_migrations=True`, or create them as described in
   [Migrations](#migrations).

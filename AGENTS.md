@@ -26,9 +26,9 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `taskiq_postgresql/migrations.py` | The tables described as columns and indexes (`TableSchema`) and as the ordered statements `on_startup` runs (`MigrationStep`, whose `objects` name what each step creates), built from the drivers' own builders; `render_sql`, `migration_statements` and the migration formats registered under the `taskiq_postgresql.migration_formats` entry-point group; the comparison engine: `catalog_query` (one read-only catalog query), `CatalogState`, `plan_migration` (a `MigrationPlan` of `PendingStep` and `SchemaProblem`) |
 | `taskiq_postgresql/contrib/sqlalchemy.py`, `contrib/sqlmodel.py` | Extras `sqlalchemy` and `sqlmodel`: `add_taskiq_tables` and `taskiq_metadata` build SQLAlchemy `Table` objects from `TableSchema` and record the descriptions under `MetaData.info[METADATA_INFO_KEY]` |
 | `taskiq_postgresql/contrib/alembic.py` | Extra `alembic`: the autogenerate comparator `compare_taskiq_steps` (registered on import) and its `TaskiqStepOp`/`TaskiqStepNoopOp`, `upgrade_taskiq_tables` for hand-written revisions, `exclude_taskiq_tables` and the `alembic` migration format (`alembic_format`); each step bounds its own lock waits (`LOCK_TIMEOUT_OPTION`) |
-| `taskiq_postgresql/cli.py` | `taskiq postgresql generate` (prints a migration script) and `taskiq postgresql migrate` (creates the tables once), a `taskiq_cli` entry point |
+| `taskiq_postgresql/cli.py` | `taskiq postgresql generate` (prints a migration script), `migrate` (creates the tables once), `plan` (prints the SQL one database still lacks) and `check` (reports it, exit 3 or 4), a `taskiq_cli` entry point |
 | `taskiq_postgresql/abc/driver.py` | `QueryDriver` and `ListenDriver` interfaces |
-| `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces; `_params.py` (bind parameters) and `_health.py` (the `LISTEN` health check) are shared |
+| `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces; `_params.py` (bind parameters), `_health.py` (the `LISTEN` health check) and `_schema.py` (the table check of `on_startup`) are shared |
 | `taskiq_postgresql/utils/` | Driver lookup by name, DSN helpers, optional-import checks |
 | `tests/` | Integration tests against a real PostgreSQL |
 | `tests/conftest.py`, `tests/helpers.py` | Fixtures (`postgresql_dsn`, drivers, teardown) and shared helpers: teardown, scratch databases, DSN and port utilities |
@@ -36,6 +36,7 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `tests/test_listen_recovery.py`, `tests/silent_proxy.py` | Lost and silent connections (reopening `LISTEN`, bounded waits), through a TCP proxy that makes a connection go silent, refuse or drop |
 | `tests/unit/` | Tests that need no database (SQL text, parameter shaping, wiring) |
 | `tests/test_migration_plan.py`, `tests/golden/migration_steps.sql` | The comparison engine against real catalogs, and the released steps, which must never change |
+| `tests/test_startup_check.py`, `tests/test_cli_plan.py` | The table check of `startup()` without `run_migrations`, and `taskiq postgresql plan` and `check`, against real catalogs |
 | `tests/test_contrib_*.py` | The SQLAlchemy, SQLModel and Alembic integrations; the Alembic ones carry the `alembic` mark (`pytest -m alembic`), which CI also runs on the oldest Alembic the extra allows |
 | `scripts/check_pins.py` | Checks that pins declared in several places agree |
 | `docs/` | Architecture, ADRs; `docs/spikes/` holds dated planning notes |
@@ -115,6 +116,10 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   pin the current DDL. `migrations.py` builds its steps from the same
   builders, and `tests/test_migration_script.py::test_the_steps_are_the_sql_run_migrations_executes`
   checks that they are the statements the drivers build for `on_startup`.
+  The bundled drivers' `on_startup` starts with the engine's one read-only
+  catalog query (`drivers/_schema.py`): with `run_migrations=True` it skips
+  the lock and the DDL when no step is pending; without it, it runs no DDL and
+  raises `SchemaNotReadyError` when a table or column is missing.
   The migration's advisory lock key (`MigrationLockQuery` in
   `abc/query.py`) is a contract between releases;
   `tests/test_migrations.py::test_migration_lock_key_is_pinned` pins it.

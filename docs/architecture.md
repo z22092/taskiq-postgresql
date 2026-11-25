@@ -120,17 +120,27 @@ the `CREATE TABLE` and hash index DDL below, and
 `tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql`
 the added columns and their index.
 
-`on_startup` migrates on one connection, in one transaction. It first checks
-with `to_regclass` (`RelationsExistQuery`) whether the table and every index
-it creates exist, and with `pg_attribute` whether the table has the added
-columns; if they all do, it returns without a lock or DDL, so a role with only
-DML privileges can start. Otherwise it takes
+`on_startup` migrates on one connection, in one transaction. It first reads
+the catalog with the comparison engine described below (`catalog_query`, then
+`plan_migration`, through `drivers/_schema.py`); if no migration step is
+pending, it returns without a lock or DDL, so a role with only DML privileges
+can start. Otherwise it takes
 `pg_advisory_xact_lock(hashtext('taskiq_postgresql'), hashtext(<table name>))`
 (`MigrationLockQuery`) and runs the DDL in that transaction: `CREATE TABLE`,
 the hash indexes, then the added columns and their index, before the commit.
 A concurrent startup waits for the commit, and its `IF NOT EXISTS` then finds
 the objects. The lock key stays the same across releases, so two versions in a
 rolling deploy also wait for each other.
+
+Without `run_migrations`, `on_startup` runs the same catalog query through
+`fetch_row`, on the driver's own pool, and no DDL (`check_table`). A missing
+table or column, or a problem the components cannot work with, raises
+`SchemaNotReadyError`, which names the table, the steps, the missing columns
+and the commands that create them; a missing index, or an index no step can
+fix, is logged as a warning. The driver describes its table from its own
+builders and `QueryDriver.component_kind`, which each component sets; a driver
+no component owns compares nothing. `RelationsExistQuery`, the probe before
+the engine, stays in `abc/query.py` for custom drivers.
 
 `taskiq_postgresql/migrations.py` describes each table twice, from the same
 builders: as columns and indexes (`TableSchema`), and as the ordered
@@ -141,7 +151,14 @@ generate` (`cli.py`) renders the steps as a script for another migration tool,
 with the same advisory lock and, by default, a `SET LOCAL lock_timeout` first,
 so that a run against a live database fails instead of queueing behind open
 transactions. `taskiq postgresql migrate` runs the migration of
-`run_migrations=True` once. `tests/test_migration_script.py` checks that the
+`run_migrations=True` once. `taskiq postgresql plan` and `check` read one
+database's catalog, in one `SELECT` that also returns `current_database()`
+and `current_schemas(false)`, through the driver of a component (or a
+throwaway one with `--component`): `plan` prints `MigrationPlan.render_sql`
+under a header naming that database, or hands the tables cut down to their
+pending steps to another format; `check` reports, exits with 3 for a missing
+table or column and 4 for a problem, and prints JSON with `--json`.
+`tests/test_migration_script.py` checks that the
 steps are the statements the drivers build for `on_startup` and that the
 script builds the catalog `on_startup` builds.
 
@@ -260,8 +277,15 @@ sequenceDiagram
 
 ## Error handling
 
-`taskiq_postgresql/exceptions.py` defines `DatabaseConnectionError` and
-`ResultIsMissingError`, both subclasses of `BaseTaskiqAsyncpgError`.
+`taskiq_postgresql/exceptions.py` defines `DatabaseConnectionError`,
+`ResultIsMissingError` and `SchemaNotReadyError`, all subclasses of
+`BaseTaskiqAsyncpgError`.
+
+- `SchemaNotReadyError`: `startup()` without `run_migrations` found the table,
+  or a column a migration step adds, missing, or a problem the component
+  cannot work with; it carries `table`, `pending` and `problems`. The query
+  driver raises it after leaving its connection block, so psqlpy and psycopg
+  do not wrap it in `DatabaseConnectionError`.
 
 - `DatabaseConnectionError`:
   - every `ListenDriver.on_startup` raises it when the `LISTEN` connection
