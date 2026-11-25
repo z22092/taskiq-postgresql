@@ -48,8 +48,6 @@ from urllib.parse import urlsplit
 import alembic as alembic_package
 import asyncpg
 import pytest
-from django.core.management import call_command
-from django.test.utils import override_settings
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase
 from sqlmodel import SQLModel
@@ -60,7 +58,6 @@ from taskiq.serializers import JSONSerializer, MSGPackSerializer
 from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend, migrations
 from taskiq_postgresql.cli import PostgresqlCMD
 from taskiq_postgresql.contrib.alembic import alembic_format
-from taskiq_postgresql.contrib.django.formats import django_format
 from taskiq_postgresql.contrib.sqlalchemy import add_taskiq_tables
 from taskiq_postgresql.migrations import (
     FormatOptions,
@@ -74,6 +71,7 @@ from tests.helpers import (
     create_database,
     drop_database,
     in_database,
+    new_database,
     run_script,
 )
 from tests.test_contrib_alembic import (
@@ -82,7 +80,6 @@ from tests.test_contrib_alembic import (
     offline_sql,
     run_upgrade,
 )
-from tests.test_contrib_django import configure_django, django_database
 from tests.test_contrib_sqlalchemy import sqlalchemy_url
 from tests.test_migrations import scram_verifier
 
@@ -1262,8 +1259,20 @@ def _taskiq_settings(namespace: dict[str, Any]) -> dict[str, Any]:
 def test_when_the_django_examples_run__then_migrate_creates_the_tables(
     project: Path,
     scratch_dsn: str,
+    postgresql_dsn: str,
     ca_file: Path,
+    django_configured: None,
 ) -> None:
+    # Imported here: collecting the other README tests needs neither Django
+    # nor the app.
+    from django.core.management import call_command  # noqa: PLC0415
+    from django.test.utils import override_settings  # noqa: PLC0415
+
+    from taskiq_postgresql.contrib.django_format import (  # noqa: PLC0415
+        django_format,
+    )
+    from tests.django_support import django_database  # noqa: PLC0415
+
     with_paths, with_dicts = _section_blocks(DJANGO_SECTION)
     assert with_paths.source.startswith("# settings.py\n")
     paths = _run_block(with_paths, ca_file)
@@ -1278,7 +1287,6 @@ def test_when_the_django_examples_run__then_migrate_creates_the_tables(
     ]
     migrate, zero = manage
     assert "taskiq_postgresql.contrib.django" in paths["INSTALLED_APPS"]
-    configure_django()
 
     with django_database(scratch_dsn):
         with override_settings(**_taskiq_settings(paths)):
@@ -1286,7 +1294,12 @@ def test_when_the_django_examples_run__then_migrate_creates_the_tables(
         created = asyncio.run(_tables(scratch_dsn))
         call_command(*zero, verbosity=0)
         after_zero = asyncio.run(_tables(scratch_dsn))
-        with override_settings(**_taskiq_settings(dicts)):
+    # The dict example on a database of its own, as a project that starts
+    # with these settings.
+    databases = new_database(postgresql_dsn)
+    with contextlib.closing(databases):
+        dicts_dsn = next(databases)
+        with django_database(dicts_dsn), override_settings(**_taskiq_settings(dicts)):
             shown = call_command(
                 "sqlmigrate",
                 "taskiq_postgresql",
@@ -1294,11 +1307,12 @@ def test_when_the_django_examples_run__then_migrate_creates_the_tables(
                 stdout=io.StringIO(),
             )
             call_command(*migrate, verbosity=0)
+        from_dicts = asyncio.run(_tables(dicts_dsn))
 
     assert created == {*DEFAULT_TABLES, "django_migrations"}
-    # zero leaves the tables; migrating again reads the settings again.
+    # The app's own reverse runs no SQL: the tables stay.
     assert after_zero == created
-    assert asyncio.run(_tables(scratch_dsn)) == {*created, "jobs", "job_results"}
+    assert from_dicts == {"jobs", "job_results", "django_migrations"}
     assert "SET LOCAL lock_timeout = '5s'" in shown
 
     (line,) = [line for line in lines if line.startswith("taskiq ")]

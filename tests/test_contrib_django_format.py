@@ -4,7 +4,11 @@ The ``django`` migration format: ``taskiq postgresql generate --format django``.
 It writes one Django migration that holds every step of the tables, its SQL
 written out, for a project that keeps the tables in a migration of its own
 instead of installing the app. ``plan --format django`` writes only the steps a
-database still lacks.
+database still lacks. The format imports no Django, so it works without the
+``django`` extra; running the migrations it writes needs Django.
+
+The format is imported when a test calls ``render``, never when this module is
+collected, so that without it each test fails on its own.
 """
 
 from __future__ import annotations
@@ -14,19 +18,19 @@ import asyncio
 import random
 import re
 import string
+import subprocess
 import sys
 from dataclasses import replace
 from importlib.metadata import entry_points
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Iterator
+from urllib.parse import quote
 
 import pytest
 from django.db import migrations as django_migrations
 from django.test.utils import override_settings
 
-from taskiq_postgresql import migrations
 from taskiq_postgresql.cli import PostgresqlCMD
-from taskiq_postgresql.contrib.django.formats import django_format
 from taskiq_postgresql.migrations import (
     COMPONENT_KINDS,
     DEFAULT_LOCK_TIMEOUT,
@@ -38,34 +42,49 @@ from taskiq_postgresql.migrations import (
     load_format,
     table_schema,
 )
-from tests.helpers import run_script
-from tests.test_cli import taskiq
-from tests.test_contrib_alembic import bounded
-from tests.test_contrib_django import (
-    APP,
-    configure_django,
-    django_database,
+from tests.django_support import APP, migrate
+from tests.helpers import (
+    BROKER_TABLE_0_4_SQL,
+    block,
+    bounded,
+    fetch_on_server,
+    in_database,
     lock_of,
-    migrate,
+    new_database,
     plan_of,
+    run_script,
+    tables_in,
 )
-from tests.test_contrib_sqlalchemy import block, databases, tables_in
-from tests.test_migrations import BROKER_TABLE_0_4_SQL
 
-pytestmark = pytest.mark.usefixtures("django_configured")
-
+FORMAT_MODULE = "taskiq_postgresql.contrib.django_format"
 IMPORTS = ["from django.db import migrations"]
-
-
-@pytest.fixture(scope="session")
-def django_configured() -> None:
-    configure_django()
+TIMEOUT = 60
+# What Python reads as an encoding declaration on the first two lines of a
+# file (PEP 263), matched without regard to case.
+ENCODING_DECLARATION = re.compile(r"coding[:=]\s*[-\w.]+", re.IGNORECASE)
+# Runs taskiq's own entry point in an interpreter where Django cannot be
+# imported, as on an install without the django extra.
+WITHOUT_DJANGO = (
+    "import runpy, sys\n"
+    "sys.modules['django'] = None\n"
+    "sys.argv = ['taskiq', *sys.argv[1:]]\n"
+    "runpy.run_module('taskiq', run_name='__main__', alter_sys=True)\n"
+)
 
 
 @pytest.fixture
-def new_database(postgresql_dsn: str) -> Iterator[Callable[[], str]]:
-    """Create empty databases for one test, and drop them after it."""
-    yield from databases(postgresql_dsn)
+def scratch_dsn(postgresql_dsn: str) -> Iterator[str]:
+    """DSN of a database created empty for one test and dropped after it."""
+    yield from new_database(postgresql_dsn)
+
+
+def render(*args: Any, **kwargs: Any) -> str:
+    """Render the django format, imported on call."""
+    from taskiq_postgresql.contrib.django_format import (  # noqa: PLC0415
+        django_format,
+    )
+
+    return django_format(*args, **kwargs)
 
 
 def default_schemas() -> list[TableSchema]:
@@ -90,7 +109,7 @@ def run_sql_of(source: str) -> list[list[str]]:
     return [list(operation.sql) for operation in operations]
 
 
-def step_statements(
+def expected_steps(
     schemas: list[TableSchema],
     *,
     lock: bool = True,
@@ -110,29 +129,40 @@ def imports_of(source: str) -> list[str]:
     ]
 
 
+def run_python(*args: str) -> subprocess.CompletedProcess[str]:
+    """Run ``python -c`` with ``args``, this interpreter, as a user would."""
+    return subprocess.run(  # noqa: S603
+        [sys.executable, "-c", *args],
+        capture_output=True,
+        text=True,
+        timeout=TIMEOUT,
+        check=False,
+    )
+
+
 def test_the_django_format_is_registered_by_the_package() -> None:
     (entry_point,) = entry_points(group=MIGRATION_FORMATS_GROUP, name="django")
 
-    assert entry_point.value == "taskiq_postgresql.contrib.django.formats:django_format"
+    assert entry_point.value == f"{FORMAT_MODULE}:django_format"
     assert entry_point.dist is not None
     assert entry_point.dist.name == "taskiq-postgresql"
     assert "django" in available_formats()
-    assert load_format("django") is django_format
+    assert load_format("django").__module__ == FORMAT_MODULE
 
 
 def test_the_migration_runs_each_step_and_imports_only_django() -> None:
     schemas = default_schemas()
 
-    source = django_format(schemas, FormatOptions())
+    source = render(schemas, FormatOptions())
 
-    assert run_sql_of(source) == step_statements(schemas)
+    assert run_sql_of(source) == expected_steps(schemas)
     assert migration_of(source).dependencies == []
     # The SQL is written out: the file never imports this package.
     assert imports_of(source) == IMPORTS
     # The same tables give the same file; Django runs each migration in a
     # transaction of its own, so BEGIN and COMMIT never appear.
-    assert django_format(schemas, FormatOptions()) == source
-    assert django_format(schemas, FormatOptions(transaction=False)) == source
+    assert render(schemas, FormatOptions()) == source
+    assert render(schemas, FormatOptions(transaction=False)) == source
     assert "BEGIN" not in source
     ast.parse(source)
 
@@ -140,7 +170,7 @@ def test_the_migration_runs_each_step_and_imports_only_django() -> None:
 def test_the_migration_takes_the_options() -> None:
     schemas = [table_schema("broker"), table_schema("result_backend")]
 
-    source = django_format(
+    source = render(
         schemas,
         FormatOptions(
             lock=False,
@@ -148,38 +178,46 @@ def test_the_migration_takes_the_options() -> None:
             extra={"dependencies": "shop.0004_orders,billing.0001_initial"},
         ),
     )
-    unbounded = django_format(schemas, FormatOptions(lock_timeout=0))
+    unbounded = render(schemas, FormatOptions(lock_timeout=0))
 
     assert migration_of(source).dependencies == [
         ("shop", "0004_orders"),
         ("billing", "0001_initial"),
     ]
-    assert run_sql_of(source) == step_statements(schemas, lock=False, lock_timeout=3)
-    assert run_sql_of(unbounded) == step_statements(schemas, lock_timeout=0)
+    assert run_sql_of(source) == expected_steps(schemas, lock=False, lock_timeout=3)
+    assert run_sql_of(unbounded) == expected_steps(schemas, lock_timeout=0)
     assert "lock_timeout" not in unbounded
 
 
 @pytest.mark.parametrize(
     ("extra", "message"),
     [
-        ({"author": "me"}, "unknown option: author"),
-        ({"downgrade": "drop"}, "unknown option: downgrade"),
-        ({"dependencies": ""}, "dependencies must be"),
-        ({"dependencies": "shop"}, "dependencies must be"),
-        ({"dependencies": "shop.0004_orders,"}, "dependencies must be"),
-        ({"dependencies": "1shop.0004_orders"}, "dependencies must be"),
-        ({"dependencies": "shop.0004-orders"}, "dependencies must be"),
-        ({"dependencies": 'shop.0004")\nimport os'}, "dependencies must be"),
-    ],
-    ids=[
-        "unknown",
-        "no-drop",
-        "empty",
-        "no-migration",
-        "trailing-comma",
-        "label-not-an-identifier",
-        "dash",
-        "injection",
+        pytest.param({"author": "me"}, "unknown option: author", id="unknown"),
+        pytest.param({"downgrade": "drop"}, "unknown option: downgrade", id="no-drop"),
+        pytest.param({"dependencies": ""}, "dependencies must be", id="empty"),
+        pytest.param(
+            {"dependencies": "shop"}, "dependencies must be", id="no-migration"
+        ),
+        pytest.param(
+            {"dependencies": "shop.0004_orders,"},
+            "dependencies must be",
+            id="trailing-comma",
+        ),
+        pytest.param(
+            {"dependencies": "1shop.0004_orders"},
+            "dependencies must be",
+            id="label-not-an-identifier",
+        ),
+        pytest.param(
+            {"dependencies": "shop.0004-orders"},
+            "dependencies must be",
+            id="dash",
+        ),
+        pytest.param(
+            {"dependencies": 'shop.0004")\nimport os'},
+            "dependencies must be",
+            id="injection",
+        ),
     ],
 )
 def test_the_format_refuses_an_option_it_cannot_honour(
@@ -187,25 +225,26 @@ def test_the_format_refuses_an_option_it_cannot_honour(
     message: str,
 ) -> None:
     with pytest.raises(MigrationFormatOptionError, match=re.escape(message)):
-        django_format([table_schema("broker")], FormatOptions(extra=extra))
-    # Checked before any table: plan checks the options with none.
+        render([table_schema("broker")], FormatOptions(extra=extra))
+    # Checked with no table too: plan checks the options with none.
     with pytest.raises(MigrationFormatOptionError, match=re.escape(message)):
-        django_format([], FormatOptions(extra=extra))
+        render([], FormatOptions(extra=extra))
 
 
 @pytest.mark.parametrize(
     "table_name",
-    ["jobs, users", 'jobs"', "1jobs", "jobs\u2028x"],
-    ids=["comma", "quote", "leading-digit", "unicode-line-separator"],
+    [
+        pytest.param("jobs, users", id="comma"),
+        pytest.param('jobs"', id="quote"),
+        pytest.param("1jobs", id="leading-digit"),
+        pytest.param("jobs\u2028x", id="unicode-line-separator"),
+    ],
 )
 def test_the_format_refuses_a_table_name_that_is_not_an_identifier(
     table_name: str,
 ) -> None:
     with pytest.raises(ValueError, match="plain SQL identifier"):
-        django_format(
-            [table_schema("broker", table_name=table_name)],
-            FormatOptions(),
-        )
+        render([table_schema("broker", table_name=table_name)], FormatOptions())
 
 
 def broker_with_step_number(number: object) -> TableSchema:
@@ -216,12 +255,31 @@ def broker_with_step_number(number: object) -> TableSchema:
 @pytest.mark.parametrize(
     ("schema", "error", "message"),
     [
-        (replace(table_schema("broker"), kind="queue"), ValueError, "kind 'queue'"),
-        (broker_with_step_number("1\nimport os"), TypeError, "must be an int"),
-        (broker_with_step_number(True), TypeError, "must be an int"),
-        (broker_with_step_number(0), ValueError, "must be positive"),
+        pytest.param(
+            replace(table_schema("broker"), kind="queue"),
+            ValueError,
+            "kind 'queue'",
+            id="unknown-kind",
+        ),
+        pytest.param(
+            broker_with_step_number("1\nimport os"),
+            TypeError,
+            "must be an int",
+            id="text-step",
+        ),
+        pytest.param(
+            broker_with_step_number(True),
+            TypeError,
+            "must be an int",
+            id="bool-step",
+        ),
+        pytest.param(
+            broker_with_step_number(0),
+            ValueError,
+            "must be positive",
+            id="step-zero",
+        ),
     ],
-    ids=["unknown-kind", "text-step", "bool-step", "step-zero"],
 )
 def test_the_format_refuses_a_kind_or_step_a_comment_cannot_hold(
     schema: TableSchema,
@@ -230,14 +288,14 @@ def test_the_format_refuses_a_kind_or_step_a_comment_cannot_hold(
 ) -> None:
     # Both are written into the file's comments.
     with pytest.raises(error, match=re.escape(message)):
-        django_format([schema], FormatOptions())
+        render([schema], FormatOptions())
 
 
 def test_the_migration_starts_with_its_comments() -> None:
     schemas = [table_schema("broker")]
-    plain = django_format(schemas, FormatOptions())
+    plain = render(schemas, FormatOptions())
 
-    source = django_format(
+    source = render(
         schemas,
         FormatOptions(),
         comments=["plan for database app (search_path {public})", 'a """ name'],
@@ -252,44 +310,63 @@ def test_the_migration_starts_with_its_comments() -> None:
 
 
 @pytest.mark.parametrize(
-    "comment",
-    ["a\nimport os", "a\rb", "a\0b"],
-    ids=["line-feed", "carriage-return", "nul"],
+    ("comment", "message"),
+    [
+        pytest.param("a\nimport os", "line break or a NUL", id="line-feed"),
+        pytest.param("a\rb", "line break or a NUL", id="carriage-return"),
+        pytest.param("a\0b", "line break or a NUL", id="nul"),
+        pytest.param("db coding:utf-7", "encoding declaration", id="pep-263-colon"),
+        pytest.param(
+            "-*- coding: latin-1 -*-",
+            "encoding declaration",
+            id="pep-263-emacs",
+        ),
+        pytest.param(
+            "vim: set fileencoding=utf-8 :",
+            "encoding declaration",
+            id="pep-263-vim",
+        ),
+        pytest.param("CODING=ascii", "encoding declaration", id="pep-263-upper"),
+    ],
 )
-def test_the_migration_refuses_a_comment_a_line_break_would_end(comment: str) -> None:
-    with pytest.raises(ValueError, match="line break or a NUL"):
-        django_format([table_schema("broker")], FormatOptions(), comments=[comment])
+def test_the_migration_refuses_a_comment_that_would_change_the_file(
+    comment: str,
+    message: str,
+) -> None:
+    # A line break would end the comment and run the rest; an encoding
+    # declaration on the first two lines changes how Python reads the file.
+    with pytest.raises(ValueError, match=message):
+        render([table_schema("broker")], FormatOptions(), comments=[comment])
 
 
 def test_the_generated_migration_runs_with_migrate_without_this_package(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    new_database: Callable[[], str],
+    django_db: str,
 ) -> None:
-    dsn = new_database()
     app = "tkq_django_" + "".join(random.choices(string.ascii_lowercase, k=10))
     (tmp_path / app / "migrations").mkdir(parents=True)
     (tmp_path / app / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / app / "migrations" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / app / "migrations" / "0001_taskiq_tables.py").write_text(
-        django_format(default_schemas(), FormatOptions()),
+        render(default_schemas(), FormatOptions()),
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))
     try:
-        with django_database(dsn), override_settings(INSTALLED_APPS=[app]):
+        with override_settings(INSTALLED_APPS=[app]):
             with monkeypatch.context() as blocked:
                 # As on a host where taskiq-postgresql is not installed.
                 block(blocked, "taskiq_postgresql")
                 migrate(app)
                 migrate(app, "zero")
-            after_zero = tables_in(dsn)
+            after_zero = tables_in(django_db)
             migrate(app)
     finally:
         for name in [name for name in sys.modules if name.split(".")[0] == app]:
             del sys.modules[name]
 
-    plan = plan_of(dsn, default_schemas())
+    plan = plan_of(django_db, default_schemas())
     assert plan.is_current, plan.pending
     assert plan.problems == ()
     # Reversed, the migration leaves the tables in place.
@@ -299,27 +376,29 @@ def test_the_generated_migration_runs_with_migrate_without_this_package(
     }
 
 
-def test_generate_writes_the_migration_through_the_cli() -> None:
-    expected = django_format(
+def test_generate_writes_the_migration(capsys: pytest.CaptureFixture[str]) -> None:
+    expected = render(
         [table_schema("broker", table_name="jobs")],
         FormatOptions(extra={"dependencies": "shop.0004_orders"}),
     )
 
-    result = taskiq(
-        "postgresql",
-        "generate",
-        "--component",
-        "broker",
-        "--table-name",
-        "jobs",
-        "--format",
-        "django",
-        "--option",
-        "dependencies=shop.0004_orders",
+    code = PostgresqlCMD().exec(
+        [
+            "generate",
+            "--component",
+            "broker",
+            "--table-name",
+            "jobs",
+            "--format",
+            "django",
+            "--option",
+            "dependencies=shop.0004_orders",
+        ],
     )
 
-    assert result.returncode == 0, result.stderr
-    assert result.stdout == expected
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert captured.out == expected
 
 
 def test_generate_exits_with_2_on_an_option_the_format_refuses(
@@ -335,19 +414,22 @@ def test_generate_exits_with_2_on_an_option_the_format_refuses(
 
 
 def test_plan_writes_only_the_pending_steps_under_the_plan_header(
-    new_database: Callable[[], str],
+    scratch_dsn: str,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    dsn = new_database()
     broker = table_schema("broker")
-    command = ["plan", "--component", "broker", "--dsn", dsn, "--format", "django"]
+    command = ["plan", "--component", "broker", "--dsn", scratch_dsn]
 
-    creating = PostgresqlCMD().exec(command)
+    creating = PostgresqlCMD().exec([*command, "--format", "django"])
     created = capsys.readouterr()
     asyncio.run(
-        run_script(dsn, "asyncpg", BROKER_TABLE_0_4_SQL.format(table=broker.name)),
+        run_script(
+            scratch_dsn,
+            "asyncpg",
+            BROKER_TABLE_0_4_SQL.format(table=broker.name),
+        ),
     )
-    completing = PostgresqlCMD().exec(command)
+    completing = PostgresqlCMD().exec([*command, "--format", "django"])
     completed = capsys.readouterr()
 
     assert (creating, completing) == (0, 0), created.err + completed.err
@@ -356,26 +438,76 @@ def test_plan_writes_only_the_pending_steps_under_the_plan_header(
         r"# plan for database \S+ \(search_path .+\): valid only for this database",
         header,
     )
-    assert created.out == django_format(
+    assert created.out == render(
         [broker],
         FormatOptions(),
         comments=[header.removeprefix("# ")],
     )
     # On a broker table 0.4.x created, only step 2 is pending.
     assert completed.out.splitlines()[0] == header
-    assert run_sql_of(completed.out) == step_statements(
+    assert run_sql_of(completed.out) == expected_steps(
         [replace(broker, steps=broker.steps[1:])],
     )
 
 
-def test_the_format_without_django_says_what_to_install(
-    monkeypatch: pytest.MonkeyPatch,
+def test_plan_writes_a_database_name_that_declares_an_encoding_escaped(
+    postgresql_dsn: str,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
-    block(monkeypatch, "django")
-    for name in [name for name in sys.modules if name.startswith(APP)]:
-        monkeypatch.delitem(sys.modules, name)
+    # The name comes from the server, and the header is the file's first line:
+    # Python would read it as the file's encoding.
+    name = "tkq_" + "".join(random.choices(string.ascii_lowercase, k=8))
+    name += "_coding:utf-7"
+    asyncio.run(fetch_on_server(postgresql_dsn, f'CREATE DATABASE "{name}"'))
+    try:
+        code = PostgresqlCMD().exec(
+            [
+                "plan",
+                "--component",
+                "broker",
+                "--dsn",
+                in_database(postgresql_dsn, quote(name, safe="")),
+                "--format",
+                "django",
+            ],
+        )
+        captured = capsys.readouterr()
+    finally:
+        asyncio.run(
+            fetch_on_server(
+                postgresql_dsn,
+                f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)',
+            ),
+        )
 
-    with pytest.raises(ImportError) as missing:
-        migrations.load_format("django")
+    assert code == 0, captured.err
+    first, second = captured.out.splitlines()[:2]
+    assert ENCODING_DECLARATION.search(first) is None
+    assert ENCODING_DECLARATION.search(second) is None
+    # Still named, with the ":" escaped as repr() would escape a control
+    # character.
+    escaped = repr(name).replace(":", "\\x3a")
+    assert first.startswith(f"# plan for database {escaped} (search_path ")
+    # Read as Python reads a file: from bytes, honouring a declaration.
+    compile(captured.out.encode(), "0001_taskiq_tables.py", "exec")
 
-    assert "pip install 'taskiq-postgresql[django]'" in str(missing.value)
+
+def test_the_format_works_without_django_and_the_app_says_what_to_install() -> None:
+    generated = run_python(
+        WITHOUT_DJANGO,
+        "postgresql",
+        "generate",
+        "--component",
+        "broker",
+        "--format",
+        "django",
+    )
+    app = run_python(
+        f"import sys\nsys.modules['django'] = None\nimport {APP}\n",
+    )
+
+    # Writing a migration file needs no Django; running one does.
+    assert generated.returncode == 0, generated.stderr
+    assert generated.stdout == render([table_schema("broker")], FormatOptions())
+    assert app.returncode == 1
+    assert "pip install taskiq-postgresql[django]" in app.stderr

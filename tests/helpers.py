@@ -4,7 +4,7 @@ import random
 import socket
 import string
 import sys
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, TypeVar, Union
@@ -14,6 +14,14 @@ import asyncpg
 import pytest
 
 from taskiq_postgresql.broker import PostgresqlBroker
+from taskiq_postgresql.migrations import (
+    DEFAULT_LOCK_TIMEOUT,
+    MigrationPlan,
+    TableSchema,
+    migration_statements,
+    plan_migration,
+    read_catalog,
+)
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 
@@ -31,6 +39,65 @@ UNUSED_DSN = "postgresql://localhost/unused"
 # How long a listening worker may take to get a message it is notified of,
 # with room for a busy machine, where 0.6 s was seen under CPU load.
 NOTIFY_DELIVERS_WITHIN = 3.0
+
+# The longest a test waits on the server; statement_timeout ends any wait
+# that nothing else bounds.
+WAIT_SECONDS = 10
+# Short, so a test that waits it out stays fast; far below WAIT_SECONDS.
+LOCK_TIMEOUT = 1
+
+# The broker's table and index exactly as 0.4.x creates them, before the
+# claim columns existed.
+BROKER_TABLE_0_4_SQL = (
+    "CREATE TABLE {table} (id SERIAL NOT NULL PRIMARY KEY, "
+    "task_id Uuid NOT NULL, task_name VARCHAR NOT NULL, message BYTEA NOT NULL, "
+    "labels JSONB NOT NULL, "
+    "created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());"
+    "CREATE INDEX {table}_id_idx ON {table} USING HASH (id);"
+)
+
+# Where the taskiq steps keep the transaction's own lock_timeout while theirs
+# applies, and the statements that keep and give it back.
+SAVED_LOCK_TIMEOUT = "taskiq_postgresql_step.lock_timeout"
+SAVE_LOCK_TIMEOUT = (
+    f"SELECT set_config('{SAVED_LOCK_TIMEOUT}', current_setting('lock_timeout'), true)"
+)
+RESTORE_LOCK_TIMEOUT = (
+    "SELECT set_config('lock_timeout', "
+    f"NULLIF(current_setting('{SAVED_LOCK_TIMEOUT}', true), ''), true)"
+)
+
+
+def bounded(
+    statements: Sequence[str],
+    lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+) -> list[str]:
+    """
+    ``statements`` as the Alembic and Django integrations run them.
+
+    They run with a ``lock_timeout`` of their own, set after keeping the
+    transaction's, which comes back after them; ``0`` adds nothing.
+    """
+    if not lock_timeout:
+        return list(statements)
+    return [
+        SAVE_LOCK_TIMEOUT,
+        f"SET LOCAL lock_timeout = '{lock_timeout}s'",
+        *statements,
+        RESTORE_LOCK_TIMEOUT,
+    ]
+
+
+def lock_of(schema: TableSchema) -> str:
+    """Return the advisory lock statement of ``schema``'s table."""
+    return migration_statements([schema])[0]
+
+
+def block(monkeypatch: pytest.MonkeyPatch, package: str) -> None:
+    """Make ``package`` and every submodule of it unimportable, as uninstalled."""
+    loaded = [name for name in sys.modules if name.startswith(f"{package}.")]
+    for name in (package, *loaded):
+        monkeypatch.setitem(sys.modules, name, None)
 
 
 def build_component(
@@ -65,7 +132,7 @@ def build_component(
     return PostgresqlSchedulerSource(**options)
 
 
-def new_database(dsn: str) -> Iterator[str]:
+def new_database(dsn: str) -> Generator[str, None, None]:
     """Create an empty database on the server of ``dsn``, yield its DSN, drop it."""
     name = "cli_" + "".join(random.choices(string.ascii_lowercase, k=10))
     asyncio.run(create_database(dsn, name))
@@ -170,6 +237,28 @@ async def _execute_on_server(dsn: str, statement: str) -> None:
     await fetch_on_server(dsn, statement)
 
 
+def tables_in(dsn: str) -> set[str]:
+    """Return the tables of the current schema of the database ``dsn`` names."""
+    rows = asyncio.run(
+        fetch_on_server(
+            dsn,
+            "SELECT DISTINCT table_name FROM information_schema.columns"
+            " WHERE table_schema = current_schema()",
+        ),
+    )
+    return {row[0] for row in rows}
+
+
+def plan_of(dsn: str, schemas: list[TableSchema]) -> MigrationPlan:
+    """Compare the database ``dsn`` names with ``schemas``."""
+
+    async def fetch_value(query: str) -> Any:
+        (row,) = await fetch_on_server(dsn, query)
+        return row[0]
+
+    return plan_migration(schemas, asyncio.run(read_catalog(schemas, fetch_value)))
+
+
 async def create_database(dsn: str, name: str) -> None:
     """
     Create the database ``name`` on the server ``dsn`` points at.
@@ -218,6 +307,22 @@ async def run_script(dsn: str, driver: str, script: str) -> None:
                 await connection.execute_batch(script)
         finally:
             pool.close()
+
+
+async def close_component(component: Component) -> None:
+    """
+    Close what ``startup()`` opened, also after a failed ``startup()``.
+
+    The broker's own ``shutdown()`` cannot do it: it fails when LISTEN never
+    started.
+    """
+    if component.driver.pool is not None:
+        await component.driver.on_shutdown()
+    if isinstance(component, PostgresqlBroker) and hasattr(
+        component.listen_driver,
+        "connection",
+    ):
+        await component.listen_driver.on_shutdown()
 
 
 async def drop_and_shutdown(

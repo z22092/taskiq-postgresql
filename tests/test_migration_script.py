@@ -46,20 +46,19 @@ from taskiq_postgresql.migrations import (
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from tests.helpers import (
+    BROKER_TABLE_0_4_SQL,
+    LOCK_TIMEOUT,
     UNUSED_DSN,
+    WAIT_SECONDS,
     address_of,
     build_component,
+    close_component,
     create_database,
     drop_database,
     in_database,
     run_script,
 )
-from tests.test_migrations import (
-    BROKER_TABLE_0_4_SQL,
-    close_component,
-    scram_verifier,
-    wait_until_blocked_by,
-)
+from tests.test_migrations import scram_verifier, wait_until_blocked_by
 
 KINDS = ("broker", "result_backend", "scheduler_source")
 TASK_ID_FIELDS = ("VarChar", "Text", "Uuid")
@@ -70,9 +69,6 @@ SHAPES = [
     ("scheduler_source", None),
 ]
 SHAPE_IDS = [f"{kind}-{field}" if field else kind for kind, field in SHAPES]
-WAIT_SECONDS = 10
-# Short, so a test that waits it out stays fast; far below WAIT_SECONDS.
-LOCK_TIMEOUT = 1
 
 
 def lock_lines(script: str) -> list[str]:
@@ -387,6 +383,21 @@ def test_two_components_with_one_table_and_different_columns_are_refused(
 
     with pytest.raises(ValueError, match="'t'"):
         collect_schemas(text_ids, uuid_ids)
+
+
+def test_descriptions_are_kept_and_each_table_comes_once(driver: str) -> None:
+    jobs = table_schema("broker", table_name="jobs")
+    schedules = table_schema("scheduler_source")
+    broker = PostgresqlBroker(dsn=UNUSED_DSN, driver=driver, table_name="jobs")
+
+    # A description of a component's table, with the same columns, adds
+    # nothing; with other columns, it is refused like a second component.
+    assert collect_schemas(jobs, schedules, broker, jobs) == [jobs, schedules]
+    with pytest.raises(ValueError, match="'jobs'"):
+        collect_schemas(
+            broker,
+            table_schema("broker", table_name="jobs", field_for_task_id="Text"),
+        )
 
 
 def test_an_import_path_is_loaded_the_way_taskiq_worker_loads_it(

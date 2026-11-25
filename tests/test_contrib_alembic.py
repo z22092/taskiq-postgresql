@@ -55,7 +55,7 @@ from taskiq_postgresql.migrations import (
     render_sql,
     table_schema,
 )
-from tests.helpers import run_script
+from tests.helpers import bounded, run_script
 from tests.test_cli import taskiq
 from tests.test_contrib_sqlalchemy import (
     CASE_IDS,
@@ -133,40 +133,10 @@ else:
         run(connection)
 """
 ALEMBIC_INI = "[alembic]\nscript_location = %(here)s/migrations\n"
-# Where the taskiq steps keep the transaction's own lock_timeout while theirs
-# applies, and the statements that keep and give it back.
-SAVED_LOCK_TIMEOUT = "taskiq_postgresql_step.lock_timeout"
-SAVE_LOCK_TIMEOUT = (
-    f"SELECT set_config('{SAVED_LOCK_TIMEOUT}', current_setting('lock_timeout'), true)"
-)
-RESTORE_LOCK_TIMEOUT = (
-    "SELECT set_config('lock_timeout', "
-    f"NULLIF(current_setting('{SAVED_LOCK_TIMEOUT}', true), ''), true)"
-)
 
 
 def default_schemas() -> list[TableSchema]:
     return [table_schema(kind) for kind in KINDS]
-
-
-def bounded(
-    statements: Sequence[str],
-    lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
-) -> list[str]:
-    """
-    ``statements`` as the Alembic integration runs them.
-
-    They run with a ``lock_timeout`` of their own, set after keeping the
-    transaction's, which comes back after them; ``0`` adds nothing.
-    """
-    if not lock_timeout:
-        return list(statements)
-    return [
-        SAVE_LOCK_TIMEOUT,
-        f"SET LOCAL lock_timeout = '{lock_timeout}s'",
-        *statements,
-        RESTORE_LOCK_TIMEOUT,
-    ]
 
 
 def run_upgrade(
@@ -584,6 +554,24 @@ def test_the_revision_starts_with_its_comments() -> None:
 )
 def test_the_revision_refuses_a_comment_a_line_break_would_end(comment: str) -> None:
     with pytest.raises(ValueError, match="line break or a NUL"):
+        alembic_format([table_schema("broker")], FormatOptions(), comments=[comment])
+
+
+@pytest.mark.parametrize(
+    "comment",
+    [
+        pytest.param("db coding:utf-7", id="colon"),
+        pytest.param("-*- coding: latin-1 -*-", id="emacs"),
+        pytest.param("vim: set fileencoding=utf-8 :", id="vim"),
+        pytest.param("CODING=ascii", id="upper-case"),
+    ],
+)
+def test_the_revision_refuses_a_comment_that_declares_an_encoding(
+    comment: str,
+) -> None:
+    # On one of a file's first two lines, Python reads it as the encoding of
+    # the whole file (PEP 263): utf-7 would turn "+AAo-" into a line break.
+    with pytest.raises(ValueError, match="encoding declaration"):
         alembic_format([table_schema("broker")], FormatOptions(), comments=[comment])
 
 

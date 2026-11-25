@@ -4,7 +4,7 @@ import signal
 import string
 import time
 from types import FrameType
-from typing import AsyncGenerator, Generator, Optional, TypeVar
+from typing import AsyncGenerator, Generator, Iterator, Optional, TypeVar
 from urllib.parse import urlsplit
 
 import pytest
@@ -17,6 +17,7 @@ from tests.helpers import (
     address_of,
     closed_local_port,
     drop_and_shutdown,
+    new_database,
     with_netloc,
 )
 
@@ -150,6 +151,33 @@ def postgresql_dsn() -> Generator[str, None, None]:
         yield container.get_connection_url(driver=None)
     finally:
         container.stop()
+
+
+@pytest.fixture(scope="session")
+def django_configured() -> None:
+    """
+    Configure Django once per session: the app installed, no database yet.
+
+    Django is imported here, not at module level, so that collecting the
+    tests that do not use it needs no Django.
+    """
+    from tests.django_support import configure_django  # noqa: PLC0415
+
+    configure_django()
+
+
+@pytest.fixture
+def django_db(postgresql_dsn: str, django_configured: None) -> Iterator[str]:
+    """DSN of a database created for one test, as Django's default database."""
+    from tests.django_support import django_database  # noqa: PLC0415
+
+    created = new_database(postgresql_dsn)
+    try:
+        dsn = next(created)
+        with django_database(dsn):
+            yield dsn
+    finally:
+        created.close()
 
 
 @pytest.fixture
