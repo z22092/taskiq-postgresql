@@ -164,3 +164,17 @@ async def test_success_backend_is_result_ready(
     )
 
     assert await result_backend.is_result_ready(task_id=task_id)
+
+
+async def test_when_the_backend_shuts_down__then_its_pool_is_closed(
+    result_backend: PostgresqlResultBackend[_ReturnType],
+) -> None:
+    """startup() opened the pool to read the catalog; shutdown() closes it."""
+    assert getattr(result_backend.driver, "pool", None) is not None
+
+    await result_backend.shutdown()
+    # A second shutdown, such as the broker's after the application's own,
+    # finds nothing to close.
+    await result_backend.shutdown()
+
+    assert getattr(result_backend.driver, "pool", None) is None

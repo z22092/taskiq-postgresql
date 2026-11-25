@@ -4,6 +4,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import logging
 import secrets
 import uuid
 from contextlib import asynccontextmanager
@@ -16,8 +17,10 @@ from taskiq import BrokerMessage
 from taskiq_postgresql.abc import query as sql_builders
 from taskiq_postgresql.abc.query import Column
 from taskiq_postgresql.broker import PostgresqlBroker
+from taskiq_postgresql.migrations import table_schema
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
+from taskiq_postgresql.utils import get_db_driver
 from tests.helpers import address_of
 
 if TYPE_CHECKING:
@@ -114,8 +117,8 @@ async def close_component(component: Component) -> None:
     """
     Close what ``startup()`` opened, also after a failed ``startup()``.
 
-    The components' own ``shutdown()`` cannot do it: the result backend's
-    leaves the pool open, and the broker's fails when LISTEN never started.
+    The broker's own ``shutdown()`` cannot do it: it fails when LISTEN never
+    started.
     """
     if component.driver.pool is not None:
         await component.driver.on_shutdown()
@@ -635,6 +638,82 @@ async def test_startup_after_the_upgrade_takes_the_fast_path(
         await blocker.close()
         await close_component(second)
         await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
+
+
+@pytest.mark.anyio
+async def test_a_driver_no_component_owns_takes_no_lock_once_its_table_exists(
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: Connection,
+) -> None:
+    """Without a kind it cannot compare, so it probes its relations as before."""
+    asyncpg = pytest.importorskip("asyncpg")
+    owner = build_component("result_backend", postgresql_dsn, postgres_table, driver)
+    try:
+        await owner.startup()
+    finally:
+        await close_component(owner)
+    alone = get_db_driver(driver)(
+        postgresql_dsn,
+        postgres_table,
+        columns=owner.driver.columns,
+        primary_key=owner.driver.primary_key,
+        index_columns=owner.driver.index_columns,
+        run_migrations=True,
+    )
+    assert alone.component_kind is None
+    blocker = await asyncpg.connect(postgresql_dsn)
+    try:
+        transaction = blocker.transaction()
+        await transaction.start()
+        await blocker.execute(
+            MIGRATION_LOCK_SQL,
+            MIGRATION_LOCK_NAMESPACE,
+            postgres_table,
+        )
+
+        # A startup that took the lock would wait for the blocker forever.
+        await asyncio.wait_for(alone.on_startup(), WAIT_SECONDS)
+    finally:
+        await blocker.close()
+        await alone.on_shutdown()
+        await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", COMPONENTS)
+async def test_a_startup_that_migrates_logs_a_problem_no_step_fixes(
+    kind: str,
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: Connection,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    index = table_schema(kind, table_name=postgres_table).indexes[0].name
+    # The name of the table's first index, taken first by another table.
+    await admin.execute(f"CREATE TABLE {postgres_table}_other (id INTEGER)")
+    await admin.execute(f"CREATE INDEX {index} ON {postgres_table}_other (id)")
+    component = build_component(kind, postgresql_dsn, postgres_table, driver)
+    try:
+        with caplog.at_level(logging.WARNING):
+            await component.startup()
+    finally:
+        await close_component(component)
+        await admin.execute(
+            f"DROP TABLE IF EXISTS {postgres_table}, {postgres_table}_other",
+        )
+
+    # IF NOT EXISTS skipped that index; without the warning nothing would say.
+    (warning,) = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno == logging.WARNING
+        and record.name.startswith("taskiq_postgresql")
+    ]
+    assert "index_on_other_table" in warning
+    assert index in warning
 
 
 @pytest.mark.anyio
