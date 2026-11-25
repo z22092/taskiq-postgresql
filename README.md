@@ -596,8 +596,9 @@ pass `--dsn`, or plan one table at a time with `--component`.
 `check` reads the same catalog and changes nothing. It reports each pending
 step and each problem on standard error, and `--json` also prints the report
 on standard output, as one object with the keys `current`, `pending` (each
-with `table`, `kind`, `step`, `severity` and what is `missing`: `table`,
-`columns`, `indexes`), `problems` (each with `table`, `code`, `severity` and
+with `table`, `kind`, `step`, `severity`, what is `missing`: `table`,
+`columns`, `indexes`, and the `not_null_columns` the step still has to make
+nullable), `problems` (each with `table`, `code`, `severity` and
 `detail`) and `advisory_only`:
 
 ```bash

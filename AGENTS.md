@@ -39,6 +39,7 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `tests/test_listen_recovery.py`, `tests/silent_proxy.py` | Lost and silent connections (reopening `LISTEN`, bounded waits), through a TCP proxy that makes a connection go silent, refuse or drop |
 | `tests/unit/` | Tests that need no database (SQL text, parameter shaping, wiring) |
 | `tests/test_migration_plan.py`, `tests/golden/migration_steps.sql` | The comparison engine against real catalogs, and the released steps, which must never change |
+| `tests/relax_schema.py`, `tests/unit/test_migration_relax.py` | A test-only table whose second step relaxes `NOT NULL` (no released step does), and the engine's handling of it without a database |
 | `tests/test_startup_check.py`, `tests/test_cli_plan.py` | The table check of `startup()` without `run_migrations`, and `taskiq postgresql plan` and `check`, against real catalogs |
 | `tests/test_contrib_*.py` | The SQLAlchemy, SQLModel, Alembic and Django integrations; the Alembic ones carry the `alembic` mark (`pytest -m alembic`), which CI also runs on the oldest Alembic the extra allows; the Django ones configure Django once per session with `settings.configure()` (no pytest-django) and point its default database at a database of their own |
 | `scripts/check_pins.py` | Checks that pins declared in several places agree |
@@ -113,7 +114,9 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   `run_migrations=True`, so existing deployments keep their tables. Columns
   added later (the broker's `channel` and `not_before` and their index) come
   from `AddColumnsQuery` with `ADD COLUMN IF NOT EXISTS`, so a table created by
-  an older release gets them too; DDL is additive only. Changing a column is a
+  an older release gets them too; DDL is additive, or relaxes `NOT NULL`
+  (`DropNotNullQuery`, a step's `StepObjects.nullable_columns`, ADR 0011);
+  nothing is removed or renamed. Changing a column is a
   schema change for existing deployments; `tests/unit/test_components.py` and
   `tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql`
   pin the current DDL. `migrations.py` builds its steps from the same
