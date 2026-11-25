@@ -19,8 +19,10 @@ import asyncpg
 import pytest
 
 from taskiq_postgresql import exceptions
+from taskiq_postgresql.drivers import _schema
 from taskiq_postgresql.migrations import CatalogState, render_sql, table_schema
 from tests.helpers import Component, build_component, run_script
+from tests.relax_schema import relaxing_schema
 from tests.test_migrations import (
     BROKER_TABLE_0_4_SQL,
     claim_schema,
@@ -232,3 +234,58 @@ async def test_run_migrations_still_creates_the_table_and_reads_the_catalog_once
 
     assert package_warnings(caplog) == []
     assert len(catalog_reads) == 2  # noqa: PLR2004
+
+
+async def test_a_step_that_relaxes_not_null_stops_a_component_until_it_has_run(
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: asyncpg.Connection,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = relaxing_schema(postgres_table)
+    # No released step relaxes a column, so the component checks a table that
+    # a test describes: the flow is the one every component runs.
+    monkeypatch.setattr(_schema, "described_table", lambda _driver: schema)
+    await run_script(
+        postgresql_dsn,
+        driver,
+        "".join(f"{statement};\n" for statement in schema.steps[0].statements),
+    )
+    not_null = (
+        "SELECT attnotnull FROM pg_attribute"
+        " WHERE attrelid = to_regclass($1) AND attname = 'note'"
+    )
+
+    component = build("result_backend", postgresql_dsn, postgres_table, driver)
+    try:
+        with pytest.raises(exceptions.SchemaNotReadyError) as raised:
+            await component.startup()
+    finally:
+        await close_component(component)
+
+    message = str(raised.value)
+    (pending,) = raised.value.pending
+    assert (pending.step.number, pending.not_null_columns) == (2, ("note",))
+    for text in (
+        postgres_table,
+        "step 2",
+        "columns still NOT NULL: note",
+        PLAN_COMMAND,
+        ALEMBIC_COMMAND,
+    ):
+        assert text in message
+    assert "step 1" not in message
+    # It only read the catalog: without run_migrations nothing runs DDL.
+    assert await admin.fetchval(not_null, postgres_table) is True
+
+    await run_script(
+        postgresql_dsn,
+        driver,
+        "".join(f"{statement};\n" for statement in schema.steps[1].statements),
+    )
+    await start(build("result_backend", postgresql_dsn, postgres_table, driver), caplog)
+
+    assert package_warnings(caplog) == []
+    assert await admin.fetchval(not_null, postgres_table) is False
