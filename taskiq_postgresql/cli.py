@@ -682,6 +682,7 @@ def _json_report(
                     "columns": list(item.missing_columns),
                     "indexes": list(item.missing_indexes),
                 },
+                "not_null_columns": list(item.not_null_columns),
             }
             for item in pending
         ],

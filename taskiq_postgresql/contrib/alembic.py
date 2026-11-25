@@ -36,6 +36,7 @@ import hashlib
 import logging
 import re
 from collections.abc import Callable, Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Final, Optional, Union
 
 try:
@@ -261,7 +262,7 @@ class TaskiqStepOp(MigrateOperation):
 
     def reverse(self) -> TaskiqStepNoopOp:
         """
-        Return the downgrade: nothing, because every step is additive.
+        Return the downgrade: nothing, because no step removes or renames.
 
         Returns:
             The operation that renders the comment.
@@ -282,8 +283,9 @@ class TaskiqStepNoopOp(MigrateOperation):
     """
     The downgrade of a ``TaskiqStepOp``: a comment, and no SQL.
 
-    A step only adds columns and indexes, which the previous release ignores,
-    and dropping them would lose data.
+    A step adds columns and indexes, which the previous release ignores, and
+    dropping them would lose data; or it makes a column accept ``NULL``, and
+    putting ``NOT NULL`` back would fail once a row holds one.
 
     Args:
         upgrade: The operation it undoes.
@@ -644,18 +646,18 @@ def _drop_covered(upgrade_ops: ops.UpgradeOps, pending: Sequence[PendingStep]) -
         for item in pending
         for column in item.step.objects.columns
     }
+    relaxed = {
+        (_name(item.table), column)
+        for item in pending
+        for column in item.step.objects.nullable_columns
+    }
     indexes = {
         (_name(item.table), _name(index.name))
         for item in pending
         for index in item.step.objects.indexes
     }
 
-    def covered(operation: MigrateOperation) -> bool:
-        if isinstance(operation, ops.AddColumnOp):
-            return (operation.table_name, operation.column.name) in columns
-        if isinstance(operation, ops.CreateIndexOp):
-            return (operation.table_name, operation.index_name) in indexes
-        return False
+    covered = partial(_is_covered, columns=columns, indexes=indexes, relaxed=relaxed)
 
     kept: list[MigrateOperation] = []
     for operation in upgrade_ops.ops:
@@ -672,6 +674,40 @@ def _drop_covered(upgrade_ops: ops.UpgradeOps, pending: Sequence[PendingStep]) -
             continue
         kept.append(operation)
     upgrade_ops.ops[:] = kept
+
+
+def _is_covered(
+    operation: MigrateOperation,
+    *,
+    columns: set[tuple[str, str]],
+    indexes: set[tuple[str, str]],
+    relaxed: set[tuple[str, str]],
+) -> bool:
+    if isinstance(operation, ops.AddColumnOp):
+        return (operation.table_name, operation.column.name) in columns
+    if isinstance(operation, ops.CreateIndexOp):
+        return (operation.table_name, operation.index_name) in indexes
+    if isinstance(operation, ops.AlterColumnOp):
+        return _is_relaxation(operation, relaxed)
+    return False
+
+
+def _is_relaxation(
+    operation: ops.AlterColumnOp,
+    relaxed: set[tuple[str, str]],
+) -> bool:
+    # Alembic puts every change it finds on one column into one operation: a
+    # type change beside the nullability one must stay for the person to see.
+    # The defaults are what an operation that does not change that is left
+    # with (False for the two that accept None as a value).
+    return (
+        (operation.table_name, operation.column_name) in relaxed
+        and operation.modify_nullable is True
+        and operation.modify_type is None
+        and operation.modify_name is None
+        and operation.modify_server_default is False
+        and operation.modify_comment is False
+    )
 
 
 def _require_transaction(op: Union[Operations, ModuleType]) -> None:

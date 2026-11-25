@@ -143,6 +143,14 @@ class AddColumnsQuery(QueryBase):
         return "\n".join(statements)
 
 
+class DropNotNullQuery(QueryBase):
+    """Query making a column of a table that may already exist accept ``NULL``."""
+
+    def make_query(self, column: str) -> str:
+        """Return the query as a string: one statement, without parameters."""
+        return f"ALTER TABLE {self.table_name} ALTER COLUMN {column} DROP NOT NULL;"
+
+
 class RelationsExistQuery(QueryBase):
     """
     Query telling whether a table and every index it gets all exist.
