@@ -158,7 +158,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
             broker: The TaskIQ broker instance to use for finding and managing tasks.
                 Required if startup_schedule is provided.
             run_migrations: Create the table and indexes on startup. Defaults to
-                False.
+                False: startup() then only checks that they exist.
             **connect_kwargs: Additional keyword arguments passed to the database
                 connection pool. These are driver-specific connection parameters.
 
@@ -205,6 +205,8 @@ class PostgresqlSchedulerSource(ScheduleSource):
             run_migrations=run_migrations,
             **connect_kwargs,
         )
+        # So that on_startup can describe the table and check it.
+        self.driver.component_kind = "scheduler_source"
 
     @property
     def dsn(self) -> str:
@@ -223,6 +225,9 @@ class PostgresqlSchedulerSource(ScheduleSource):
         Raises:
             TypeError: if the DSN callable returns ``None`` or an empty string.
             DatabaseConnectionError: if the connection to the database fails.
+            SchemaNotReadyError: with ``run_migrations=False``, if the table
+                or one of its columns is missing; see
+                ``QueryDriver.on_startup``.
         """
         self.driver.connection_string = self.dsn
         await self.driver.on_startup()

@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from datetime import date, datetime
 from types import TracebackType
-from typing import Any, AsyncIterator, Optional, Sequence, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, Optional, Sequence, Union
 
 from typing_extensions import Self
 
@@ -21,6 +21,9 @@ from taskiq_postgresql.abc.query import (
     SelectQuery,
 )
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+
+if TYPE_CHECKING:
+    from taskiq_postgresql.migrations import ComponentKind
 
 
 class _ConnectionStringHolder:
@@ -60,6 +63,11 @@ class QueryDriver(_ConnectionStringHolder, ABC):
     #: one pooled connection, and a claim given up would leave its DELETE to
     #: run later with nobody to take the row.
     query_timeout: Optional[float] = None
+    #: The component that owns the table, which the bundled components set:
+    #: with it, ``on_startup()`` describes the table from this driver's own
+    #: builders (``taskiq_postgresql.migrations``) and compares the database
+    #: with that. ``None`` compares nothing.
+    component_kind: Optional["ComponentKind"] = None
 
     def __init__(
         self,
@@ -187,16 +195,30 @@ class QueryDriver(_ConnectionStringHolder, ABC):
     @abstractmethod
     async def on_startup(self) -> None:
         """
-        Create the table and its indexes when ``run_migrations`` is set.
+        Check the table, or create and complete it when ``run_migrations`` is set.
 
-        Runs on one connection, in one transaction. When the table, every
-        index and the ``added_columns`` and ``added_indexes`` already exist it
-        does nothing else, so a role without CREATE on the schema or ownership
-        of the table can start. Otherwise it takes ``migration_lock_query``
-        before the DDL: a concurrent startup waits for the commit, and its
-        ``IF NOT EXISTS`` then finds the objects instead of failing on a
-        duplicate catalog entry. ``added_columns`` and ``added_indexes`` come
-        last, so a table created by an older release gets them too.
+        Given ``component_kind``, it starts with one read-only catalog query
+        (``catalog_query``), compared with the table's description
+        (``plan_migration``).
+
+        With ``run_migrations`` set it runs on one connection, in one
+        transaction. When no migration step is pending it does nothing else,
+        so a role without CREATE on the schema or ownership of the table can
+        start. Otherwise, or without ``component_kind``, it takes
+        ``migration_lock_query`` before the DDL: a concurrent startup waits for
+        the commit, and its ``IF NOT EXISTS`` then finds the objects instead
+        of failing on a duplicate catalog entry. ``added_columns`` and
+        ``added_indexes`` come last, so a table created by an older release
+        gets them too.
+
+        Without ``run_migrations`` it runs no DDL, and without
+        ``component_kind`` it checks nothing. It logs a warning for a missing
+        index and for a problem no step fixes that the component works with.
+
+        Raises:
+            SchemaNotReadyError: without ``run_migrations``, when the table or
+                a column of it is missing, or when a problem no step fixes
+                keeps the component from working.
         """
 
     @abstractmethod

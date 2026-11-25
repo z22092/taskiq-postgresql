@@ -54,6 +54,7 @@ from taskiq_postgresql.abc.query import (
 )
 
 if TYPE_CHECKING:
+    from taskiq_postgresql.abc.driver import QueryDriver
     from taskiq_postgresql.broker import PostgresqlBroker
     from taskiq_postgresql.result_backend import PostgresqlResultBackend
     from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
@@ -323,17 +324,7 @@ def table_schema(
             "table_name and field_for_task_id describe a component kind; "
             "a component already has its own",
         )
-    kind = _kind_of(component)
-    driver = component.driver
-    return _schema(
-        kind,
-        driver.create_table_query,
-        driver.create_index_query,
-        driver.index_columns or (),
-        add_columns=driver.add_columns_query,
-        added_columns=driver.added_columns,
-        added_indexes=driver.added_indexes,
-    )
+    return _driver_schema(_kind_of(component), component.driver)
 
 
 def collect_components(
@@ -1459,6 +1450,20 @@ def _schema(
         ),
         indexes=(*created_indexes, *added),
         steps=tuple(steps),
+    )
+
+
+def _driver_schema(kind: ComponentKind, driver: QueryDriver) -> TableSchema:
+    # From the builders the driver's on_startup runs, so a driver can describe
+    # its own table without the component around it.
+    return _schema(
+        kind,
+        driver.create_table_query,
+        driver.create_index_query,
+        driver.index_columns or (),
+        add_columns=driver.add_columns_query,
+        added_columns=driver.added_columns,
+        added_indexes=driver.added_indexes,
     )
 
 

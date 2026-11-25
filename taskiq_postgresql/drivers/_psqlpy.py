@@ -16,7 +16,9 @@ from typing_extensions import Self
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.drivers._health import check_listen
+from taskiq_postgresql.drivers._schema import check_table, compare, described_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+from taskiq_postgresql.migrations import catalog_query
 
 
 def encode_psqlpy_params(
@@ -245,42 +247,40 @@ class PsqlpyDriver(QueryDriver):
             return results.result(as_tuple=True)
 
     async def on_startup(self) -> None:
-        """Create the table and its indexes, see ``QueryDriver.on_startup``."""
-        if self.run_migrations:
-            async with (
-                self,
-                self.connection() as connection,
-                connection.transaction() as transaction,
+        """Check the table, or migrate it; see ``QueryDriver.on_startup``."""
+        if not self.run_migrations:
+            await check_table(self)
+            return
+        schema = described_table(self)
+        async with (
+            self,
+            self.connection() as connection,
+            connection.transaction() as transaction,
+        ):
+            if (
+                schema is not None
+                and compare(
+                    schema,
+                    await transaction.fetch_val(catalog_query([schema])),
+                ).is_current
             ):
-                if await transaction.fetch_val(
-                    self.relations_exist_query.make_query(
-                        self.index_columns,
-                        added_columns=self.added_columns,
-                        added_indexes=self.added_indexes,
-                    ),
-                    self.relations_exist_query.params(
-                        self.index_columns,
-                        added_columns=self.added_columns,
-                        added_indexes=self.added_indexes,
-                    ),
-                ):
-                    return
-                await transaction.execute(
-                    self.migration_lock_query.make_query(),
-                    list(self.migration_lock_query.params()),
+                return
+            await transaction.execute(
+                self.migration_lock_query.make_query(),
+                list(self.migration_lock_query.params()),
+            )
+            await transaction.execute_batch(self.create_table_query.make_query())
+            if self.index_columns is not None:
+                await transaction.execute_batch(
+                    self.create_index_query.make_query(self.index_columns),
                 )
-                await transaction.execute_batch(self.create_table_query.make_query())
-                if self.index_columns is not None:
-                    await transaction.execute_batch(
-                        self.create_index_query.make_query(self.index_columns),
-                    )
-                if self.added_columns or self.added_indexes:
-                    await transaction.execute_batch(
-                        self.add_columns_query.make_query(
-                            self.added_columns,
-                            self.added_indexes,
-                        ),
-                    )
+            if self.added_columns or self.added_indexes:
+                await transaction.execute_batch(
+                    self.add_columns_query.make_query(
+                        self.added_columns,
+                        self.added_indexes,
+                    ),
+                )
 
     async def on_shutdown(self) -> None:
         """Close the pool, if a query created it."""
