@@ -21,7 +21,12 @@ from taskiq_postgresql.migrations import table_schema
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from taskiq_postgresql.utils import get_db_driver
-from tests.helpers import BROKER_TABLE_0_4_SQL, address_of, close_component
+from tests.helpers import (
+    BROKER_TABLE_0_4_SQL,
+    UNUSED_DSN,
+    address_of,
+    close_component,
+)
 
 if TYPE_CHECKING:
     from asyncpg import Connection
@@ -166,11 +171,19 @@ async def wait_until_blocked_by(
     return None
 
 
-def test_migration_lock_key_is_pinned() -> None:
-    lock = sql_builders.MigrationLockQuery("jobs")
+# The key hashes the table name as configured, never folded to lower case.
+@pytest.mark.parametrize("table_name", ["jobs", "Jobs_Mixed"])
+def test_migration_lock_key_is_pinned(table_name: str) -> None:
+    lock = sql_builders.MigrationLockQuery(table_name)
+    # The lock a component takes, not only the builder's: folding the name to
+    # lower case at construction would split a rolling deploy's lock.
+    used = PostgresqlBroker(dsn=UNUSED_DSN, table_name=table_name).driver
+    used_lock = used.migration_lock_query
 
     assert lock.make_query() == MIGRATION_LOCK_SQL
-    assert lock.params() == (MIGRATION_LOCK_NAMESPACE, "jobs")
+    assert lock.params() == (MIGRATION_LOCK_NAMESPACE, table_name)
+    assert used_lock.make_query() == MIGRATION_LOCK_SQL
+    assert used_lock.params() == (MIGRATION_LOCK_NAMESPACE, table_name)
 
 
 def test_fast_path_checks_the_table_and_every_index_it_creates() -> None:

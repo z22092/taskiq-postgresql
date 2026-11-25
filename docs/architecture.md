@@ -3,6 +3,14 @@
 How `taskiq-postgresql` is put together. Decisions and their reasons are in
 [`adr/`](adr/); commands and conventions are in [`../AGENTS.md`](../AGENTS.md).
 
+## Planned for 1.0
+
+This page describes the code as it is; the data layer proposed for 1.0 is in
+ADRs [0007](adr/0007-driver-port-and-core-owned-sql.md),
+[0008](adr/0008-identifiers.md), [0009](adr/0009-delivery-modes.md) and
+[0010](adr/0010-plugin-registry-and-codec-interface.md), with the plan in
+[`spikes/2026-11-25-v1-data-layer.md`](spikes/2026-11-25-v1-data-layer.md).
+
 ## Components
 
 Three classes implement taskiq's extension points. Each builds its own driver
