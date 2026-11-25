@@ -1287,6 +1287,10 @@ def test_when_the_django_examples_run__then_migrate_creates_the_tables(
     ]
     migrate, zero = manage
     assert "taskiq_postgresql.contrib.django" in paths["INSTALLED_APPS"]
+    # `python manage.py` puts the project's directory first on sys.path, and
+    # the app imports the paths with that sys.path alone, never from the
+    # working directory (the project fixture puts sys.path back afterwards).
+    sys.path.insert(0, str(project))
 
     with django_database(scratch_dsn):
         with override_settings(**_taskiq_settings(paths)):

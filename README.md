@@ -1062,7 +1062,10 @@ instead of recording migrations that created nothing, and `manage.py check`
 reports `taskiq_postgresql.E001`, or `taskiq_postgresql.E002` for a lock
 timeout that is not a whole number of seconds. The check only reads the
 settings; the paths, and so the table names of their components, are
-imported when `migrate` or `sqlmigrate` runs.
+imported when `migrate` or `sqlmigrate` runs. Unlike the `taskiq postgresql`
+commands, the app imports them with the project's own `sys.path`, the one
+`manage.py` starts with its own directory first, and never from the
+directory the command runs in.
 
 Django never applies a migration twice, so a table you add to the settings,
 or rename, after the app was migrated is not created by the next `migrate`.
