@@ -1,8 +1,10 @@
 import asyncio
 import os
 import random
+import signal
 import socket
 import string
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
@@ -381,3 +383,39 @@ async def eventually(
             msg = f"still false after {timeout} s"
             raise AssertionError(msg)
         await asyncio.sleep(0.05)
+
+
+def assert_exited_cleanly(
+    script: subprocess.CompletedProcess[str],
+    driver: str,
+    *,
+    version: tuple[int, ...] = sys.version_info[:3],
+) -> None:
+    """
+    Assert that a README script exited with code 0.
+
+    psqlpy 0.13.1 on Python 3.10 occasionally aborts the interpreter at exit,
+    after the script's work is done, with ``PyGILState_Release`` while the
+    runtime is finalizing; psqlpy alone, without this package, does it too
+    (about 1 run in 80). Only that abort is tolerated, and the caller still
+    checks the script's output.
+
+    Args:
+        script: The finished script process, with its stderr captured as text.
+        driver: The driver the script ran on.
+        version: The interpreter version the script ran on; the running one
+            by default.
+
+    Raises:
+        AssertionError: If the script did not exit with code 0 and the abort is
+            not the tolerated one.
+    """
+    if (
+        script.returncode == -signal.SIGABRT
+        and driver == "psqlpy"
+        and version < (3, 11)
+        and "Fatal Python error: PyGILState_Release" in script.stderr
+        and "finalizing" in script.stderr
+    ):
+        return
+    assert script.returncode == 0, script.stderr
