@@ -118,11 +118,14 @@ Upgrading from 0.4.x:
   a deploy can tell a forgotten migration from a failed connection. Both
   commands read each component's own database, or `--dsn`, and need no DDL
   privilege; `--component` describes one table without the application.
-- `QueryDriver.component_kind`, which the components set on their driver. The
-  bundled drivers' `on_startup()` describes the table with it and compares the
-  database with that description, with `run_migrations` or without; a driver
-  built without a component checks nothing, and with `run_migrations=True`
-  takes the migration lock and runs its DDL at every start.
+- `QueryDriver.component_kind`, which the components set on their driver, at
+  construction and again in `startup()`, so a driver swapped in later gets it
+  too. The bundled drivers' `on_startup()` describes the table with it and
+  compares the database with that description, with `run_migrations` or
+  without. A driver built without a component checks nothing without
+  `run_migrations`; with `run_migrations=True` it probes its table and indexes
+  as before (`RelationsExistQuery`) and takes no lock and runs no DDL once they
+  exist.
 - `taskiq_postgresql.migrations` describes the tables as data (`table_schema`,
   `collect_schemas`) and renders the script (`render_sql`), or its statements
   one by one (`migration_statements`, which stops after a given step with
@@ -206,8 +209,14 @@ Upgrading from 0.4.x:
   `taskiq postgresql migrate`, with the SQL `taskiq postgresql plan` prints,
   with an Alembic revision (`alembic revision --autogenerate`), or by starting
   once with `run_migrations=True`. The check opens the component's pool at
-  startup, so a database that cannot be reached now fails `startup()` with
-  `DatabaseConnectionError` for every component.
+  startup, so on a database it cannot reach `startup()` now fails with
+  `DatabaseConnectionError`, for every component, before the worker starts,
+  as it already did with `run_migrations=True`. With psycopg it fails once
+  the pool has waited for a connection for its `timeout`, 30 seconds by
+  default (`psycopg_pool.AsyncConnectionPool`). With `run_migrations=True`,
+  `startup()` also logs a warning for each problem no step fixes, such as an
+  invalid index or an index name another table took, which `IF NOT EXISTS`
+  skips.
 - Runtime dependencies use closed ranges (`>=floor,<ceiling`): `taskiq`,
   `typing-extensions`, `pydantic` and the `asyncpg`, `psqlpy` and `psycopg`
   extras. `typing-extensions>=4.0.0,<5` is declared.
@@ -341,6 +350,9 @@ Upgrading from 0.4.x:
   that received no message, or a schedule source never asked for its
   schedules. A query driver's `on_shutdown()` now does nothing when no query
   opened its pool.
+- `PostgresqlResultBackend.shutdown()` closes the backend's connection pool,
+  which it used to leave open. A second call, or a call before `startup()`,
+  does nothing.
 - The warning for a NOTIFY payload that is not a message id holds at most
   the first 64 characters of it, followed by its length when it is longer,
   because any role that can connect can notify the channel. An integer

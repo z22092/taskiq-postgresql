@@ -230,6 +230,8 @@ class PostgresqlSchedulerSource(ScheduleSource):
                 ``QueryDriver.on_startup``.
         """
         self.driver.connection_string = self.dsn
+        # Again here, for a driver swapped in after the constructor.
+        self.driver.component_kind = "scheduler_source"
         await self.driver.on_startup()
 
         if self.startup_schedule is not None and self.broker is not None:

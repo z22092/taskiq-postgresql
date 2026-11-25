@@ -63,10 +63,13 @@ class QueryDriver(_ConnectionStringHolder, ABC):
     #: one pooled connection, and a claim given up would leave its DELETE to
     #: run later with nobody to take the row.
     query_timeout: Optional[float] = None
-    #: The component that owns the table, which the bundled components set:
-    #: with it, ``on_startup()`` describes the table from this driver's own
-    #: builders (``taskiq_postgresql.migrations``) and compares the database
-    #: with that. ``None`` compares nothing.
+    #: The component that owns the table, which the bundled components set at
+    #: construction and again in ``startup()``: with it, ``on_startup()``
+    #: describes the table from this driver's own builders
+    #: (``taskiq_postgresql.migrations``) and compares the database with
+    #: that. ``None``, a driver no component owns, compares nothing: it
+    #: probes its relations with ``relations_exist_query`` when it migrates,
+    #: and checks nothing when it does not.
     component_kind: Optional["ComponentKind"] = None
 
     def __init__(
@@ -104,6 +107,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
             [self.primary_key, *self.columns, self.created_at],
         )
         self.create_index_query = CreateIndexQuery(self.table_name)
+        # The probe of a driver without component_kind, which cannot compare.
         self.relations_exist_query = RelationsExistQuery(self.table_name)
         self.migration_lock_query = MigrationLockQuery(self.table_name)
         self.add_columns_query = AddColumnsQuery(self.table_name)
@@ -199,21 +203,25 @@ class QueryDriver(_ConnectionStringHolder, ABC):
 
         Given ``component_kind``, it starts with one read-only catalog query
         (``catalog_query``), compared with the table's description
-        (``plan_migration``).
+        (``plan_migration``). Without it, it cannot describe the table: it
+        then probes the table and its indexes with ``relations_exist_query``
+        when ``run_migrations`` is set, as releases before that comparison
+        did, and checks nothing otherwise.
 
         With ``run_migrations`` set it runs on one connection, in one
-        transaction. When no migration step is pending it does nothing else,
-        so a role without CREATE on the schema or ownership of the table can
-        start. Otherwise, or without ``component_kind``, it takes
+        transaction. When no migration step is pending, or the probe finds
+        every relation, it does nothing else, so a role without CREATE on the
+        schema or ownership of the table can start. Otherwise it takes
         ``migration_lock_query`` before the DDL: a concurrent startup waits for
         the commit, and its ``IF NOT EXISTS`` then finds the objects instead
         of failing on a duplicate catalog entry. ``added_columns`` and
         ``added_indexes`` come last, so a table created by an older release
-        gets them too.
+        gets them too. Then it logs a warning for each problem no step fixes,
+        which ``IF NOT EXISTS`` skipped.
 
-        Without ``run_migrations`` it runs no DDL, and without
-        ``component_kind`` it checks nothing. It logs a warning for a missing
-        index and for a problem no step fixes that the component works with.
+        Without ``run_migrations`` it runs no DDL. It logs a warning for a
+        missing index and for a problem no step fixes that the component works
+        with.
 
         Raises:
             SchemaNotReadyError: without ``run_migrations``, when the table or
