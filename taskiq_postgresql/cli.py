@@ -12,10 +12,17 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import dataclasses
 import json
 import sys
-from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple, Sequence
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    Callable,
+    Final,
+    Literal,
+    NamedTuple,
+    Sequence,
+)
 
 from taskiq.abc.cmd import TaskiqCMD
 
@@ -28,7 +35,6 @@ if TYPE_CHECKING:
         FormatOptions,
         MigrationFormat,
         MigrationPlan,
-        MigrationStep,
         PendingStep,
         SchemaProblem,
         TableSchema,
@@ -48,11 +54,6 @@ _CHECK_EXIT_STATUS = (
 )
 _BEHIND: Final = 3
 _NEEDS_A_PERSON: Final = 4
-
-_DriverName = Literal["asyncpg", "psqlpy", "psycopg"]
-# The driver --component reads with, the first one installed: without the
-# application, no component says which.
-_DRIVERS: Final[tuple[_DriverName, ...]] = ("asyncpg", "psycopg", "psqlpy")
 
 
 class PostgresqlCMD(TaskiqCMD):
@@ -101,21 +102,24 @@ class _Database(NamedTuple):
 def _run(args: list[str]) -> int:
     from taskiq_postgresql import migrations  # noqa: PLC0415
 
-    parser, commands = _parser(migrations)
-    namespace = parser.parse_args(args)
-    command = commands[namespace.command]
-    if namespace.command == "generate":
-        return _generate(namespace, command, migrations)
-    if namespace.command == "plan":
-        return _plan(namespace, command, migrations)
-    if namespace.command == "check":
-        return _check(namespace, command, migrations)
-    return _migrate(namespace, migrations)
+    namespace = _parser(migrations).parse_args(args)
+    # The subcommand's own parser, so a usage error shows its usage line.
+    parser: argparse.ArgumentParser = namespace.parser
+    try:
+        return namespace.run(namespace, parser, migrations)
+    except (
+        migrations.MigrationFormatOptionError,
+        migrations.UnknownMigrationFormatError,
+        migrations.AmbiguousMigrationFormatError,
+    ) as error:
+        parser.error(str(error))
+    # The application's import, a format's module, a third-party format and
+    # the server can raise anything.
+    except Exception as error:
+        return _fail(error)
 
 
-def _parser(
-    migrations: ModuleType,
-) -> tuple[argparse.ArgumentParser, dict[str, argparse.ArgumentParser]]:
+def _parser(migrations: ModuleType) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=_PROG,
         description="Create the tables of taskiq-postgresql, print the SQL that "
@@ -124,13 +128,15 @@ def _parser(
         "--help.",
     )
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND", required=True)
-    commands = {
-        "generate": _generate_parser(subparsers, migrations),
-        "migrate": _migrate_parser(subparsers),
-        "plan": _plan_parser(subparsers, migrations),
-        "check": _check_parser(subparsers, migrations),
+    commands: dict[argparse.ArgumentParser, Callable[..., int]] = {
+        _generate_parser(subparsers, migrations): _generate,
+        _migrate_parser(subparsers): _migrate,
+        _plan_parser(subparsers, migrations): _plan,
+        _check_parser(subparsers, migrations): _check,
     }
-    return parser, commands
+    for command, run in commands.items():
+        command.set_defaults(run=run, parser=command)
+    return parser
 
 
 def _generate_parser(subparsers: Any, migrations: ModuleType) -> Any:
@@ -333,20 +339,6 @@ def _format_options(
         parser.error(f"--lock-timeout: {error}")
 
 
-def _load_format(
-    namespace: argparse.Namespace,
-    parser: argparse.ArgumentParser,
-    migrations: ModuleType,
-) -> MigrationFormat:
-    try:
-        return migrations.load_format(namespace.format)
-    except (
-        migrations.UnknownMigrationFormatError,
-        migrations.AmbiguousMigrationFormatError,
-    ) as error:
-        parser.error(str(error))
-
-
 def _generate(
     namespace: argparse.Namespace,
     parser: argparse.ArgumentParser,
@@ -354,21 +346,8 @@ def _generate(
 ) -> int:
     _check_selection(namespace, parser)
     options = _format_options(namespace, parser, migrations)
-    try:
-        render = _load_format(namespace, parser, migrations)
-    except Exception as error:  # a format's module and entry point are not ours
-        return _fail(error)
-    try:
-        schemas = _schemas(namespace, parser, migrations)
-    except Exception as error:  # the application's own import errors too
-        return _fail(error)
-    try:
-        script = render(schemas, options)
-    except migrations.MigrationFormatOptionError as error:
-        parser.error(str(error))
-    except Exception as error:  # a third-party format can raise anything
-        return _fail(error)
-    sys.stdout.write(script)
+    render = migrations.load_format(namespace.format)
+    sys.stdout.write(render(_schemas(namespace, parser, migrations), options))
     return 0
 
 
@@ -401,41 +380,62 @@ def _plan(
 ) -> int:
     _check_selection(namespace, parser, needs_dsn=True)
     options = _format_options(namespace, parser, migrations)
-    try:
-        render = _load_format(namespace, parser, migrations)
-    except Exception as error:  # a format's module and entry point are not ours
-        return _fail(error)
-    if render is migrations.sql_format and options.extra:
-        # The plan renders the sql format itself, so it refuses what it would.
-        parser.error(
-            f"the sql format takes no --option; got {', '.join(sorted(options.extra))}",
+    render = migrations.load_format(namespace.format)
+    _check_format_options(render, options, migrations)
+    connections = _connections(namespace, parser, migrations)
+    if len(connections) > 1:
+        raise ValueError(
+            f"the components use {len(connections)} connection strings, and "
+            "a plan is for one database: pass --dsn, or plan one component "
+            "at a time with --component",
         )
-    try:
-        connections = _connections(namespace, parser, migrations)
-        if len(connections) > 1:
-            raise ValueError(
-                f"the components use {len(connections)} connection strings, and "
-                "a plan is for one database: pass --dsn, or plan one component "
-                "at a time with --component",
-            )
-        (database,) = asyncio.run(_read(connections, migrations))
-    except Exception as error:  # the application's and the server's errors
-        return _fail(error)
+    (database,) = asyncio.run(_read(connections, migrations))
     plan = database.plan
+    _check_downgrade(namespace, options, plan, migrations)
     for note in plan.notes:
         _say(f"note: {note}")
     _say_problems(plan.problems)
     if plan.is_current:
         _say_up_to_date(database.schemas)
     else:
-        try:
-            script = _plan_script(database, render, options, migrations)
-        except migrations.MigrationFormatOptionError as error:
-            parser.error(str(error))
-        except Exception as error:  # a third-party format can raise anything
-            return _fail(error)
-        sys.stdout.write(script)
+        sys.stdout.write(_plan_script(database, render, options, migrations))
     return _NEEDS_A_PERSON if plan.problems else 0
+
+
+def _check_format_options(
+    render: MigrationFormat,
+    options: FormatOptions,
+    migrations: ModuleType,
+) -> None:
+    # A format checks its options as it renders, and a plan with nothing
+    # pending renders nothing: render no table at all first, before anything
+    # connects. Any other error is the format's answer to an empty list; the
+    # real render reports its own.
+    try:
+        render([], options)
+    except migrations.MigrationFormatOptionError:
+        raise
+    except Exception:
+        return
+
+
+def _check_downgrade(
+    namespace: argparse.Namespace,
+    options: FormatOptions,
+    plan: MigrationPlan,
+    migrations: ModuleType,
+) -> None:
+    # The alembic format's downgrade=drop drops every table it is given, and
+    # load_format always picks this package's own format for that name.
+    if namespace.format != "alembic" or options.extra.get("downgrade") != "drop":
+        return
+    kept = sorted({item.table for item in plan.pending if not item.table_missing})
+    if kept:
+        raise migrations.MigrationFormatOptionError(
+            f"--option downgrade=drop: the revision would drop {', '.join(kept)}, "
+            "which it does not create, since only later steps are pending; "
+            "leave downgrade at none",
+        )
 
 
 def _plan_script(
@@ -446,27 +446,16 @@ def _plan_script(
 ) -> str:
     plan = database.plan
     if render is migrations.sql_format:
-        first, rest = plan.render_sql(
+        # A comment that keeps the script from being run on another database
+        # by mistake.
+        return plan.render_sql(
             transaction=options.transaction,
             lock=options.lock,
             lock_timeout=options.lock_timeout,
-        ).split("\n", 1)
-        # After the version line, before the steps: a comment that keeps the
-        # script from being run on another database by mistake.
-        return f"{first}\n-- {database.header}\n{rest}"
+            comments=[database.header],
+        )
     _say(f"note: {database.header}")
-    # Another format gets the tables with only their pending steps.
-    steps: dict[str, list[MigrationStep]] = {}
-    for item in plan.pending:
-        steps.setdefault(item.table, []).append(item.step)
-    return render(
-        [
-            dataclasses.replace(schema, steps=tuple(steps[schema.name]))
-            for schema in database.schemas
-            if schema.name in steps
-        ],
-        options,
-    )
+    return render(plan.pending_schemas(database.schemas), options)
 
 
 def _check(
@@ -475,18 +464,15 @@ def _check(
     migrations: ModuleType,
 ) -> int:
     _check_selection(namespace, parser, needs_dsn=True)
-    try:
-        databases = asyncio.run(
-            _read(_connections(namespace, parser, migrations), migrations),
-        )
-    except Exception as error:  # the application's and the server's errors
-        return _fail(error)
+    databases = asyncio.run(
+        _read(_connections(namespace, parser, migrations), migrations),
+    )
     pending = [item for database in databases for item in database.plan.pending]
     problems = [problem for database in databases for problem in database.plan.problems]
     for item in pending:
         _say(
             f"pending: {item.table} step {item.step.number} ({item.severity}): "
-            f"{_missing(item)}",
+            f"{item.describe()}",
         )
     _say_problems(problems)
     if not pending:
@@ -506,45 +492,40 @@ def _connections(
     migrations: ModuleType,
 ) -> dict[str, tuple[QueryDriver, list[TableSchema]]]:
     """Group the tables by the connection string their catalog is read with."""
-    if namespace.component is None:
-        components = migrations.collect_components(
-            *namespace.targets,
-            app_dir=namespace.app_dir,
-        )
-        tables = [
-            (component, migrations.table_schema(component)) for component in components
-        ]
-    else:
-        tables = [
-            (_component_of_kind(namespace.component, namespace.dsn), schema)
-            for schema in _schemas(namespace, parser, migrations)
-        ]
+    if namespace.component is not None:
+        schemas = _schemas(namespace, parser, migrations)
+        return {namespace.dsn: (_catalog_driver(namespace.dsn), schemas)}
     grouped: dict[str, tuple[QueryDriver, list[TableSchema]]] = {}
-    for component, schema in tables:
+    for component in migrations.collect_components(
+        *namespace.targets,
+        app_dir=namespace.app_dir,
+    ):
         dsn = namespace.dsn or component.dsn
         _, schemas = grouped.setdefault(dsn, (component.driver, []))
-        schemas.append(schema)
+        schemas.append(migrations.table_schema(component))
     return grouped
 
 
-def _component_of_kind(kind: str, dsn: str) -> Component:
-    # Its table options do not matter: it only lends its driver.
-    from importlib.util import find_spec  # noqa: PLC0415
-
-    from taskiq_postgresql.broker import PostgresqlBroker  # noqa: PLC0415
-    from taskiq_postgresql.result_backend import (  # noqa: PLC0415
-        PostgresqlResultBackend,
-    )
-    from taskiq_postgresql.scheduler_source import (  # noqa: PLC0415
-        PostgresqlSchedulerSource,
+def _catalog_driver(dsn: str) -> QueryDriver:
+    """Return a query driver that only reads the catalog of ``dsn``."""
+    from taskiq_postgresql.abc.query import PrimaryKeyColumn  # noqa: PLC0415
+    from taskiq_postgresql.utils import get_db_driver  # noqa: PLC0415
+    from taskiq_postgresql.utils.libs_available import (  # noqa: PLC0415
+        is_asyncpg_available,
+        is_psqlpy_available,
+        is_psycopg_available,
     )
 
-    driver = next((name for name in _DRIVERS if find_spec(name)), _DRIVERS[0])
-    if kind == "broker":
-        return PostgresqlBroker(dsn, driver=driver)
-    if kind == "result_backend":
-        return PostgresqlResultBackend(dsn, driver=driver)
-    return PostgresqlSchedulerSource(dsn, driver=driver)
+    # Without the application no component says which driver: the first one
+    # installed, else asyncpg, whose error then says what to install.
+    installed: tuple[tuple[Literal["asyncpg", "psqlpy", "psycopg"], bool], ...] = (
+        ("asyncpg", is_asyncpg_available()),
+        ("psycopg", is_psycopg_available()),
+        ("psqlpy", is_psqlpy_available()),
+    )
+    name = next((name for name, available in installed if available), "asyncpg")
+    # It reads no table of its own, so its table and columns never matter.
+    return get_db_driver(name)(dsn, "taskiq_catalog", [], PrimaryKeyColumn())
 
 
 async def _read(
@@ -563,38 +544,30 @@ async def _read_database(
     schemas: list[TableSchema],
     migrations: ModuleType,
 ) -> _Database:
-    # One SELECT: the catalog, and what the plan's header names.
-    query = (
-        "SELECT current_database()::text AS database,"  # noqa: S608
-        " current_schemas(false)::text AS search_path, catalog FROM ("
-        + migrations.catalog_query(schemas)
-        + ") AS state"
-    )
+    found: dict[str, Any] = {}
+
+    async def fetch_value(query: str) -> Any:
+        # One SELECT: the catalog, and what the plan's header names.
+        row = await driver.fetch_row(
+            "SELECT current_database()::text AS database,"
+            " current_schemas(false)::text AS search_path,"
+            f" ({query}) AS catalog",
+        )
+        found.update(row or {})
+        return found.get("catalog")
+
     driver.connection_string = dsn
     try:
-        row = await driver.fetch_row(query)
+        state = await migrations.read_catalog(schemas, fetch_value)
     finally:
         if getattr(driver, "pool", None) is not None:
             await driver.on_shutdown()
-    found = row or {}
-    state = migrations.CatalogState.from_json(found.get("catalog") or "")
     return _Database(
-        name=str(found.get("database")),
-        search_path=str(found.get("search_path")),
+        name=str(found["database"]),
+        search_path=str(found["search_path"]),
         schemas=schemas,
         plan=migrations.plan_migration(schemas, state),
     )
-
-
-def _missing(item: PendingStep) -> str:
-    if item.table_missing:
-        return "the table is missing"
-    found = []
-    if item.missing_columns:
-        found.append(f"missing columns: {', '.join(item.missing_columns)}")
-    if item.missing_indexes:
-        found.append(f"missing indexes: {', '.join(item.missing_indexes)}")
-    return "; ".join(found)
 
 
 def _json_report(
@@ -650,15 +623,16 @@ def _say(text: str) -> None:
     sys.stderr.write(f"{_PROG}: {text}\n")
 
 
-def _migrate(namespace: argparse.Namespace, migrations: ModuleType) -> int:
-    try:
-        components = migrations.collect_components(
-            *namespace.targets,
-            app_dir=namespace.app_dir,
-        )
-        asyncio.run(_apply(components))
-    except Exception as error:  # the application's and the server's errors
-        return _fail(error)
+def _migrate(
+    namespace: argparse.Namespace,
+    parser: argparse.ArgumentParser,
+    migrations: ModuleType,
+) -> int:
+    components = migrations.collect_components(
+        *namespace.targets,
+        app_dir=namespace.app_dir,
+    )
+    asyncio.run(_apply(components))
     names = ", ".join(component.driver.table_name for component in components)
     sys.stderr.write(f"{_PROG}: tables ready: {names}\n")
     return 0

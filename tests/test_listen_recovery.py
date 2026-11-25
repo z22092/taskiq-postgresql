@@ -579,22 +579,28 @@ async def test_when_a_reopen_hangs__then_it_is_given_up_after_query_timeout(
     assert stuck.cancelled
 
 
-async def test_when_the_broker_shuts_down_before_any_query__then_shutdown_succeeds(
+async def test_when_a_started_broker_shuts_down_twice__then_both_succeed(
     postgresql_dsn: str,
     postgres_table: str,
     driver: str,
 ) -> None:
-    """A pool that no query created yet is nothing to close."""
+    """The second shutdown() finds the pool and the LISTEN connection closed."""
     worker = PostgresqlBroker(
         dsn=postgresql_dsn,
         channel_name=f"{postgres_table}_channel",
         table_name=postgres_table,
         driver=driver,
+        run_migrations=True,
     )
-    # startup() reads the catalog, which opens the pool: only a broker that
-    # never started has none.
-    await worker.shutdown()
-    await worker.shutdown()
+    await worker.startup()
+    try:
+        await worker.shutdown()
+        await worker.shutdown()
+    finally:
+        await fetch_on_server(postgresql_dsn, f"DROP TABLE IF EXISTS {postgres_table}")
+
+    assert getattr(worker.driver, "pool", None) is None
+    assert getattr(worker.listen_driver, "connection", None) is None
 
 
 async def test_when_listen_is_health_checked__then_each_notify_is_delivered_once(

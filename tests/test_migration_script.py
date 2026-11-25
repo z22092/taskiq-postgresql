@@ -18,7 +18,7 @@ import string
 import sys
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional, Union
+from typing import Any, AsyncGenerator, Optional
 from urllib.parse import urlsplit
 
 import asyncpg
@@ -46,7 +46,9 @@ from taskiq_postgresql.migrations import (
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from tests.helpers import (
+    UNUSED_DSN,
     address_of,
+    build_component,
     create_database,
     drop_database,
     in_database,
@@ -59,14 +61,6 @@ from tests.test_migrations import (
     wait_until_blocked_by,
 )
 
-Component = Union[
-    PostgresqlBroker,
-    PostgresqlResultBackend[object],
-    PostgresqlSchedulerSource,
-]
-
-# Construction needs no server; the components never connect with it.
-UNUSED_DSN = "postgresql://localhost/unused"
 KINDS = ("broker", "result_backend", "scheduler_source")
 TASK_ID_FIELDS = ("VarChar", "Text", "Uuid")
 # Every table shape the package creates; the schedule table has no task_id.
@@ -79,28 +73,6 @@ SHAPE_IDS = [f"{kind}-{field}" if field else kind for kind, field in SHAPES]
 WAIT_SECONDS = 10
 # Short, so a test that waits it out stays fast; far below WAIT_SECONDS.
 LOCK_TIMEOUT = 1
-
-
-def build_component(
-    kind: str,
-    *,
-    dsn: str = UNUSED_DSN,
-    table_name: Optional[str] = None,
-    field: Optional[str] = None,
-    driver: str = "asyncpg",
-) -> Component:
-    options: dict[str, Any] = {"dsn": dsn, "driver": driver, "run_migrations": True}
-    if table_name is not None:
-        options["table_name"] = table_name
-    if field is not None:
-        options["field_for_task_id"] = field
-    if kind == "broker":
-        if table_name is not None:
-            options["channel_name"] = f"{table_name}_channel"
-        return PostgresqlBroker(**options)
-    if kind == "result_backend":
-        return PostgresqlResultBackend(**options)
-    return PostgresqlSchedulerSource(**options)
 
 
 def lock_lines(script: str) -> list[str]:
@@ -198,7 +170,8 @@ def test_the_steps_are_the_sql_run_migrations_executes(
     else:
         assert later_steps == []
         assert (runtime.added_columns, runtime.added_indexes) == ((), ())
-    # The startup fast path checks exactly the relations the steps create.
+    # A driver no component owns cannot compare, and probes instead: exactly
+    # the relations the steps create.
     assert [schema.name, *(index.name for index in schema.indexes)] == (
         runtime.relations_exist_query.relation_names(
             runtime.index_columns,

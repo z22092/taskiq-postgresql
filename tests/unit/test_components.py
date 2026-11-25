@@ -118,14 +118,22 @@ async def test_when_no_component_owns_the_driver__then_startup_checks_nothing(
 
 
 @pytest.mark.anyio
-async def test_when_scheduler_source_never_queried__then_shutdown_succeeds(
+@pytest.mark.parametrize(
+    "component",
+    [PostgresqlResultBackend, PostgresqlSchedulerSource],
+    ids=["result_backend", "scheduler_source"],
+)
+async def test_when_a_component_never_started__then_shutdown_succeeds_twice(
+    component: Component,
     driver: str,
 ) -> None:
-    # startup() reads the catalog, which opens the driver's pool: only a
-    # source that never started has no pool to close.
-    source = PostgresqlSchedulerSource(DSN, driver=driver)
+    # A pool that startup() never opened is nothing to close, once or twice.
+    instance = component(DSN, driver=driver)
 
-    await source.shutdown()
+    await instance.shutdown()
+    await instance.shutdown()
+
+    assert getattr(instance.driver, "pool", None) is None
 
 
 @pytest.mark.anyio

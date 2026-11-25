@@ -638,14 +638,20 @@ else starts, naming what is missing and how to create it. On a broker table
 that 0.4.x created:
 
 ```text
-taskiq_messages is not ready and run_migrations is off: step 2 has not run (missing columns: channel, not_before). Create what is missing with `taskiq postgresql migrate <module>:<object>`, with the SQL `taskiq postgresql plan <module>:<object>` prints, or with an Alembic revision (`alembic revision --autogenerate`); or start once with run_migrations=True.
+taskiq_messages is not ready and run_migrations is off: step 2 has not run (missing columns: channel, not_before; missing indexes: taskiq_messages_not_before_idx). Create what is missing with `taskiq postgresql migrate <module>:<object>`, with the SQL `taskiq postgresql plan <module>:<object>` prints, or with an Alembic revision (`alembic revision --autogenerate`); or start once with run_migrations=True.
 ```
 
 A missing index, or an index no step can fix (an invalid one, or one whose
 name another table took), logs a warning instead: the component works, if more
 slowly. With
-`run_migrations=True` startup reads the catalog the same way, and takes the
-migration lock and runs the DDL only when a step is pending.
+`run_migrations=True` startup reads the catalog the same way, takes the
+migration lock and runs the DDL only when a step is pending, and logs the same
+warning for an index no step can fix.
+
+The check needs the database at startup: on one it cannot reach, `startup()`
+fails with `DatabaseConnectionError` before the worker starts, as it does with
+`run_migrations=True`. With psycopg that happens once the connection pool has
+waited for a connection for its `timeout`, 30 seconds by default.
 
 ### Alembic, Django and Flyway
 
@@ -961,7 +967,10 @@ out the locks, and `--lock-timeout` sets each step's bound on lock waits as
 above. Any other option, or a value the format does not accept, exits with 2.
 `plan --format alembic` takes the same options and writes the same file with
 only the steps that the database it reads still lacks
-([Plan and check](#plan-and-check)).
+([Plan and check](#plan-and-check)). It checks them before it connects, and
+refuses `downgrade=drop`, with exit status 2, when a table it would drop
+already exists, such as a broker table 0.4.x created that only needs step 2:
+the revision does not create that table, so its downgrade must not drop it.
 
 ## Compatibility
 

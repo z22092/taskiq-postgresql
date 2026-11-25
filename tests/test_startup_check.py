@@ -12,17 +12,15 @@ component works without it.
 from __future__ import annotations
 
 import logging
-from typing import AsyncGenerator, Union
+from functools import partial
+from typing import AsyncGenerator
 
 import asyncpg
 import pytest
 
 from taskiq_postgresql import exceptions
-from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.migrations import CatalogState, render_sql, table_schema
-from taskiq_postgresql.result_backend import PostgresqlResultBackend
-from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
-from tests.helpers import run_script
+from tests.helpers import Component, build_component, run_script
 from tests.test_migrations import (
     BROKER_TABLE_0_4_SQL,
     claim_schema,
@@ -31,48 +29,14 @@ from tests.test_migrations import (
 
 pytestmark = pytest.mark.anyio
 
-Component = Union[
-    PostgresqlBroker,
-    PostgresqlResultBackend[object],
-    PostgresqlSchedulerSource,
-]
-
 KINDS = ("broker", "result_backend", "scheduler_source")
 # What the error tells a person to run; the module path is theirs to fill in.
 PLAN_COMMAND = "taskiq postgresql plan"
 ALEMBIC_COMMAND = "alembic revision --autogenerate"
 
 
-def build(
-    kind: str,
-    dsn: str,
-    table: str,
-    driver: str,
-    *,
-    run_migrations: bool = False,
-) -> Component:
-    """Return a component of ``kind`` on ``table``; it does not migrate by default."""
-    if kind == "broker":
-        return PostgresqlBroker(
-            dsn=dsn,
-            table_name=table,
-            channel_name=f"{table}_channel",
-            driver=driver,
-            run_migrations=run_migrations,
-        )
-    if kind == "result_backend":
-        return PostgresqlResultBackend(
-            dsn=dsn,
-            table_name=table,
-            driver=driver,
-            run_migrations=run_migrations,
-        )
-    return PostgresqlSchedulerSource(
-        dsn=dsn,
-        table_name=table,
-        driver=driver,
-        run_migrations=run_migrations,
-    )
+# The components under test check their table: they do not migrate.
+build = partial(build_component, run_migrations=False)
 
 
 @pytest.fixture
@@ -258,7 +222,7 @@ async def test_run_migrations_still_creates_the_table_and_reads_the_catalog_once
     catalog_reads: list[str],
 ) -> None:
     await start(
-        build(kind, postgresql_dsn, postgres_table, driver, run_migrations=True),
+        build_component(kind, postgresql_dsn, postgres_table, driver),
         caplog,
     )
     # The read that found the table missing.

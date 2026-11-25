@@ -12,8 +12,9 @@ other parsed.
 
 Each step also declares the objects it guarantees, so a database can be
 compared with the description: ``catalog_query`` reads what exists, in one
-read-only query, and ``plan_migration`` tells which steps are still pending
-and what is wrong in a way no step fixes.
+read-only query (``read_catalog`` runs it through a driver), and
+``plan_migration`` tells which steps are still pending and what is wrong in a
+way no step fixes.
 
 Importing this module imports no driver library.
 """
@@ -23,8 +24,8 @@ from __future__ import annotations
 import json
 import re
 import sys
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, replace
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, entry_points, version
 from inspect import isfunction, signature
@@ -40,6 +41,7 @@ from typing import (
     get_args,
 )
 
+from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.abc.query import (
     MIGRATION_LOCK_NAMESPACE,
     AddColumnsQuery,
@@ -54,7 +56,6 @@ from taskiq_postgresql.abc.query import (
 )
 
 if TYPE_CHECKING:
-    from taskiq_postgresql.abc.driver import QueryDriver
     from taskiq_postgresql.broker import PostgresqlBroker
     from taskiq_postgresql.result_backend import PostgresqlResultBackend
     from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
@@ -99,6 +100,7 @@ __all__ = [
     "load_format",
     "migration_statements",
     "plan_migration",
+    "read_catalog",
     "render_sql",
     "sql_format",
     "table_schema",
@@ -285,22 +287,25 @@ class TableSchema:
 
 
 def table_schema(
-    component: Union[Component, ComponentKind],
+    component: Union[Component, QueryDriver, ComponentKind],
     *,
     table_name: Optional[str] = None,
     field_for_task_id: Optional[TaskIdType] = None,
 ) -> TableSchema:
     """
-    Describe the table of a component, or of a component kind.
+    Describe the table of a component, of its query driver, or of a kind.
 
     Given a component, the description comes from the columns its driver
-    uses. Given a kind, it needs no instance, no DSN and no driver: the
-    component's defaults apply unless ``table_name`` or ``field_for_task_id``
-    say otherwise.
+    uses. Given that query driver, it comes from the driver's own builders,
+    under the ``component_kind`` the component set on it, so a driver can
+    describe its own table. Given a kind, it needs no instance, no DSN and no
+    driver: the component's defaults apply unless ``table_name`` or
+    ``field_for_task_id`` say otherwise.
 
     Args:
         component: A ``PostgresqlBroker``, ``PostgresqlResultBackend`` or
-            ``PostgresqlSchedulerSource``, or one of ``COMPONENT_KINDS``.
+            ``PostgresqlSchedulerSource``, the ``QueryDriver`` of one, or one
+            of ``COMPONENT_KINDS``.
         table_name: With a kind, the table name; the component's default
             otherwise.
         field_for_task_id: With the ``broker`` or ``result_backend`` kind, the
@@ -310,8 +315,10 @@ def table_schema(
         The table's description.
 
     Raises:
-        TypeError: if ``component`` is neither a component nor a kind, or if
-            ``table_name`` or ``field_for_task_id`` come with a component.
+        TypeError: if ``component`` is neither a component, a query driver
+            nor a kind, if a query driver has no ``component_kind``, or if
+            ``table_name`` or ``field_for_task_id`` come with a component or
+            a driver.
         ValueError: if the kind is unknown, ``field_for_task_id`` is not one
             of ``TASK_ID_TYPES`` or is given for the scheduler source, the
             table name cannot be written in a script, or a column type has no
@@ -324,6 +331,13 @@ def table_schema(
             "table_name and field_for_task_id describe a component kind; "
             "a component already has its own",
         )
+    if isinstance(component, QueryDriver):
+        if component.component_kind is None:
+            raise TypeError(
+                "this query driver has no component_kind, so it cannot tell "
+                "which table it holds: describe the component that owns it",
+            )
+        return _driver_schema(component.component_kind, component)
     return _driver_schema(_kind_of(component), component.driver)
 
 
@@ -640,6 +654,24 @@ class PendingStep:
             )
         return tuple(notes)
 
+    def describe(self) -> str:
+        """
+        Say what the step still has to create.
+
+        Returns:
+            ``the table is missing``, or the missing columns and indexes, for
+            example ``missing columns: channel, not_before; missing indexes:
+            taskiq_messages_not_before_idx``.
+        """
+        if self.table_missing:
+            return "the table is missing"
+        found = []
+        if self.missing_columns:
+            found.append(f"missing columns: {', '.join(self.missing_columns)}")
+        if self.missing_indexes:
+            found.append(f"missing indexes: {', '.join(self.missing_indexes)}")
+        return "; ".join(found)
+
     def statements(self, *, lock: bool = True) -> list[str]:
         """
         Return the statements that run the step.
@@ -713,10 +745,29 @@ class MigrationPlan:
             The statements in the order they run; none when nothing is
             pending.
         """
-        grouped: dict[str, list[MigrationStep]] = {}
-        for item in self.pending:
-            grouped.setdefault(item.table, []).append(item.step)
-        return _script_statements(list(grouped.items()), lock=lock)
+        return _script_statements(list(self._steps_by_table().items()), lock=lock)
+
+    def pending_schemas(self, schemas: Iterable[TableSchema]) -> list[TableSchema]:
+        """
+        Return the tables that have a pending step, each with only those steps.
+
+        A migration format given them renders what the database still lacks,
+        as ``render_sql`` of the plan does for the ``sql`` format.
+
+        Args:
+            schemas: The tables the plan was computed for.
+
+        Returns:
+            Those of ``schemas`` that have a pending step, in their order, each
+            with ``steps`` cut down to its pending ones; none when nothing is
+            pending.
+        """
+        steps = self._steps_by_table()
+        return [
+            replace(schema, steps=tuple(steps[schema.name]))
+            for schema in schemas
+            if schema.name in steps
+        ]
 
     def render_sql(
         self,
@@ -724,6 +775,7 @@ class MigrationPlan:
         transaction: bool = True,
         lock: bool = True,
         lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
+        comments: Sequence[str] = (),
     ) -> str:
         """
         Render the script that runs the pending steps.
@@ -736,6 +788,9 @@ class MigrationPlan:
             lock: Take the advisory locks, as ``render_sql`` does.
             lock_timeout: Seconds a statement waits for a lock, as for
                 ``render_sql``; ``0`` leaves the statement out.
+            comments: Lines written as SQL comments after the version line,
+                before the list of pending steps, such as the database the
+                plan is for.
 
         Returns:
             The script, as ``render_sql`` lays it out, or an empty string when
@@ -743,19 +798,27 @@ class MigrationPlan:
 
         Raises:
             ValueError: if ``lock_timeout`` is not a whole number of seconds
-                from 0 to 2147483.
+                from 0 to 2147483, or a comment holds a line break or a NUL.
         """
         statements = _lock_timeout_first(self.statements(lock=lock), lock_timeout)
+        for comment in comments:
+            _check_comment(comment)
         if not self.pending:
             return ""
         pending = ", ".join(
             f"{item.table} step {item.step.number}" for item in self.pending
         )
         return _script_text(
-            [f"-- pending: {pending}"],
+            [*(f"-- {comment}" for comment in comments), f"-- pending: {pending}"],
             statements,
             transaction=transaction,
         )
+
+    def _steps_by_table(self) -> dict[str, list[MigrationStep]]:
+        grouped: dict[str, list[MigrationStep]] = {}
+        for item in self.pending:
+            grouped.setdefault(item.table, []).append(item.step)
+        return grouped
 
 
 def catalog_query(schemas: Iterable[TableSchema]) -> str:
@@ -764,7 +827,8 @@ def catalog_query(schemas: Iterable[TableSchema]) -> str:
 
     The query has no parameters: the names are written in it as literals, so
     every driver runs it as it is. It returns one row with one text column,
-    ``catalog``, which ``CatalogState.from_json`` reads. Names resolve through
+    ``catalog``, which ``CatalogState.from_json`` reads; ``read_catalog`` runs
+    the query and reads that value. Names resolve through
     the ``search_path``, as the components' own SQL does, and the query reads
     only the ``pg_catalog`` tables, which every role can read by default.
 
@@ -788,6 +852,39 @@ def catalog_query(schemas: Iterable[TableSchema]) -> str:
         + ", ".join(_table_state_sql(table) for table in tables)
         + "))::text AS catalog"
     )
+
+
+async def read_catalog(
+    schemas: Iterable[TableSchema],
+    fetch_value: Callable[[str], Awaitable[Any]],
+) -> CatalogState:
+    """
+    Run ``catalog_query`` for the tables and read what it returns.
+
+    Args:
+        schemas: The tables.
+        fetch_value: Runs a query and returns the first column of its first
+            row, or ``None`` when it returns no row; asyncpg's
+            ``Connection.fetchval``, for example.
+
+    Returns:
+        What the database holds for the tables, for ``plan_migration``.
+
+    Raises:
+        ValueError: if ``schemas`` is empty or a table name cannot be written
+            in SQL, if the query came back without its row, or if its value
+            is not what ``catalog_query`` returns.
+    """
+    value = await fetch_value(catalog_query(schemas))
+    if value is None:
+        # The query always returns one row: whatever ran it lost the row.
+        raise ValueError("catalog_query returned no row, and it always returns one")
+    if not isinstance(value, str):
+        raise ValueError(
+            f"catalog_query returned {type(value).__name__}, not the JSON text "
+            "of its catalog column",
+        )
+    return CatalogState.from_json(value)
 
 
 def plan_migration(
@@ -1025,6 +1122,15 @@ def _check_table_name(name: str) -> None:
         raise ValueError(
             f"table name {name!r} cannot be written in a SQL script: it is "
             "empty or holds a line break or a NUL",
+        )
+
+
+def _check_comment(text: str) -> None:
+    # A line break would end the comment and leave the rest of it as SQL.
+    if any(character in text for character in "\0\r\n"):
+        raise ValueError(
+            f"comment {text!r} cannot be written in a SQL script: it holds a "
+            "line break or a NUL",
         )
 
 

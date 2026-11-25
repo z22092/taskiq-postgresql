@@ -13,9 +13,6 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-import random
-import string
-import sys
 from importlib.metadata import version
 from pathlib import Path
 from typing import Callable, Iterator
@@ -27,10 +24,9 @@ import pytest
 from taskiq_postgresql.migrations import FormatOptions, render_sql, table_schema
 from tests.helpers import (
     closed_local_port,
-    create_database,
-    drop_database,
     fetch_on_server,
-    in_database,
+    importable_modules,
+    new_database,
     run_script,
     with_netloc,
 )
@@ -119,14 +115,6 @@ broker = PostgresqlBroker(dsn=dsn).with_result_backend(
 """
 
 
-def new_database(postgresql_dsn: str) -> Iterator[str]:
-    """Create an empty database for one test, yield its DSN, then drop it."""
-    name = "cli_" + "".join(random.choices(string.ascii_lowercase, k=10))
-    asyncio.run(create_database(postgresql_dsn, name))
-    yield in_database(postgresql_dsn, name)
-    asyncio.run(drop_database(postgresql_dsn, name))
-
-
 @pytest.fixture
 def scratch_dsn(postgresql_dsn: str) -> Iterator[str]:
     """DSN of a database created empty for one test and dropped after it."""
@@ -144,24 +132,9 @@ def app_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[Callable[[str], str]]:
-    """
-    Write a module into ``tmp_path`` and return its name, unique per call.
-
-    The command adds ``--app-dir`` to ``sys.path``, as taskiq worker does; the
-    path and the imported modules are put back after the test.
-    """
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    names: list[str] = []
-
-    def write(source: str) -> str:
-        name = "tkq_app_" + "".join(random.choices(string.ascii_lowercase, k=10))
-        (tmp_path / f"{name}.py").write_text(source, encoding="utf-8")
-        names.append(name)
-        return name
-
-    yield write
-    for name in names:
-        sys.modules.pop(name, None)
+    """Write a module into ``tmp_path`` and return its name, unique per call."""
+    with importable_modules(tmp_path, monkeypatch) as write:
+        yield write
 
 
 def execute(dsn: str, script: str) -> None:

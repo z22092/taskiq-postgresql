@@ -120,27 +120,33 @@ the `CREATE TABLE` and hash index DDL below, and
 `tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql`
 the added columns and their index.
 
-`on_startup` migrates on one connection, in one transaction. It first reads
-the catalog with the comparison engine described below (`catalog_query`, then
-`plan_migration`, through `drivers/_schema.py`); if no migration step is
-pending, it returns without a lock or DDL, so a role with only DML privileges
-can start. Otherwise it takes
+The three drivers' `on_startup` is one flow, `start_table` in
+`drivers/_schema.py`; each driver lends it only its primitives, a `Session`
+(fetch one value, execute a statement or a script) on one pooled connection in
+one transaction. With `run_migrations` it first reads the catalog with the
+comparison engine described below (`read_catalog`, then `plan_migration`); if
+no migration step is pending, it returns without a lock or DDL, so a role with
+only DML privileges can start. Otherwise it takes
 `pg_advisory_xact_lock(hashtext('taskiq_postgresql'), hashtext(<table name>))`
 (`MigrationLockQuery`) and runs the DDL in that transaction: `CREATE TABLE`,
 the hash indexes, then the added columns and their index, before the commit.
 A concurrent startup waits for the commit, and its `IF NOT EXISTS` then finds
 the objects. The lock key stays the same across releases, so two versions in a
-rolling deploy also wait for each other.
+rolling deploy also wait for each other. Then it logs a warning for each
+problem no step fixes, which `IF NOT EXISTS` skipped.
 
 Without `run_migrations`, `on_startup` runs the same catalog query through
-`fetch_row`, on the driver's own pool, and no DDL (`check_table`). A missing
-table or column, or a problem the components cannot work with, raises
-`SchemaNotReadyError`, which names the table, the steps, the missing columns
-and the commands that create them; a missing index, or an index no step can
-fix, is logged as a warning. The driver describes its table from its own
-builders and `QueryDriver.component_kind`, which each component sets; a driver
-no component owns compares nothing. `RelationsExistQuery`, the probe before
-the engine, stays in `abc/query.py` for custom drivers.
+`fetch_row`, on the driver's own pool, and no DDL. A missing table or column,
+or a problem the components cannot work with, raises `SchemaNotReadyError`,
+which names the table, the steps, the missing columns and indexes, and, when
+a step is what is missing, the commands that run it (`HOW_TO_MIGRATE`); a
+missing index, or an index no step can fix, is logged as a warning. The driver
+describes its table from its own builders and `QueryDriver.component_kind`
+(`table_schema(driver)`), which each component sets at construction and again
+in `startup()`. A driver no component owns cannot describe its table: without
+`run_migrations` it checks nothing, and with it it keeps the probe of the
+releases before the engine, `RelationsExistQuery`, and skips the lock and the
+DDL once its table and indexes exist.
 
 `taskiq_postgresql/migrations.py` describes each table twice, from the same
 builders: as columns and indexes (`TableSchema`), and as the ordered
@@ -155,9 +161,13 @@ transactions. `taskiq postgresql migrate` runs the migration of
 database's catalog, in one `SELECT` that also returns `current_database()`
 and `current_schemas(false)`, through the driver of a component (or a
 throwaway one with `--component`): `plan` prints `MigrationPlan.render_sql`
-under a header naming that database, or hands the tables cut down to their
-pending steps to another format; `check` reports, exits with 3 for a missing
-table or column and 4 for a problem, and prints JSON with `--json`.
+with a comment naming that database, or hands the tables cut down to their
+pending steps (`MigrationPlan.pending_schemas`) to another format; `check`
+reports, exits with 3 for a missing table or column and 4 for a problem, and
+prints JSON with `--json`. `plan` lets the format refuse its options before it
+connects, by rendering no table, and refuses the alembic format's
+`downgrade=drop` when a pending step's table already exists, since the
+revision would drop a table it did not create.
 `tests/test_migration_script.py` checks that the
 steps are the statements the drivers build for `on_startup` and that the
 script builds the catalog `on_startup` builds.

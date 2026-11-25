@@ -9,16 +9,15 @@ from types import TracebackType
 from typing import Any, AsyncGenerator, Optional, Sequence, Union
 from uuid import UUID
 
-from psqlpy import Connection, ConnectionPool, Listener
+from psqlpy import Connection, ConnectionPool, Listener, Transaction
 from psqlpy.extra_types import JSONB
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.drivers._health import check_listen
-from taskiq_postgresql.drivers._schema import check_table, compare, described_table
+from taskiq_postgresql.drivers._schema import Session, start_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
-from taskiq_postgresql.migrations import catalog_query
 
 
 def encode_psqlpy_params(
@@ -59,6 +58,20 @@ def encode_psqlpy_params(
             new_values[index] = UUID(value)
 
     return new_values
+
+
+async def _fetch_value(transaction: Transaction, query: str, *values: Any) -> Any:
+    """Return the first column of the first row of ``query``, or ``None``."""
+    return await transaction.fetch_val(query, list(values) or None)
+
+
+async def _execute(transaction: Transaction, query: str, *values: Any) -> None:
+    """Run a statement with ``values``, or, without values, a whole script."""
+    if values:
+        await transaction.execute(query, list(values))
+    else:
+        # execute() prepares its query, which takes one statement only.
+        await transaction.execute_batch(query)
 
 
 class PsqlpyDriver(QueryDriver):
@@ -248,39 +261,20 @@ class PsqlpyDriver(QueryDriver):
 
     async def on_startup(self) -> None:
         """Check the table, or migrate it; see ``QueryDriver.on_startup``."""
-        if not self.run_migrations:
-            await check_table(self)
-            return
-        schema = described_table(self)
+        await start_table(self, self._session)
+
+    @asynccontextmanager
+    async def _session(self) -> AsyncGenerator[Session, None]:
+        """One pooled connection in one transaction, for ``start_table``."""
         async with (
             self,
             self.connection() as connection,
             connection.transaction() as transaction,
         ):
-            if (
-                schema is not None
-                and compare(
-                    schema,
-                    await transaction.fetch_val(catalog_query([schema])),
-                ).is_current
-            ):
-                return
-            await transaction.execute(
-                self.migration_lock_query.make_query(),
-                list(self.migration_lock_query.params()),
+            yield Session(
+                fetch_value=partial(_fetch_value, transaction),
+                execute=partial(_execute, transaction),
             )
-            await transaction.execute_batch(self.create_table_query.make_query())
-            if self.index_columns is not None:
-                await transaction.execute_batch(
-                    self.create_index_query.make_query(self.index_columns),
-                )
-            if self.added_columns or self.added_indexes:
-                await transaction.execute_batch(
-                    self.add_columns_query.make_query(
-                        self.added_columns,
-                        self.added_indexes,
-                    ),
-                )
 
     async def on_shutdown(self) -> None:
         """Close the pool, if a query created it."""
