@@ -71,6 +71,7 @@ __all__ = [
     "COMPONENT_KINDS",
     "DEFAULT_LOCK_TIMEOUT",
     "MIGRATION_FORMATS_GROUP",
+    "SYSTEM_PATH",
     "TASK_ID_TYPES",
     "AmbiguousMigrationFormatError",
     "CatalogState",
@@ -118,6 +119,24 @@ __all__ = [
 
 ComponentKind = Literal["broker", "result_backend", "scheduler_source"]
 """The three components that own a table."""
+
+
+class _SystemPath:
+    """The type of ``SYSTEM_PATH``."""
+
+    def __repr__(self) -> str:
+        return "SYSTEM_PATH"
+
+
+SYSTEM_PATH: Final = _SystemPath()
+"""
+Pass as ``app_dir`` to import a path with the interpreter's own ``sys.path``.
+
+Nothing is added to it, not even the working directory, which the default
+puts first while a module is imported. A caller whose process has already set
+its import path up, such as a Django project, passes it so that a module of
+the same name in whatever directory the command runs from is not loaded.
+"""
 
 COMPONENT_KINDS: Final[tuple[ComponentKind, ...]] = get_args(ComponentKind)
 
@@ -481,7 +500,7 @@ def table_schema(
 
 def collect_components(
     *targets: object,
-    app_dir: Optional[str] = None,
+    app_dir: Union[str, _SystemPath, None] = None,
 ) -> list[Component]:
     """
     Find the components behind brokers, schedulers and import paths.
@@ -496,7 +515,9 @@ def collect_components(
         *targets: Components, brokers, schedulers, or ``"module:object"``
             paths that name one, resolved like ``taskiq worker`` resolves its
             broker: the object is imported and, if it is a function, called.
-        app_dir: A directory to add to ``sys.path`` before importing a path.
+        app_dir: A directory to add to ``sys.path`` before importing a path,
+            or ``SYSTEM_PATH`` to add nothing. Left out, the working
+            directory is on ``sys.path`` while a path is imported.
 
     Returns:
         The components, in target order.
@@ -517,7 +538,7 @@ def collect_components(
 
 def collect_schemas(
     *targets: object,
-    app_dir: Optional[str] = None,
+    app_dir: Union[str, _SystemPath, None] = None,
 ) -> list[TableSchema]:
     """
     Describe the tables behind brokers, schedulers, import paths and descriptions.
@@ -1261,8 +1282,9 @@ class RenderedStep:
 
     Raises:
         ValueError: if ``table`` is empty or holds a line break or a NUL,
-            ``kind`` is not one of ``COMPONENT_KINDS``, or ``number`` is not
-            positive.
+            ``kind`` is not one of ``COMPONENT_KINDS``, ``number`` is not
+            positive, or a comment holds a line break, a NUL or an encoding
+            declaration.
         TypeError: if ``number`` is not an ``int``.
     """
 
@@ -1283,6 +1305,10 @@ class RenderedStep:
             )
         if self.number < 1:
             raise ValueError(f"the step number must be positive, got {self.number}")
+        # The lines go into a generated file, and the class is public: nothing
+        # but the checked constructors may be trusted to have checked them.
+        for comment in self.comments:
+            check_comment(comment)
 
     @classmethod
     def of(
@@ -2105,7 +2131,10 @@ def _scheduler_source_parts() -> _TableParts:
     )
 
 
-def _components_of(target: object, app_dir: Optional[str]) -> list[Component]:
+def _components_of(
+    target: object,
+    app_dir: Union[str, _SystemPath, None],
+) -> list[Component]:
     loaded = _load_target(target, app_dir) if isinstance(target, str) else target
     components = _components_in(loaded)
     if not components:
@@ -2133,11 +2162,14 @@ def _describe(target: object) -> str:
     return repr(target) if isinstance(target, str) else type(target).__name__
 
 
-def _load_target(spec: str, app_dir: Optional[str]) -> object:
+def _load_target(spec: str, app_dir: Union[str, _SystemPath, None]) -> object:
     module_name, attribute = parse_target(spec)
+    if app_dir is SYSTEM_PATH:
+        loaded = getattr(import_module(module_name), attribute)
+        return loaded() if isfunction(loaded) else loaded
     # As taskiq worker does: app_dir stays on sys.path, the working directory
     # only while the module is imported.
-    if app_dir is not None and app_dir not in sys.path:
+    if isinstance(app_dir, str) and app_dir not in sys.path:
         sys.path.insert(0, app_dir)
     cwd = str(Path.cwd())
     added_cwd = cwd not in sys.path

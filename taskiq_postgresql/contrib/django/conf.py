@@ -28,6 +28,7 @@ from django.core.exceptions import ImproperlyConfigured
 from taskiq_postgresql.migrations import (
     COMPONENT_KINDS,
     DEFAULT_LOCK_TIMEOUT,
+    SYSTEM_PATH,
     TableSchema,
     check_lock_timeout,
     check_plain_identifier,
@@ -64,9 +65,10 @@ def configured_schemas() -> list[TableSchema]:
     """
     Describe the tables ``TASKIQ_POSTGRESQL_TARGETS`` names.
 
-    Paths are imported here, so a module that only Django's settings make
-    importable resolves. A table named twice with the same columns is
-    described once.
+    Paths are imported here with the interpreter's own ``sys.path``, so a
+    module that only Django's settings make importable resolves, and nothing
+    is added to it, not even the working directory. A table named twice with
+    the same columns is described once.
 
     Returns:
         The tables, in the order the setting names them.
@@ -79,7 +81,9 @@ def configured_schemas() -> list[TableSchema]:
     """
     targets = _targets()
     try:
-        schemas = collect_schemas(*targets)
+        # Django has set the project's path up; the working directory of a
+        # `migrate` run is not part of it and must not be searched.
+        schemas = collect_schemas(*targets, app_dir=SYSTEM_PATH)
         for schema in schemas:
             # The steps write the name unquoted, and run without parameters.
             check_plain_identifier(schema.name)
