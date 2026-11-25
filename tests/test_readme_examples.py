@@ -68,6 +68,7 @@ from taskiq_postgresql.migrations import (
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from tests.helpers import (
     address_of,
+    assert_exited_cleanly,
     create_database,
     drop_database,
     in_database,
@@ -656,30 +657,6 @@ def _start(
     return process, lines
 
 
-def _assert_exited_cleanly(
-    script: subprocess.CompletedProcess[str],
-    driver: str,
-) -> None:
-    """
-    Assert that a README script exited with code 0.
-
-    psqlpy 0.13.1 on Python 3.10 occasionally aborts the interpreter at exit,
-    after the script's work is done, with ``PyGILState_Release`` while the
-    runtime is finalizing; psqlpy alone, without this package, does it too
-    (about 1 run in 80). Only that abort is tolerated, and the caller still
-    checks the script's output.
-    """
-    if (
-        script.returncode == -signal.SIGABRT
-        and driver == "psqlpy"
-        and sys.version_info < (3, 11)
-        and "Fatal Python error: PyGILState_Release" in script.stderr
-        and "finalizing" in script.stderr
-    ):
-        return
-    assert script.returncode == 0, script.stderr
-
-
 @pytest.mark.timeout(180)
 def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_stored(
     driver: str,
@@ -713,7 +690,7 @@ def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_sto
             timeout=SCRIPT_TIMEOUT,
             check=False,
         )
-        _assert_exited_cleanly(kick, driver)
+        assert_exited_cleanly(kick, driver)
         assert kick.stdout.strip() == "3"
 
         schedule = subprocess.run(
@@ -725,7 +702,7 @@ def test_when_the_quickstart_is_followed__then_a_task_runs_and_a_schedule_is_sto
             timeout=SCRIPT_TIMEOUT,
             check=False,
         )
-        _assert_exited_cleanly(schedule, driver)
+        assert_exited_cleanly(schedule, driver)
 
         scheduler, scheduler_lines = _start(scheduler_command, tmp_path, env)
         scheduler_seen: list[str] = []
@@ -821,7 +798,7 @@ def test_when_the_migration_commands_run__then_they_create_the_tables(
             timeout=SCRIPT_TIMEOUT,
             check=False,
         )
-        _assert_exited_cleanly(result, driver)
+        assert_exited_cleanly(result, driver)
         ran[subcommand] += 1
         if target:
             output = tmp_path / target

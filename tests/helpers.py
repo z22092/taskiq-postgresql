@@ -1,8 +1,10 @@
 import asyncio
 import os
 import random
+import signal
 import socket
 import string
+import subprocess
 import sys
 from collections.abc import Awaitable, Callable, Generator, Iterator, Sequence
 from contextlib import contextmanager
@@ -381,3 +383,49 @@ async def eventually(
             msg = f"still false after {timeout} s"
             raise AssertionError(msg)
         await asyncio.sleep(0.05)
+
+
+def assert_exited_cleanly(
+    script: subprocess.CompletedProcess[str],
+    driver: str,
+    *,
+    version: tuple[int, ...] = sys.version_info[:3],
+) -> None:
+    """
+    Assert that a README script exited with code 0.
+
+    psqlpy aborts the interpreter at exit, after the script's work is done,
+    on its own and without this package (psqlpy-python/psqlpy#182): psqlpy
+    alone (connect, ``SELECT 1``, close) aborted in 14 of 200 runs on Python
+    3.10, 12 of 150 on 3.11, 9 of 150 on 3.12 and 0 of 150 on 3.13, under 16
+    busy loops on 8 cores. Newer releases print ``PyGILState_Release`` while
+    the runtime is finalizing; psqlpy 0.11.3, the floor, aborts with no fatal
+    error line at all, only pydantic's ``UserWarning`` on stderr. So the
+    tolerated abort is SIGABRT of a psqlpy script on Python before 3.13,
+    with no traceback and either no fatal error line or that ``PyGILState_Release``
+    one. Any other exit still fails, and the caller still checks what the script
+    did.
+
+    Args:
+        script: The finished script process, with its stderr captured as text.
+        driver: The driver the script ran on.
+        version: The interpreter version the script ran on; the running one
+            by default.
+
+    Raises:
+        AssertionError: If the script did not exit with code 0 and the abort is
+            not the tolerated one.
+    """
+    stderr = script.stderr
+    gil_abort = (
+        "Fatal Python error: PyGILState_Release" in stderr and "finalizing" in stderr
+    )
+    if (
+        script.returncode == -signal.SIGABRT
+        and driver == "psqlpy"
+        and version < (3, 13)
+        and "Traceback (most recent call last)" not in stderr
+        and ("Fatal Python error" not in stderr or gil_abort)
+    ):
+        return
+    assert script.returncode == 0, script.stderr
