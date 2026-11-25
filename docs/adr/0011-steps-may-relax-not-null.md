@@ -24,22 +24,32 @@ second time.
 - A step may make columns nullable. `StepObjects.nullable_columns` names them,
   and `DropNotNullQuery` in `abc/query.py` builds the statement, as every other
   DDL statement comes from a builder. `TableSchema` refuses a step that makes
-  nullable a column the table does not have, or one its final description has
-  `NOT NULL`.
+  nullable a column the table does not have, one its final description has
+  `NOT NULL`, or one that no step with a lower number creates or adds: the
+  statement would fail on a table built from scratch.
 - `catalog_query` also reads `pg_attribute.attnotnull`, beside the columns and
   in the same query. A step is pending while one of its `nullable_columns`
-  exists and is still `NOT NULL`; `PendingStep.not_null_columns` names them. Such
-  a step is `required`, because the components would violate `NOT NULL`
-  without it. A column the table lacks is the business of the step that adds
-  it, so it is not reported twice.
+  exists and is still `NOT NULL`; `PendingStep.not_null_columns` names them.
+  Such a step is `required`, because the components would violate `NOT NULL`
+  without it. A column the table lacks is reported by the earlier step that
+  adds it, and the step that relaxes it is pending in the same run, so the plan
+  and the statements it renders carry both; when `CREATE TABLE` created the
+  column, the report is a `missing_column` problem instead, and no step runs
+  for it.
 - The rule becomes "additive, or relaxes `NOT NULL`; nothing is removed or
   renamed". Dropping a column, changing a type or putting `NOT NULL` back stay
   out of the steps.
 - The Alembic comparator removes the `alter_column` Alembic proposes when its
   only change makes a column of a pending step nullable, so a revision holds
-  the `TaskiqStepOp` and nothing else for it. The downgrade of such a step does
-  nothing, with `downgrade=drop` too: `SET NOT NULL` would fail on the first row
-  that holds a `NULL`.
+  the `TaskiqStepOp` and nothing else for it. The downgrade of such a step
+  does nothing, and its comment says that `NOT NULL` is not put back: `SET NOT
+  NULL` would fail on the first row that holds a `NULL`. The revision's
+  `downgrade=drop` option drops the tables instead, in `generate`; `plan`
+  refuses it when a step is pending on a table that exists. Nothing ever puts
+  `NOT NULL` back.
+- The text a step writes into a generated file says what the step does: the
+  comment of a step that makes a column nullable says so, and the text of every
+  released step stays as it was.
 - This change adds the kind of step only. No released step changes, and no step
   is added to a real table; `tests/golden/migration_steps.sql` stays as it is.
 
@@ -59,5 +69,10 @@ second time.
   statement: the drivers' `on_startup` still runs their own builders, and
   `tests/test_migration_script.py::test_the_steps_are_the_sql_run_migrations_executes`
   fails until the two agree.
+- Relaxing a column of a real table also needs the relaxed column carried
+  through `_TableParts` and `_schema` in `migrations.py`, so that only the
+  final description has it nullable while step 1's `CREATE TABLE` (which
+  `tests/golden/migration_steps.sql` pins) still writes it `NOT NULL`. This
+  change leaves `_schema` as it is: the tests describe their own tables.
 - `taskiq postgresql check --json` reports `not_null_columns` for each pending
-  step.
+  step, and `check` exits 3 while a column is still `NOT NULL`.

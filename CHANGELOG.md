@@ -78,9 +78,10 @@ Upgrading from 0.4.x:
 - A migration step can now make a column nullable: `StepObjects` has a
   `nullable_columns` field, and `PendingStep` a `not_null_columns` field naming
   the columns of a pending step that are still `NOT NULL` (`taskiq postgresql
-  check --json` reports it as `not_null_columns`). Such a step is `required`,
-  and the Alembic integration leaves its `ALTER COLUMN ... DROP NOT NULL` to the
-  step instead of proposing it twice. No step of this release relaxes a column.
+  check --json` reports it as `not_null_columns`). Such a step is `required`
+  (`check` exits 3 while it is pending), and the Alembic integration leaves its
+  `ALTER COLUMN ... DROP NOT NULL` to the step instead of proposing it twice.
+  No step of this release relaxes a column.
 - Python 3.14 and 3.15 support.
 - taskiq 0.13 support: the dependency range is now `taskiq>=0.11.7,<0.14`. The
   package no longer imports `taskiq.compat`, whose pydantic helpers taskiq 0.13
