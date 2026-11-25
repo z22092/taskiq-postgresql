@@ -239,6 +239,31 @@ def test_migrate_creates_the_tables_of_an_import_path_once(
     )
 
 
+def test_a_path_is_not_imported_from_the_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # A module that only the current directory holds must not load: a migrate
+    # run from a writable directory would otherwise import whatever sits there.
+    from taskiq_postgresql.contrib.django.conf import (  # noqa: PLC0415
+        configured_schemas,
+    )
+
+    with importable_modules(tmp_path, monkeypatch) as write:
+        monkeypatch.chdir(tmp_path)
+        name = write(APP_SOURCE)
+        before = list(sys.path)
+
+        with (
+            configured([f"{name}:broker"]),
+            pytest.raises(ImproperlyConfigured, match=name),
+        ):
+            configured_schemas()
+
+        assert sys.path == before
+        assert name not in sys.modules
+
+
 def test_a_0_4_broker_table_gets_step_2_from_the_second_migration(
     django_db: str,
 ) -> None:
