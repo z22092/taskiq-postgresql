@@ -641,44 +641,40 @@ async def test_startup_after_the_upgrade_takes_the_fast_path(
 
 
 @pytest.mark.anyio
-async def test_a_driver_no_component_owns_takes_no_lock_once_its_table_exists(
+async def test_a_driver_no_component_owns_runs_no_ddl_once_its_table_exists(
     driver: str,
     postgresql_dsn: str,
     postgres_table: str,
     admin: Connection,
 ) -> None:
     """Without a kind it cannot compare, so it probes its relations as before."""
-    asyncpg = pytest.importorskip("asyncpg")
     owner = build_component("result_backend", postgresql_dsn, postgres_table, driver)
     try:
         await owner.startup()
     finally:
         await close_component(owner)
-    alone = get_db_driver(driver)(
+
+    # A role without CREATE fails at once on the DDL, where a held migration
+    # lock would leave a cancelled startup's transaction open on the server.
+    async with dml_role(
+        admin,
         postgresql_dsn,
         postgres_table,
-        columns=owner.driver.columns,
-        primary_key=owner.driver.primary_key,
-        index_columns=owner.driver.index_columns,
-        run_migrations=True,
-    )
-    assert alone.component_kind is None
-    blocker = await asyncpg.connect(postgresql_dsn)
-    try:
-        transaction = blocker.transaction()
-        await transaction.start()
-        await blocker.execute(
-            MIGRATION_LOCK_SQL,
-            MIGRATION_LOCK_NAMESPACE,
+        "result_backend",
+    ) as role_dsn:
+        alone = get_db_driver(driver)(
+            role_dsn,
             postgres_table,
+            columns=owner.driver.columns,
+            primary_key=owner.driver.primary_key,
+            index_columns=owner.driver.index_columns,
+            run_migrations=True,
         )
-
-        # A startup that took the lock would wait for the blocker forever.
-        await asyncio.wait_for(alone.on_startup(), WAIT_SECONDS)
-    finally:
-        await blocker.close()
-        await alone.on_shutdown()
-        await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
+        assert alone.component_kind is None
+        try:
+            await asyncio.wait_for(alone.on_startup(), WAIT_SECONDS)
+        finally:
+            await alone.on_shutdown()
 
 
 @pytest.mark.anyio
