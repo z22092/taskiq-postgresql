@@ -277,7 +277,7 @@ def test_plan_writes_a_revision_of_only_the_pending_steps(
     from taskiq_postgresql.contrib.alembic import alembic_format  # noqa: PLC0415
 
     execute(scratch_dsn, OLD_SQL)
-    database, _ = database_of(scratch_dsn)
+    database, search_path = database_of(scratch_dsn)
 
     code, out, err = run_in_process(
         ["plan", *broker_options(scratch_dsn), "--format", "alembic"],
@@ -285,7 +285,11 @@ def test_plan_writes_a_revision_of_only_the_pending_steps(
     )
 
     assert code == 0, err
-    assert out == alembic_format(
+    # The file itself names the database it was planned for, as the SQL does.
+    assert out == (
+        f"# plan for database {database} (search_path {search_path}): valid only "
+        "for this database\n"
+    ) + alembic_format(
         [dataclasses.replace(BROKER, steps=BROKER.steps[1:])],
         FormatOptions(),
     )
