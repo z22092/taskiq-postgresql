@@ -1,11 +1,17 @@
 import asyncio
 import os
+import random
 import socket
-from collections.abc import Awaitable, Callable
+import string
+import sys
+from collections.abc import Awaitable, Callable, Iterator
+from contextlib import contextmanager
+from pathlib import Path
 from typing import Any, Optional, TypeVar, Union
 from urllib.parse import SplitResult, parse_qsl, urlsplit
 
 import asyncpg
+import pytest
 
 from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
@@ -13,9 +19,88 @@ from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 
 _ReturnType = TypeVar("_ReturnType")
 
+Component = Union[
+    PostgresqlBroker,
+    PostgresqlResultBackend[Any],
+    PostgresqlSchedulerSource,
+]
+
+# Construction needs no server; the components never connect with it.
+UNUSED_DSN = "postgresql://localhost/unused"
+
 # How long a listening worker may take to get a message it is notified of,
 # with room for a busy machine, where 0.6 s was seen under CPU load.
 NOTIFY_DELIVERS_WITHIN = 3.0
+
+
+def build_component(
+    kind: str,
+    dsn: str = UNUSED_DSN,
+    table_name: Optional[str] = None,
+    driver: str = "asyncpg",
+    *,
+    field: Optional[str] = None,
+    run_migrations: bool = True,
+) -> Component:
+    """
+    Build a component of ``kind``; it migrates its table by default.
+
+    A broker on ``table_name`` listens on its own ``<table_name>_channel``.
+    """
+    options: dict[str, Any] = {
+        "dsn": dsn,
+        "driver": driver,
+        "run_migrations": run_migrations,
+    }
+    if table_name is not None:
+        options["table_name"] = table_name
+    if field is not None:
+        options["field_for_task_id"] = field
+    if kind == "broker":
+        if table_name is not None:
+            options["channel_name"] = f"{table_name}_channel"
+        return PostgresqlBroker(**options)
+    if kind == "result_backend":
+        return PostgresqlResultBackend(**options)
+    return PostgresqlSchedulerSource(**options)
+
+
+def new_database(dsn: str) -> Iterator[str]:
+    """Create an empty database on the server of ``dsn``, yield its DSN, drop it."""
+    name = "cli_" + "".join(random.choices(string.ascii_lowercase, k=10))
+    asyncio.run(create_database(dsn, name))
+    try:
+        yield in_database(dsn, name)
+    finally:
+        asyncio.run(drop_database(dsn, name))
+
+
+@contextmanager
+def importable_modules(
+    directory: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[Callable[[str], str]]:
+    """
+    Yield a function that writes a module into ``directory`` and names it.
+
+    Each name is unique, so in-process tests never reuse another test's
+    import. The command adds ``--app-dir`` to ``sys.path``, as taskiq worker
+    does; ``sys.path`` and the imported modules are put back afterwards.
+    """
+    monkeypatch.setattr(sys, "path", list(sys.path))
+    names: list[str] = []
+
+    def write(source: str) -> str:
+        name = "tkq_app_" + "".join(random.choices(string.ascii_lowercase, k=10))
+        (directory / f"{name}.py").write_text(source, encoding="utf-8")
+        names.append(name)
+        return name
+
+    try:
+        yield write
+    finally:
+        for name in names:
+            sys.modules.pop(name, None)
 
 
 def closed_local_port() -> int:

@@ -105,15 +105,35 @@ async def test_when_driver_never_connected__then_shutdown_succeeds(
 
 
 @pytest.mark.anyio
-async def test_when_scheduler_source_never_queried__then_shutdown_succeeds(
+async def test_when_no_component_owns_the_driver__then_startup_checks_nothing(
     driver: str,
 ) -> None:
-    # Without run_migrations and a startup schedule, startup sends no query,
-    # so the driver's pool is never opened.
-    source = PostgresqlSchedulerSource(DSN, driver=driver)
-    await source.startup()
+    # Only a component can tell the driver what kind of table it holds, so
+    # a driver built alone and not migrating sends no query at startup.
+    instance = never_connected(driver)
 
-    await source.shutdown()
+    await instance.on_startup()
+
+    assert instance.pool is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "component",
+    [PostgresqlResultBackend, PostgresqlSchedulerSource],
+    ids=["result_backend", "scheduler_source"],
+)
+async def test_when_a_component_never_started__then_shutdown_succeeds_twice(
+    component: Component,
+    driver: str,
+) -> None:
+    # A pool that startup() never opened is nothing to close, once or twice.
+    instance = component(DSN, driver=driver)
+
+    await instance.shutdown()
+    await instance.shutdown()
+
+    assert getattr(instance.driver, "pool", None) is None
 
 
 @pytest.mark.anyio

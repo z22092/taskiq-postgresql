@@ -31,13 +31,11 @@ Upgrading from 0.4.x:
     ON taskiq_messages (channel, not_before, id);
   ```
 
-  Without it, `kick()` fails with
-  `column "channel" of relation "taskiq_messages" does not exist`, and the
-  workers of this version deliver nothing from the table. Each of them logs
-  a failed sweep every `poll_interval`
-  (`Error claiming a due message on channel ...`) and, for every NOTIFY a
-  0.4.x producer sends, a failed claim of that message
-  (`Error claiming message <id> on channel ...`). `ADD COLUMN` does not
+  `taskiq postgresql plan` prints the same statements, with the advisory lock
+  and a lock timeout, for your own table names, and `taskiq postgresql check`
+  tells whether they have run. Without them, a component of this version with
+  `run_migrations=False` refuses to start: `startup()` raises
+  `SchemaNotReadyError`, naming the missing columns. `ADD COLUMN` does not
   rewrite the table, but `CREATE INDEX` blocks writes to it while it builds.
   On a large table, run the upgrade before deploying even with
   `run_migrations=True`: the `ALTER TABLE` first, then, outside a transaction,
@@ -105,6 +103,29 @@ Upgrading from 0.4.x:
   `run_migrations=True` runs, whatever the components set. Run it before the
   workers, which can then use `run_migrations=False` and a role that only reads
   and writes rows.
+- `taskiq postgresql plan` reads one database's catalog, in one read-only
+  query, and prints only the SQL of the migration steps that database still
+  lacks: the script of `generate`, with its options (`--lock-timeout`,
+  `--no-transaction`, `--no-lock`, `--format alembic` for a revision of the
+  pending steps), under a comment that names the database and `search_path` it
+  is valid for, and nothing when every step has run. The locks each step takes
+  and the problems no step fixes go to standard error.
+- `taskiq postgresql check` reads the same catalog, changes nothing, and
+  reports the pending steps and the problems on standard error (and as JSON
+  with `--json`). It exits with 0 when the database is up to date or lacks
+  only an index, 3 when a table or column is missing, and 4 when a problem no
+  step fixes needs a person, such as an invalid index; 1 stays for errors, so
+  a deploy can tell a forgotten migration from a failed connection. Both
+  commands read each component's own database, or `--dsn`, and need no DDL
+  privilege; `--component` describes one table without the application.
+- `QueryDriver.component_kind`, which the components set on their driver, at
+  construction and again in `startup()`, so a driver swapped in later gets it
+  too. The bundled drivers' `on_startup()` describes the table with it and
+  compares the database with that description, with `run_migrations` or
+  without. A driver built without a component checks nothing without
+  `run_migrations`; with `run_migrations=True` it probes its table and indexes
+  as before (`RelationsExistQuery`) and takes no lock and runs no DDL once they
+  exist.
 - `taskiq_postgresql.migrations` describes the tables as data (`table_schema`,
   `collect_schemas`) and renders the script (`render_sql`), or its statements
   one by one (`migration_statements`, which stops after a given step with
@@ -176,6 +197,26 @@ Upgrading from 0.4.x:
 
 ### Changed
 
+- **BREAKING:** with `run_migrations=False` (the default), `startup()` checks
+  the component's table before anything else starts. It reads the catalog in
+  one read-only query, through the component's own pool, and runs no DDL. When
+  the table, or a column a migration step adds (such as the broker's `channel`
+  and `not_before` on a table 0.4.x created), is missing, it raises
+  `SchemaNotReadyError` from `taskiq_postgresql.exceptions`, which names the
+  table, the step and the columns; such a component used to start and fail on
+  its first query. A missing index, or an index no step can fix, only logs a
+  warning. What to do: create the tables before the workers start, with
+  `taskiq postgresql migrate`, with the SQL `taskiq postgresql plan` prints,
+  with an Alembic revision (`alembic revision --autogenerate`), or by starting
+  once with `run_migrations=True`. The check opens the component's pool at
+  startup, so on a database it cannot reach `startup()` now fails with
+  `DatabaseConnectionError`, for every component, before the worker starts,
+  as it already did with `run_migrations=True`. With psycopg it fails once
+  the pool has waited for a connection for its `timeout`, 30 seconds by
+  default (`psycopg_pool.AsyncConnectionPool`). With `run_migrations=True`,
+  `startup()` also logs a warning for each problem no step fixes, such as an
+  invalid index or an index name another table took, which `IF NOT EXISTS`
+  skips.
 - Runtime dependencies use closed ranges (`>=floor,<ceiling`): `taskiq`,
   `typing-extensions`, `pydantic` and the `asyncpg`, `psqlpy` and `psycopg`
   extras. `typing-extensions>=4.0.0,<5` is declared.
@@ -309,6 +350,9 @@ Upgrading from 0.4.x:
   that received no message, or a schedule source never asked for its
   schedules. A query driver's `on_shutdown()` now does nothing when no query
   opened its pool.
+- `PostgresqlResultBackend.shutdown()` closes the backend's connection pool,
+  which it used to leave open. A second call, or a call before `startup()`,
+  does nothing.
 - The warning for a NOTIFY payload that is not a message id holds at most
   the first 64 characters of it, followed by its length when it is longer,
   because any role that can connect can notify the channel. An integer
@@ -342,6 +386,19 @@ Upgrading from 0.4.x:
   first parameter: omitting it raises Python's own `TypeError`, and type
   checkers flag the call. `None` or an empty string, given directly or returned
   by a callable `dsn`, raises `TypeError` with an example of the expected value.
+
+### Security
+
+- The error `taskiq postgresql migrate`, `plan` and `check` print when a
+  driver fails on a connection string no longer holds its password. When the
+  driver cannot read the string at all, as asyncpg with an unencoded `/` in
+  the password or psqlpy with an unquoted space in a `key=value` password,
+  its message quoted part of the password: it is left out, and the error says
+  what to check instead. Any other driver message loses the connection string
+  and its password, as written and percent-decoded. Other users of the
+  machine can read a command line, so give `--dsn` a connection string
+  without the password, and the password through a password file or
+  `PGPASSWORD`, which asyncpg and psycopg read and psqlpy does not.
 
 Earlier versions are not described in this file; see the
 [GitHub releases page](https://github.com/z22092/taskiq-postgresql/releases) and

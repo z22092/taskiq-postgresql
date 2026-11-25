@@ -59,7 +59,8 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             serializer: serializer of the results; ``PickleSerializer`` when
                 ``None``.
             driver: driver to use.
-            run_migrations: create the table and its index on startup.
+            run_migrations: create the table and its index on startup; without
+                it, startup() only checks that they exist.
             connect_kwargs: additional arguments for nats `ConnectionPool` class.
 
         Raises:
@@ -91,6 +92,8 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             run_migrations=run_migrations,
             **connect_kwargs,
         )
+        # So that on_startup can describe the table and check it.
+        self.driver.component_kind = "result_backend"
 
     @property
     def dsn(self) -> str:
@@ -113,12 +116,24 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         Raises:
             TypeError: if the DSN callable returns ``None`` or an empty
                 string.
+            SchemaNotReadyError: with ``run_migrations=False``, if the table
+                or one of its columns is missing; see
+                ``QueryDriver.on_startup``.
         """
         self.driver.connection_string = self.dsn
+        # Again here, for a driver swapped in after the constructor.
+        self.driver.component_kind = "result_backend"
         await self.driver.on_startup()
 
     async def shutdown(self) -> None:
-        """Close the connection pool."""
+        """
+        Close the connection pool.
+
+        startup() opens it to read the catalog, so a backend that never reads
+        a result holds one too. Nothing to close before startup(), or after a
+        previous shutdown().
+        """
+        await self.driver.on_shutdown()
 
     async def set_result(
         self,

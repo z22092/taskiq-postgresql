@@ -279,7 +279,8 @@ class PostgresqlBroker(AsyncBroker):
             pool_kwargs (dict[str, Any] | None, optional): \
                 Additional arguments for asyncpg pool creation.
             run_migrations (bool, optional): \
-                Create the tables and indexes on startup. Defaults to False.
+                Create the tables and indexes on startup. Defaults to False: \
+                startup() then only checks that they exist.
             poll_interval (float, optional): \
                 Seconds between two sweeps of listen() for due messages, so \
                 a delayed message goes out at most this long after it is \
@@ -374,9 +375,10 @@ class PostgresqlBroker(AsyncBroker):
         self._configure_drivers()
 
     def _configure_drivers(self) -> None:
-        """Hand the recovery settings to the drivers."""
+        """Hand the recovery settings, and the kind of the table, to the drivers."""
         # Attributes, not constructor arguments: the bundled drivers pass every
         # keyword argument on to the connection.
+        self.driver.component_kind = "broker"
         self.driver.query_timeout = self.query_timeout
         self.listen_driver.health_check_interval = self.health_check_interval
         self.listen_driver.query_timeout = self.query_timeout
@@ -397,6 +399,9 @@ class PostgresqlBroker(AsyncBroker):
 
         Raises:
             TypeError: if the DSN callable returns ``None`` or an empty string.
+            SchemaNotReadyError: with ``run_migrations=False``, if the table
+                or one of its columns is missing; see
+                ``QueryDriver.on_startup``.
         """
         # Resolved once, so both drivers connect to the same server.
         dsn = self.dsn

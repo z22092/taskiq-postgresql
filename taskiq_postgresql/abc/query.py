@@ -148,7 +148,11 @@ class RelationsExistQuery(QueryBase):
     Query telling whether a table and every index it gets all exist.
 
     Given the columns and indexes ``AddColumnsQuery`` adds, it also tells
-    whether the table has them.
+    whether the table has them. A query driver no component owns
+    (``QueryDriver.component_kind`` is ``None``) cannot describe its table for
+    ``catalog_query``, so with ``run_migrations`` it runs this probe instead,
+    as every driver did before that comparison, and skips the migration lock
+    and the DDL when it answers true.
     """
 
     def relation_names(

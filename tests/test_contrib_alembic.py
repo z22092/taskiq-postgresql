@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import sys
+from importlib.metadata import EntryPoint
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence
 
@@ -44,12 +45,14 @@ from taskiq_postgresql.contrib.alembic import (
 )
 from taskiq_postgresql.migrations import (
     DEFAULT_LOCK_TIMEOUT,
+    MIGRATION_FORMATS_GROUP,
     FormatOptions,
     MigrationFormatOptionError,
     TableSchema,
     available_formats,
     load_format,
     migration_statements,
+    render_sql,
     table_schema,
 )
 from tests.helpers import run_script
@@ -65,6 +68,8 @@ from tests.test_contrib_sqlalchemy import (
     sqlalchemy_url,
     tables_in,
 )
+from tests.test_migration_formats import register
+from tests.test_migrations import BROKER_TABLE_0_4_SQL
 
 pytestmark = pytest.mark.alembic
 
@@ -552,6 +557,36 @@ def test_the_format_refuses_an_option_it_cannot_honour(
         alembic_format([table_schema("broker")], FormatOptions(extra=extra))
 
 
+def test_the_revision_starts_with_its_comments() -> None:
+    schemas = [table_schema("broker")]
+    plain = alembic_format(schemas, FormatOptions())
+
+    source = alembic_format(
+        schemas,
+        FormatOptions(),
+        comments=["plan for database app (search_path {public})", 'a """ name'],
+    )
+
+    # Comment lines, so a name read from a server is never code, and the
+    # docstring stays the module's first statement.
+    assert source == (
+        '# plan for database app (search_path {public})\n# a """ name\n' + plain
+    )
+    assert ast.get_docstring(ast.parse(source)) == ast.get_docstring(ast.parse(plain))
+    revision = revision_namespace(source)["revision"]
+    assert revision == revision_namespace(plain)["revision"]
+
+
+@pytest.mark.parametrize(
+    "comment",
+    ["a\nimport os", "a\rb", "a\0b"],
+    ids=["line-feed", "carriage-return", "nul"],
+)
+def test_the_revision_refuses_a_comment_a_line_break_would_end(comment: str) -> None:
+    with pytest.raises(ValueError, match="line break or a NUL"):
+        alembic_format([table_schema("broker")], FormatOptions(), comments=[comment])
+
+
 @pytest.mark.parametrize("sqlalchemy_driver", SQLALCHEMY_DRIVERS)
 @pytest.mark.parametrize("downgrade", ["none", "drop"])
 def test_the_generated_revision_runs_with_the_alembic_command(
@@ -667,6 +702,113 @@ def test_generate_exits_with_2_on_an_option_the_format_refuses(
     captured = capsys.readouterr()
     assert (code, captured.out) == (2, "")
     assert message in captured.err
+
+
+def plan_command(dsn: str, *options: str) -> list[str]:
+    """``taskiq postgresql plan`` of the default broker table, as a revision."""
+    return [
+        "plan",
+        "--component",
+        "broker",
+        "--dsn",
+        dsn,
+        "--format",
+        "alembic",
+        *(text for option in options for text in ("--option", option)),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("option", "message"),
+    [
+        ("author=me", "unknown option: author"),
+        ("downgrade=truncate", "downgrade must be 'none' or 'drop'"),
+    ],
+    ids=["unknown", "downgrade"],
+)
+def test_plan_exits_with_2_on_an_option_the_format_refuses_with_nothing_pending(
+    option: str,
+    message: str,
+    new_database: Callable[[], str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dsn = new_database()
+    asyncio.run(run_script(dsn, "asyncpg", render_sql([table_schema("broker")])))
+
+    code = PostgresqlCMD().exec(plan_command(dsn, option))
+
+    # A database with nothing to plan renders nothing, which must not let the
+    # option through: it is checked before the catalog is read.
+    captured = capsys.readouterr()
+    assert (code, captured.out) == (2, "")
+    assert message in captured.err
+
+
+def test_plan_drops_only_a_table_its_revision_creates(
+    new_database: Callable[[], str],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    dsn = new_database()
+    command = plan_command(dsn, "downgrade=drop")
+    table_0_4 = BROKER_TABLE_0_4_SQL.format(table="taskiq_messages")
+
+    # Every step pending: the revision creates the table, so it may drop it.
+    creating = PostgresqlCMD().exec(command)
+    created = capsys.readouterr()
+    asyncio.run(run_script(dsn, "asyncpg", table_0_4))
+    completing = PostgresqlCMD().exec(command)
+    completed = capsys.readouterr()
+
+    assert creating == 0, created.err
+    assert "DROP TABLE IF EXISTS taskiq_messages" in created.out
+    # Only step 2 pending: the downgrade of a revision that adds two columns
+    # would drop the table 0.4.x created, and every message in it.
+    assert (completing, completed.out) == (2, "")
+    assert "downgrade=drop" in completed.err
+    assert "taskiq_messages" in completed.err
+
+
+def test_plan_knows_the_alembic_format_under_another_name(
+    new_database: Callable[[], str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Another package can register this format under a name of its own: the
+    # format, not the name asked for, gets the header and the drop guard.
+    register(
+        monkeypatch,
+        EntryPoint(
+            name="revision",
+            value="taskiq_postgresql.contrib.alembic:alembic_format",
+            group=MIGRATION_FORMATS_GROUP,
+        ),
+    )
+    dsn = new_database()
+    command = [
+        "plan",
+        "--component",
+        "broker",
+        "--dsn",
+        dsn,
+        "--format",
+        "revision",
+        "--option",
+        "downgrade=drop",
+    ]
+
+    creating = PostgresqlCMD().exec(command)
+    created = capsys.readouterr()
+    table_0_4 = BROKER_TABLE_0_4_SQL.format(table="taskiq_messages")
+    asyncio.run(run_script(dsn, "asyncpg", table_0_4))
+    completing = PostgresqlCMD().exec(command)
+    completed = capsys.readouterr()
+
+    assert creating == 0, created.err
+    assert created.out.startswith("# plan for database ")
+    assert "DROP TABLE IF EXISTS taskiq_messages" in created.out
+    assert (completing, completed.out) == (2, "")
+    assert "downgrade=drop" in completed.err
+    assert "taskiq_messages" in completed.err
 
 
 def test_the_format_without_alembic_says_what_to_install(

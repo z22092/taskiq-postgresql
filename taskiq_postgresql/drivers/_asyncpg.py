@@ -15,6 +15,7 @@ from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.drivers._params import encode_params
+from taskiq_postgresql.drivers._schema import Session, start_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 logger = logging.getLogger(__name__)
@@ -206,42 +207,14 @@ class AsyncpgDriver(QueryDriver):
             )
 
     async def on_startup(self) -> None:
-        """Create the table and its indexes, see ``QueryDriver.on_startup``."""
-        if self.run_migrations:
-            async with (
-                self,
-                self.connection() as connection,
-                connection.transaction(),
-            ):
-                if await connection.fetchval(
-                    self.relations_exist_query.make_query(
-                        self.index_columns,
-                        added_columns=self.added_columns,
-                        added_indexes=self.added_indexes,
-                    ),
-                    *self.relations_exist_query.params(
-                        self.index_columns,
-                        added_columns=self.added_columns,
-                        added_indexes=self.added_indexes,
-                    ),
-                ):
-                    return
-                await connection.execute(
-                    self.migration_lock_query.make_query(),
-                    *self.migration_lock_query.params(),
-                )
-                await connection.execute(self.create_table_query.make_query())
-                if self.index_columns is not None:
-                    await connection.execute(
-                        self.create_index_query.make_query(self.index_columns),
-                    )
-                if self.added_columns or self.added_indexes:
-                    await connection.execute(
-                        self.add_columns_query.make_query(
-                            self.added_columns,
-                            self.added_indexes,
-                        ),
-                    )
+        """Check the table, or migrate it; see ``QueryDriver.on_startup``."""
+        await start_table(self, self._session)
+
+    @asynccontextmanager
+    async def _session(self) -> AsyncGenerator[Session, None]:
+        """One pooled connection in one transaction, for ``start_table``."""
+        async with self, self.connection() as connection, connection.transaction():
+            yield Session(fetch_value=connection.fetchval, execute=connection.execute)
 
     async def on_shutdown(self) -> None:
         """

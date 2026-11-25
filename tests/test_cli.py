@@ -10,8 +10,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import random
-import string
 import subprocess
 import sys
 from importlib.metadata import EntryPoint, entry_points, version
@@ -32,14 +30,13 @@ from taskiq_postgresql.migrations import (
     table_schema,
 )
 from tests.helpers import (
+    UNUSED_DSN,
     closed_local_port,
-    create_database,
-    drop_database,
-    in_database,
+    importable_modules,
+    new_database,
     with_netloc,
 )
 
-UNUSED_DSN = "postgresql://localhost/unused"
 TIMEOUT = 60
 DRIVER_MODULES = ("asyncpg", "psycopg", "psycopg_pool", "psqlpy")
 TABLES = ("cli_messages", "cli_results", "cli_schedules")
@@ -184,10 +181,7 @@ def app_dir(tmp_path: Path) -> Path:
 @pytest.fixture
 def scratch_dsn(postgresql_dsn: str) -> Iterator[str]:
     """DSN of a database created empty for one test and dropped after it."""
-    name = "cli_" + "".join(random.choices(string.ascii_lowercase, k=10))
-    asyncio.run(create_database(postgresql_dsn, name))
-    yield in_database(postgresql_dsn, name)
-    asyncio.run(drop_database(postgresql_dsn, name))
+    yield from new_database(postgresql_dsn)
 
 
 @pytest.fixture
@@ -195,17 +189,9 @@ def app_module(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> Iterator[str]:
-    """
-    Name of a module holding ``APP``, importable through ``--app-dir``.
-
-    The name is unique, so in-process tests never reuse another test's import.
-    """
-    name = "tkq_app_" + "".join(random.choices(string.ascii_lowercase, k=10))
-    (tmp_path / f"{name}.py").write_text(APP, encoding="utf-8")
-    # The command adds --app-dir to sys.path, as taskiq worker does.
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    yield name
-    sys.modules.pop(name, None)
+    """Name of a module holding ``APP``, importable through ``--app-dir``."""
+    with importable_modules(tmp_path, monkeypatch) as write:
+        yield write(APP)
 
 
 def existing_tables(dsn: str) -> set[str]:
