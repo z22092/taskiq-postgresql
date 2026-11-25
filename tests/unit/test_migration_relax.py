@@ -329,3 +329,89 @@ def test_the_startup_check_refuses_naming_the_step_and_the_column() -> None:
     assert "step 2 has not run (columns still NOT NULL: note)" in message
     assert "step 1" not in message
     assert HOW_TO_MIGRATE in message
+
+
+# --- a nullable column is a name a generated file will carry --------------------
+
+# The names go into a docstring and a comment line of a generated Python file,
+# so none of them may hold a character that ends either.
+HOSTILE_NAMES = [
+    pytest.param('x"""', id="triple-quote"),
+    pytest.param("x\nimport os", id="line-break"),
+    pytest.param("x\\", id="backslash"),
+    pytest.param("x y", id="space"),
+]
+
+
+def relaxing_step_of(schema: TableSchema, name: str) -> MigrationStep:
+    """The step of ``schema`` that relaxes a column, relaxing ``name`` instead."""
+    return dataclasses.replace(
+        schema.steps[1],
+        objects=StepObjects(
+            creates_table=False,
+            columns=(),
+            indexes=(),
+            nullable_columns=(name,),
+        ),
+    )
+
+
+@pytest.mark.parametrize("name", HOSTILE_NAMES)
+def test_a_description_refuses_a_nullable_column_a_file_cannot_hold(name: str) -> None:
+    schema = relaxing_schema()
+    # The name is made a real nullable column, so only its characters are wrong.
+    note = next(column for column in schema.columns if column.name == RELAXED)
+    hostile = dataclasses.replace(note, name=name)
+    step = relaxing_step_of(schema, name)
+
+    with pytest.raises(ValueError, match="not a plain SQL identifier") as raised:
+        dataclasses.replace(
+            schema,
+            columns=(*schema.columns, hostile),
+            steps=(schema.steps[0], step),
+        )
+
+    assert "step 2" in str(raised.value)
+
+
+@pytest.mark.parametrize("name", HOSTILE_NAMES)
+def test_a_rendered_step_refuses_a_nullable_column_a_file_cannot_hold(
+    name: str,
+) -> None:
+    with pytest.raises(ValueError, match="not a plain SQL identifier") as raised:
+        RenderedStep(
+            table=TABLE,
+            kind="result_backend",
+            number=2,
+            comments=("a comment",),
+            statements=(STEP_2_SQL,),
+            nullable_columns=(name,),
+        )
+
+    assert "step 2" in str(raised.value)
+
+
+# --- the catalog is read strictly ------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "not_null",
+    [
+        pytest.param("note", id="string"),
+        pytest.param({"note": True}, id="dict"),
+        pytest.param(["note", 1], id="list-with-an-int"),
+        pytest.param(7, id="int"),
+    ],
+)
+def test_a_catalog_with_a_malformed_not_null_is_refused(not_null: object) -> None:
+    # A string would read as a set of characters and a dict as its keys.
+    table = {
+        "name": TABLE,
+        "relkind": "r",
+        "columns": [["id", "integer"]],
+        "not_null": not_null,
+        "indexes": [],
+    }
+
+    with pytest.raises(ValueError, match="not_null"):
+        CatalogState.from_json(json.dumps({"tables": [table]}))
