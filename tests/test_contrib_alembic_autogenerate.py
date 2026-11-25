@@ -44,7 +44,7 @@ from taskiq_postgresql.migrations import (
     plan_migration,
     table_schema,
 )
-from tests.helpers import fetch_on_server, run_script
+from tests.helpers import column_is_not_null, run_script, script_of
 from tests.relax_schema import RELAXED, relaxing_schema
 from tests.test_contrib_alembic import (
     SQLALCHEMY_DRIVERS,
@@ -545,66 +545,34 @@ def test_configured_table_names_get_their_steps(
 # --- a step that relaxes NOT NULL ---------------------------------------------
 
 
-def alter_column_ops(upgrade_ops: ops.UpgradeOps) -> list[ops.AlterColumnOp]:
-    """Every ``AlterColumnOp`` of a revision, wherever autogenerate nested it."""
-    found: list[ops.AlterColumnOp] = []
-    for operation in upgrade_ops.ops:
-        inner = (
-            operation.ops if isinstance(operation, ops.ModifyTableOps) else [operation]
-        )
-        found.extend(item for item in inner if isinstance(item, ops.AlterColumnOp))
-    return found
-
-
 def test_autogenerate_leaves_only_the_step_for_a_column_it_relaxes(
     driver: str,
     new_database: Callable[[], str],
 ) -> None:
     dsn = new_database()
     schema = relaxing_schema()
-    asyncio.run(
-        run_script(
-            dsn,
-            driver,
-            "".join(f"{statement};\n" for statement in schema.steps[0].statements),
-        ),
-    )
+    prepare(dsn, driver, "step-1", schema)
     metadata = taskiq_metadata(schema)
 
     # The metadata has the column nullable and the database has it NOT NULL:
     # without the step covering it, Alembic would propose an alter_column too.
     script = produce(dsn, metadata)
 
-    assert alter_column_ops(script.upgrade_ops) == []
     assert script.upgrade_ops.as_diffs() == [(STEP, schema.name, 2)]
     # Putting NOT NULL back would refuse the first row that holds a NULL.
     downgrade = render_python_code(script.downgrade_ops)
     assert "SET NOT NULL" not in downgrade
     assert "alter_column" not in downgrade
 
-    asyncio.run(
-        run_script(
-            dsn,
-            driver,
-            "".join(
-                f"{statement};\n"
-                for operation in script.upgrade_ops.ops
-                for statement in operation.statements
-            ),
-        ),
-    )
+    statements = [
+        statement
+        for operation in script.upgrade_ops.ops
+        for statement in operation.statements
+    ]
+    asyncio.run(run_script(dsn, driver, script_of(statements)))
 
     assert produce(dsn, metadata).upgrade_ops.as_diffs() == []
-    (row,) = asyncio.run(
-        fetch_on_server(
-            dsn,
-            "SELECT attnotnull FROM pg_attribute"
-            " WHERE attrelid = to_regclass($1) AND attname = $2",
-            schema.name,
-            RELAXED,
-        ),
-    )
-    assert row[0] is False
+    assert not asyncio.run(column_is_not_null(dsn, schema.name, RELAXED))
 
 
 # --- upgrade_taskiq_tables with through ----------------------------------------

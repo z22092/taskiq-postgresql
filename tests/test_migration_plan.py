@@ -39,7 +39,14 @@ from taskiq_postgresql.migrations import (
     render_sql,
     table_schema,
 )
-from tests.helpers import create_database, drop_database, in_database, run_script
+from tests.helpers import (
+    column_is_not_null,
+    create_database,
+    drop_database,
+    in_database,
+    run_script,
+    script_of,
+)
 from tests.relax_schema import relaxing_schema
 from tests.test_migration_script import SHAPE_IDS, SHAPES, build_component
 from tests.test_migrations import BROKER_TABLE_0_4_SQL, close_component
@@ -649,11 +656,7 @@ async def test_a_step_that_relaxes_not_null_is_pending_until_it_has_run(
 ) -> None:
     schema = relaxing_schema()
     first, second = schema.steps
-    await run_script(
-        empty_dsn,
-        driver,
-        "".join(f"{statement};\n" for statement in first.statements),
-    )
+    await run_script(empty_dsn, driver, script_of(first.statements))
 
     before = await read_catalog(empty_dsn, driver, [schema])
     plan = plan_migration([schema], before)
@@ -667,35 +670,17 @@ async def test_a_step_that_relaxes_not_null_is_pending_until_it_has_run(
     assert (pending.missing_columns, pending.missing_indexes) == ((), ())
     assert plan.problems == ()
 
-    await run_script(
-        empty_dsn,
-        driver,
-        "".join(f"{statement};\n" for statement in plan.statements()),
-    )
-    inspector = await asyncpg.connect(empty_dsn)
-    try:
-        # Read apart from the engine's own query, so the check does not trust
-        # what it checks.
-        nullable = dict(
-            await inspector.fetch(
-                "SELECT column_name, is_nullable FROM information_schema.columns"
-                " WHERE table_schema = current_schema() AND table_name = $1",
-                schema.name,
-            ),
-        )
-    finally:
-        await inspector.close()
+    await run_script(empty_dsn, driver, script_of(plan.statements()))
     after = await read_catalog(empty_dsn, driver, [schema])
 
-    assert nullable == {"id": "NO", "note": "YES"}
+    # Read apart from the engine's own query, so the check does not trust what
+    # it checks.
+    assert not await column_is_not_null(empty_dsn, schema.name, "note")
+    assert await column_is_not_null(empty_dsn, schema.name, "id")
     assert after.tables[schema.name].not_null == {"id"}
     assert plan_migration([schema], after) == MigrationPlan((), (), ())
     # The engine only runs it while pending; running it again is harmless too.
-    await run_script(
-        empty_dsn,
-        driver,
-        "".join(f"{statement};\n" for statement in second.statements),
-    )
+    await run_script(empty_dsn, driver, script_of(second.statements))
 
 
 @pytest.mark.anyio
