@@ -39,7 +39,15 @@ from taskiq_postgresql.migrations import (
     render_sql,
     table_schema,
 )
-from tests.helpers import create_database, drop_database, in_database, run_script
+from tests.helpers import (
+    column_is_not_null,
+    create_database,
+    drop_database,
+    in_database,
+    run_script,
+    script_of,
+)
+from tests.relax_schema import relaxing_schema
 from tests.test_migration_script import SHAPE_IDS, SHAPES, build_component
 from tests.test_migrations import BROKER_TABLE_0_4_SQL, close_component
 
@@ -639,6 +647,40 @@ async def test_the_catalog_follows_the_steps_through_every_driver(
     ]
     assert all(plan.problems == () for plan in seen)
     assert seen[-1].is_current
+
+
+@pytest.mark.anyio
+async def test_a_step_that_relaxes_not_null_is_pending_until_it_has_run(
+    driver: str,
+    empty_dsn: str,
+) -> None:
+    schema = relaxing_schema()
+    first, second = schema.steps
+    await run_script(empty_dsn, driver, script_of(first.statements))
+
+    before = await read_catalog(empty_dsn, driver, [schema])
+    plan = plan_migration([schema], before)
+
+    # The catalog reports the constraint the first step wrote, and the key's.
+    assert before.tables[schema.name].not_null == {"id", "note"}
+    (pending,) = plan.pending
+    assert pending.step == second
+    assert pending.not_null_columns == ("note",)
+    assert pending.severity == "required"
+    assert (pending.missing_columns, pending.missing_indexes) == ((), ())
+    assert plan.problems == ()
+
+    await run_script(empty_dsn, driver, script_of(plan.statements()))
+    after = await read_catalog(empty_dsn, driver, [schema])
+
+    # Read apart from the engine's own query, so the check does not trust what
+    # it checks.
+    assert not await column_is_not_null(empty_dsn, schema.name, "note")
+    assert await column_is_not_null(empty_dsn, schema.name, "id")
+    assert after.tables[schema.name].not_null == {"id"}
+    assert plan_migration([schema], after) == MigrationPlan((), (), ())
+    # The engine only runs it while pending; running it again is harmless too.
+    await run_script(empty_dsn, driver, script_of(second.statements))
 
 
 @pytest.mark.anyio

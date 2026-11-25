@@ -6,7 +6,14 @@ import socket
 import string
 import subprocess
 import sys
-from collections.abc import Awaitable, Callable, Generator, Iterator, Sequence
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Generator,
+    Iterable,
+    Iterator,
+    Sequence,
+)
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Optional, TypeVar, Union
@@ -232,6 +239,23 @@ async def fetch_on_server(dsn: str, query: str, *args: Any) -> list[asyncpg.Reco
         return await connection.fetch(query, *args)
     finally:
         await connection.close()
+
+
+async def column_is_not_null(dsn: str, table: str, column: str) -> bool:
+    """Tell whether ``column`` of ``table`` is ``NOT NULL`` in the database ``dsn``."""
+    (row,) = await fetch_on_server(
+        dsn,
+        "SELECT attnotnull FROM pg_attribute"
+        " WHERE attrelid = to_regclass($1) AND attname = $2",
+        table,
+        column,
+    )
+    return row[0]
+
+
+def script_of(statements: Iterable[str]) -> str:
+    """Return ``statements`` as a script: each one ended by ``;`` and a newline."""
+    return "".join(f"{statement};\n" for statement in statements)
 
 
 async def _execute_on_server(dsn: str, statement: str) -> None:

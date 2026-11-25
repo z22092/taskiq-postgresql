@@ -36,6 +36,7 @@ import hashlib
 import logging
 import re
 from collections.abc import Callable, Sequence
+from functools import partial
 from typing import TYPE_CHECKING, Final, Optional, Union
 
 try:
@@ -71,6 +72,7 @@ from taskiq_postgresql.migrations import (
     plan_migration,
     render_steps,
     scoped_lock_timeout,
+    statements_effect,
     step_statements,
 )
 
@@ -121,7 +123,7 @@ _REVISION: Final = '''\
 Revision ID: {revision}
 Revises:{revises}
 Written by `taskiq postgresql generate --format alembic` (taskiq-postgresql
-{version}). Each statement only adds what is missing, so upgrade() is safe on
+{version}). Each statement {effect}, so upgrade() is safe on
 a database that already has the tables. The SQL is written out, so the
 revision never imports taskiq-postgresql.
 """
@@ -261,7 +263,7 @@ class TaskiqStepOp(MigrateOperation):
 
     def reverse(self) -> TaskiqStepNoopOp:
         """
-        Return the downgrade: nothing, because every step is additive.
+        Return the downgrade: nothing, because no step removes or renames.
 
         Returns:
             The operation that renders the comment.
@@ -282,8 +284,9 @@ class TaskiqStepNoopOp(MigrateOperation):
     """
     The downgrade of a ``TaskiqStepOp``: a comment, and no SQL.
 
-    A step only adds columns and indexes, which the previous release ignores,
-    and dropping them would lose data.
+    A step adds columns and indexes, which the previous release ignores, and
+    dropping them would lose data; or it makes a column accept ``NULL``, and
+    putting ``NOT NULL`` back would fail once a row holds one.
 
     Args:
         upgrade: The operation it undoes.
@@ -318,7 +321,7 @@ def _render_step(autogen_context: AutogenContext, op: TaskiqStepOp) -> list[str]
 
 @renderers.dispatch_for(TaskiqStepNoopOp)
 def _render_noop(autogen_context: AutogenContext, op: TaskiqStepNoopOp) -> list[str]:
-    return _noop_lines(op.upgrade)
+    return _noop_lines(op.upgrade.rendered)
 
 
 def compare_taskiq_steps(
@@ -465,7 +468,8 @@ def upgrade_taskiq_tables(
     transaction, so the advisory lock ``run_migrations=True`` takes lasts
     until Alembic commits. A released step never changes, so the revision
     runs the same SQL with every later release of the package. Every
-    statement only adds what is missing. With ``alembic upgrade --sql`` the
+    statement only adds what is missing, or relaxes a ``NOT NULL`` that is
+    still there. With ``alembic upgrade --sql`` the
     statements are printed instead.
 
     The statements bound their own lock waits: ``lock_timeout`` is set
@@ -594,6 +598,7 @@ def alembic_format(
         revision=revision,
         revises="" if down_revision is None else f" {down_revision}",
         version=package_version(),
+        effect=statements_effect([step for schema in schemas for step in schema.steps]),
         revision_literal=f'"{revision}"',
         down_revision_literal="None" if down_revision is None else f'"{down_revision}"',
         upgrade=_body([line for step in steps for line in _step_lines(step, "op.")]),
@@ -644,18 +649,18 @@ def _drop_covered(upgrade_ops: ops.UpgradeOps, pending: Sequence[PendingStep]) -
         for item in pending
         for column in item.step.objects.columns
     }
+    relaxed = {
+        (_name(item.table), column)
+        for item in pending
+        for column in item.step.objects.nullable_columns
+    }
     indexes = {
         (_name(item.table), _name(index.name))
         for item in pending
         for index in item.step.objects.indexes
     }
 
-    def covered(operation: MigrateOperation) -> bool:
-        if isinstance(operation, ops.AddColumnOp):
-            return (operation.table_name, operation.column.name) in columns
-        if isinstance(operation, ops.CreateIndexOp):
-            return (operation.table_name, operation.index_name) in indexes
-        return False
+    covered = partial(_is_covered, columns=columns, indexes=indexes, relaxed=relaxed)
 
     kept: list[MigrateOperation] = []
     for operation in upgrade_ops.ops:
@@ -672,6 +677,42 @@ def _drop_covered(upgrade_ops: ops.UpgradeOps, pending: Sequence[PendingStep]) -
             continue
         kept.append(operation)
     upgrade_ops.ops[:] = kept
+
+
+def _is_covered(
+    operation: MigrateOperation,
+    *,
+    columns: set[tuple[str, str]],
+    indexes: set[tuple[str, str]],
+    relaxed: set[tuple[str, str]],
+) -> bool:
+    if isinstance(operation, ops.AddColumnOp):
+        return (operation.table_name, operation.column.name) in columns
+    if isinstance(operation, ops.CreateIndexOp):
+        return (operation.table_name, operation.index_name) in indexes
+    if isinstance(operation, ops.AlterColumnOp):
+        return _is_relaxation(operation, relaxed)
+    return False
+
+
+def _is_relaxation(
+    operation: ops.AlterColumnOp,
+    relaxed: set[tuple[str, str]],
+) -> bool:
+    # Alembic puts every change it finds on one column into one operation: a
+    # type change beside the nullability one must stay for the person to see.
+    # The defaults are what an operation that does not change that is left
+    # with (False for the two that accept None as a value).
+    return (
+        (operation.table_name, operation.column_name) in relaxed
+        and operation.modify_nullable is True
+        and operation.modify_type is None
+        and operation.modify_name is None
+        and operation.modify_server_default is False
+        and operation.modify_comment is False
+        # A comparator of the user's own may add any modify_* key to kw.
+        and not any(key.startswith("modify_") for key in operation.kw)
+    )
 
 
 def _require_transaction(op: Union[Operations, ModuleType]) -> None:
@@ -708,10 +749,16 @@ def _step_lines(step: RenderedStep, prefix: str) -> list[str]:
     ]
 
 
-def _noop_lines(step: Union[TaskiqStepOp, RenderedStep]) -> list[str]:
+def _noop_lines(step: RenderedStep) -> list[str]:
     title = f"step {step.number} of {step.table}"
+    if step.nullable_columns:
+        # Putting NOT NULL back would fail on the first row that holds a NULL.
+        columns = ", ".join(step.nullable_columns)
+        said = f"makes {columns} nullable: it stays, and NOT NULL is not put back."
+    else:
+        said = "is additive: it stays."
     # A body of comments alone is not valid Python: pass makes it a statement.
-    return [f"# taskiq-postgresql {title} is additive: it stays.", "pass"]
+    return [f"# taskiq-postgresql {title} {said}", "pass"]
 
 
 def _execute_line(prefix: str, statement: str) -> str:

@@ -582,23 +582,24 @@ psql "$POSTGRESQL_URL" -v ON_ERROR_STOP=1 -f taskiq_pending.sql
 The script is the one `generate` writes, with the same lock timeout and
 advisory lock and the same options (`--lock-timeout`, `--no-transaction`,
 `--no-lock`, `--format`), for the pending steps only. A comment after the
-version line names the database and `search_path` the plan was computed for:
-it is right for that database at that moment, and each statement still only
-adds what is missing. The locks each step takes (`note:` lines) and what no
-step fixes (`problem:` lines), such as an invalid index or an index name that
-another table took, go to standard error, each with what to do.
-`--format alembic` writes a revision file with only the pending steps, and
-`--format django` a Django migration, whose first line is the same comment. A
-plan
-is for one database: when the components use different connection strings,
-pass `--dsn`, or plan one table at a time with `--component`.
+version line names the database and `search_path` the plan was computed for: it
+is right for that database at that moment, and each statement still only adds
+what is missing, or relaxes a `NOT NULL` that is still there. The locks each
+step takes (`note:` lines) and what no step fixes (`problem:` lines), such as
+an invalid index or an index name that another table took, go to standard
+error, each with what to do. `--format alembic` writes a revision file with
+only the pending steps, and `--format django` a Django migration, whose first
+line is the same comment. A plan is for one database: when the components use
+different connection strings, pass `--dsn`, or plan one table at a time with
+`--component`.
 
 `check` reads the same catalog and changes nothing. It reports each pending
-step and each problem on standard error, and `--json` also prints the report
-on standard output, as one object with the keys `current`, `pending` (each
-with `table`, `kind`, `step`, `severity` and what is `missing`: `table`,
-`columns`, `indexes`), `problems` (each with `table`, `code`, `severity` and
-`detail`) and `advisory_only`:
+step and each problem on standard error, and `--json` also prints the report on
+standard output, as one object with the keys `current`, `pending` (each with
+`table`, `kind`, `step`, `severity`, what is `missing`: `table`, `columns`,
+`indexes`, and the `not_null_columns` the step still has to make nullable),
+`problems` (each with `table`, `code`, `severity` and `detail`) and
+`advisory_only`:
 
 ```bash
 taskiq postgresql check app:scheduler --json
@@ -633,7 +634,7 @@ The exit status says what to do:
 | 0 | The plan is printed, or no step is pending. | Up to date; a missing index alone only warns. |
 | 1 | An error: the connection, the import of the application, a path without a component. | The same. |
 | 2 | A usage error. | The same. |
-| 3 | Not used. | A table or a column is missing: a step is pending. |
+| 3 | Not used. | A table or a column is missing, or a column is still `NOT NULL`: a step is pending. |
 | 4 | A problem no step fixes needs a person; the plan, if any, is still printed. | The same; it wins over 3. |
 
 So a deploy can check the database before it starts the workers, with the
@@ -683,8 +684,9 @@ taskiq postgresql generate app:scheduler --no-transaction > db/migration/V2__tas
 ```
 
 A Flyway file holds the SQL of the release that generated it, and the script
-only adds what is missing, so when an upgrade changes the tables (the
-changelog says so), add a new migration with the new script.
+only adds what is missing or relaxes a `NOT NULL` that is still there, so when
+an upgrade changes the tables (the changelog says so), add a new migration with
+the new script.
 
 For Alembic and Django, install their extra instead of copying the script.
 [Alembic](#alembic) shows how autogenerate writes the steps a database lacks,
@@ -1023,21 +1025,21 @@ Then migrate it with your other apps, or on its own:
 python manage.py migrate taskiq_postgresql
 ```
 
-The app, labelled `taskiq_postgresql`, has no models, only migrations: one
-per migration step. `0001` runs step 1 of every table (the table and its
-indexes) and `0002` step 2 (the broker table's `channel` and `not_before`,
-which also completes a broker table 0.4.x created); a release that adds a step
-adds a migration. Each migration runs its statements one at a time, in the
-migration's transaction. It first keeps the transaction's own `lock_timeout`,
-then sets `SET LOCAL lock_timeout = '10s'`, so that a statement that waits
-longer for a lock fails and rolls the migration back instead of stalling the
-broker. It then takes the advisory lock `run_migrations=True` takes, so
-workers that start meanwhile wait for the migration, and runs statements that
-only add what is missing; its last statement gives the transaction back the
-`lock_timeout` it kept, so the other migrations of the same transaction wait
-for locks as before. `python manage.py sqlmigrate taskiq_postgresql 0001`
-shows the SQL. Once the tables exist, the workers can run with
-`run_migrations=False`.
+The app, labelled `taskiq_postgresql`, has no models, only migrations: one per
+migration step. `0001` runs step 1 of every table (the table and its indexes)
+and `0002` step 2 (the broker table's `channel` and `not_before`, which also
+completes a broker table 0.4.x created); a release that adds a step adds a
+migration. Each migration runs its statements one at a time, in the migration's
+transaction. It first keeps the transaction's own `lock_timeout`, then sets
+`SET LOCAL lock_timeout = '10s'`, so that a statement that waits longer for a
+lock fails and rolls the migration back instead of stalling the broker. It then
+takes the advisory lock `run_migrations=True` takes, so workers that start
+meanwhile wait for the migration, and runs statements that only add what is
+missing or relax a `NOT NULL` that is still there; its last statement gives the
+transaction back the `lock_timeout` it kept, so the other migrations of the
+same transaction wait for locks as before. `python manage.py sqlmigrate
+taskiq_postgresql 0001` shows the SQL. Once the tables exist, the workers can
+run with `run_migrations=False`.
 
 An entry can also be a dict that describes a table by kind, which needs no
 import of your application: `kind` is `broker`, `result_backend` or

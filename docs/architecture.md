@@ -120,13 +120,14 @@ payload is the integer id its own INSERT returned.
 Created by `on_startup` only when the component gets `run_migrations=True`,
 with `CREATE TABLE IF NOT EXISTS` and hash indexes. The broker's table then
 gets its `channel` and `not_before` columns and a btree index on them from
-`AddColumnsQuery` (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, then
-`CREATE INDEX IF NOT EXISTS`), so a table created by 0.4.x ends up with the
-same columns as a new one. The DDL is additive only: no column is ever
-changed or dropped. `tests/unit/test_components.py::test_default_schema` pins
-the `CREATE TABLE` and hash index DDL below, and
-`tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql`
-the added columns and their index.
+`AddColumnsQuery` (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, then `CREATE
+INDEX IF NOT EXISTS`), so a table created by 0.4.x ends up with the same
+columns as a new one. The DDL is additive, or relaxes `NOT NULL`
+(`DropNotNullQuery`; [ADR 0011](adr/0011-steps-may-relax-not-null.md)): nothing
+is removed or renamed. `tests/unit/test_components.py::test_default_schema`
+pins the `CREATE TABLE` and hash index DDL below, and
+`tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql` the
+added columns and their index.
 
 The three drivers' `on_startup` is one flow, `start_table` in
 `drivers/_schema.py`; each driver lends it only its primitives, a `Session`
@@ -204,24 +205,32 @@ since it can quote any part of the string.
 steps are the statements the drivers build for `on_startup` and that the
 script builds the catalog `on_startup` builds.
 
-The same module compares a database with that description. Each step also
-names what it creates (`MigrationStep.objects`, a `StepObjects`: whether it
-creates the table, its columns, its indexes). `catalog_query` is one read-only
-`SELECT` with the names written in as literals, so every driver runs it as it
-is; it resolves each table and index name with `to_regclass` and returns, as
-one JSON text value, the relation's kind and columns (`pg_attribute`, with
+The same module compares a database with that description. Each step also names
+what it creates (`MigrationStep.objects`, a `StepObjects`: whether it creates
+the table, its columns, its indexes). `catalog_query` is one read-only `SELECT`
+with the names written in as literals, so every driver runs it as it is; it
+resolves each table and index name with `to_regclass` and returns, as one JSON
+text value, the relation's kind and columns (`pg_attribute`, with
 `format_type`) and, per index name, whether it is an index of that table,
-`indisvalid`, its access method, columns, uniqueness and predicate.
+`indisvalid`, its access method, columns, uniqueness and predicate, and, beside
+the columns, which of them are `NOT NULL` (`attnotnull`).
 `CatalogState.from_json` reads it, and `plan_migration` compares it with the
 steps: a step whose table, column or index is absent is pending (`required`
 when the table or a column is missing, `advisory` when only an index is), and
 since every statement is `IF NOT EXISTS`, running the whole step again
-completes it. What `IF NOT EXISTS` would skip becomes a `SchemaProblem`
-instead, never DDL: a name another relation took, an index on another table,
-an invalid index, an index of another shape, a column of another type, or a
-missing column that only a step's `CREATE TABLE` creates, which skips a table
-that exists. A released step never changes; `tests/golden/migration_steps.sql`
-pins them.
+completes it. A step that makes columns nullable names them in
+`StepObjects.nullable_columns`; it is pending, and `required`, while one of
+them exists and is still `NOT NULL` (`PendingStep.not_null_columns`). A column
+the table lacks is reported by the earlier step that adds it, and the step that
+relaxes it is pending in the same run; when `CREATE TABLE` created the column,
+the report is a `missing_column` problem instead. `TableSchema` refuses a step
+that makes nullable a column its final description lacks or has `NOT NULL`, or
+that no earlier step adds. What `IF NOT EXISTS` would skip becomes a
+`SchemaProblem` instead, never DDL: a name another relation took, an index on
+another table, an invalid index, an index of another shape, a column of another
+type, or a missing column that only a step's `CREATE TABLE` creates, which
+skips a table that exists. A released step never changes;
+`tests/golden/migration_steps.sql` pins them.
 
 `contrib/alembic.py` puts that engine into Alembic's autogenerate. Importing it
 registers `compare_taskiq_steps` as a schema comparator that runs after
@@ -231,10 +240,15 @@ Alembic's own. It finds the descriptions `taskiq_metadata` and
 removes the `create_table`, `add_column` and `create_index` operations Alembic
 proposed for objects of the pending steps, keeps every other operation (a type
 change still shows), and adds one `TaskiqStepOp` per pending step; problems
-become warnings in the log. A `TaskiqStepOp` renders as `op.execute(...)`
-calls holding the step's SQL, so a revision runs the statements
-`run_migrations=True` runs without importing the package; its downgrade does
-nothing, the DDL being additive. Unless configured to `0`, each step keeps the
+become warnings in the log. A `TaskiqStepOp` renders as `op.execute(...)` calls
+holding the step's SQL, so a revision runs the statements `run_migrations=True`
+runs without importing the package; its downgrade does nothing, since no step
+removes or renames anything and putting `NOT NULL` back would fail on a row
+that holds a `NULL` (`downgrade=drop` drops the tables in `generate`, and
+`plan` refuses it when a step is pending on an existing table; nothing puts
+`NOT NULL` back). When autogenerate also proposes an `alter_column` whose only
+change makes a column of a pending step nullable, it removes that one too: the
+step runs the statement. Unless configured to `0`, each step keeps the
 transaction's `lock_timeout`, sets its own (`SET LOCAL`) before it takes the
 same advisory lock, and ends by giving Alembic's transaction back the kept
 value, so the user's own migrations in that transaction keep theirs; the step

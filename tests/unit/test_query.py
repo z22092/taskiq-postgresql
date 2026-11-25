@@ -16,6 +16,7 @@ from taskiq_postgresql.abc.query import (
     CreateTableQuery,
     DeleteByDateQuery,
     DeleteQuery,
+    DropNotNullQuery,
     InsertOrUpdateQuery,
     InsertQuery,
     NotBeforeColumn,
@@ -236,3 +237,9 @@ def test_values_never_reach_the_sql_text() -> None:
     for sql in statements:
         assert "$1" in sql, sql
         assert "'" not in sql, sql
+
+
+def test_drop_not_null_writes_one_statement_per_column() -> None:
+    query = DropNotNullQuery("results").make_query("result")
+
+    assert query == "ALTER TABLE results ALTER COLUMN result DROP NOT NULL;"
