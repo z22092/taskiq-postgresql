@@ -23,6 +23,7 @@ from taskiq_postgresql.migrations import (
     TableSchema,
     package_version,
     render_steps,
+    statements_effect,
 )
 
 __all__ = ["django_format"]
@@ -41,7 +42,7 @@ _MIGRATION: Final = '''\
 """Create or complete the taskiq-postgresql tables.
 
 Written by `taskiq postgresql generate --format django` (taskiq-postgresql
-{version}). Each statement only adds what is missing, so the migration is safe
+{version}). Each statement {effect}, so the migration is safe
 on a database that already has the tables, and reversing it runs nothing: the
 tables stay. The SQL is written out, so the migration never imports
 taskiq-postgresql.
@@ -113,6 +114,7 @@ def django_format(
     dependencies = _dependencies(options.extra.get("dependencies"))
     return "".join(f"# {comment}\n" for comment in comments) + _MIGRATION.format(
         version=package_version(),
+        effect=statements_effect([step for schema in schemas for step in schema.steps]),
         dependencies=_block([f"({app!r}, {name!r})," for app, name in dependencies]),
         operations=_block([line for step in steps for line in _operation(step)]),
     )

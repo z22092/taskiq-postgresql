@@ -144,7 +144,7 @@ class AddColumnsQuery(QueryBase):
 
 
 class DropNotNullQuery(QueryBase):
-    """Query making a column of a table that may already exist accept ``NULL``."""
+    """Query making an existing column accept ``NULL``; a no-op when it already does."""
 
     def make_query(self, column: str) -> str:
         """Return the query as a string: one statement, without parameters."""

@@ -54,8 +54,8 @@ _PLAN_EXIT_STATUS = (
 )
 _CHECK_EXIT_STATUS = (
     "Exit status: 0 up to date, or only an index is missing; 1 error or no "
-    "component found; 2 usage error; 3 a table or column is missing; 4 a "
-    "problem no step fixes needs a person."
+    "component found; 2 usage error; 3 a table or column is missing, or a column "
+    "is still NOT NULL; 4 a problem no step fixes needs a person."
 )
 _BEHIND: Final = 3
 _NEEDS_A_PERSON: Final = 4
@@ -85,8 +85,9 @@ class PostgresqlCMD(TaskiqCMD):
         Returns:
             The exit status: 0 on success, 1 on an error or when a target
             holds no component, 2 on a usage error. ``check`` returns 3 when
-            a table or a column is missing, and ``plan`` and ``check`` return 4
-            when a problem no migration step fixes needs a person.
+            a table or a column is missing or a column is still ``NOT NULL``,
+            and ``plan`` and ``check`` return 4 when a problem no migration
+            step fixes needs a person.
         """
         try:
             return _run(list(args))

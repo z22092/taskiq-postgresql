@@ -72,6 +72,7 @@ from taskiq_postgresql.migrations import (
     plan_migration,
     render_steps,
     scoped_lock_timeout,
+    statements_effect,
     step_statements,
 )
 
@@ -122,7 +123,7 @@ _REVISION: Final = '''\
 Revision ID: {revision}
 Revises:{revises}
 Written by `taskiq postgresql generate --format alembic` (taskiq-postgresql
-{version}). Each statement only adds what is missing, so upgrade() is safe on
+{version}). Each statement {effect}, so upgrade() is safe on
 a database that already has the tables. The SQL is written out, so the
 revision never imports taskiq-postgresql.
 """
@@ -320,7 +321,7 @@ def _render_step(autogen_context: AutogenContext, op: TaskiqStepOp) -> list[str]
 
 @renderers.dispatch_for(TaskiqStepNoopOp)
 def _render_noop(autogen_context: AutogenContext, op: TaskiqStepNoopOp) -> list[str]:
-    return _noop_lines(op.upgrade)
+    return _noop_lines(op.upgrade.rendered)
 
 
 def compare_taskiq_steps(
@@ -467,7 +468,8 @@ def upgrade_taskiq_tables(
     transaction, so the advisory lock ``run_migrations=True`` takes lasts
     until Alembic commits. A released step never changes, so the revision
     runs the same SQL with every later release of the package. Every
-    statement only adds what is missing. With ``alembic upgrade --sql`` the
+    statement only adds what is missing, or relaxes a ``NOT NULL`` that is
+    still there. With ``alembic upgrade --sql`` the
     statements are printed instead.
 
     The statements bound their own lock waits: ``lock_timeout`` is set
@@ -596,6 +598,7 @@ def alembic_format(
         revision=revision,
         revises="" if down_revision is None else f" {down_revision}",
         version=package_version(),
+        effect=statements_effect([step for schema in schemas for step in schema.steps]),
         revision_literal=f'"{revision}"',
         down_revision_literal="None" if down_revision is None else f'"{down_revision}"',
         upgrade=_body([line for step in steps for line in _step_lines(step, "op.")]),
@@ -707,6 +710,8 @@ def _is_relaxation(
         and operation.modify_name is None
         and operation.modify_server_default is False
         and operation.modify_comment is False
+        # A comparator of the user's own may add any modify_* key to kw.
+        and not any(key.startswith("modify_") for key in operation.kw)
     )
 
 
@@ -744,10 +749,16 @@ def _step_lines(step: RenderedStep, prefix: str) -> list[str]:
     ]
 
 
-def _noop_lines(step: Union[TaskiqStepOp, RenderedStep]) -> list[str]:
+def _noop_lines(step: RenderedStep) -> list[str]:
     title = f"step {step.number} of {step.table}"
+    if step.nullable_columns:
+        # Putting NOT NULL back would fail on the first row that holds a NULL.
+        columns = ", ".join(step.nullable_columns)
+        said = f"makes {columns} nullable: it stays, and NOT NULL is not put back."
+    else:
+        said = "is additive: it stays."
     # A body of comments alone is not valid Python: pass makes it a statement.
-    return [f"# taskiq-postgresql {title} is additive: it stays.", "pass"]
+    return [f"# taskiq-postgresql {title} {said}", "pass"]
 
 
 def _execute_line(prefix: str, statement: str) -> str:

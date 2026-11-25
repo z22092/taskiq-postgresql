@@ -153,9 +153,9 @@ IndexMethod = Literal["hash", "btree"]
 
 Severity = Literal["required", "advisory"]
 """
-How much a gap matters: without a ``required`` object (a table or a column)
-the components fail; without an ``advisory`` one (an index) they only slow
-down.
+How much a gap matters: without a ``required`` object (a table or a column,
+or a column that accepts ``NULL``) the components fail; without an
+``advisory`` one (an index) they only slow down.
 """
 
 ProblemCode = Literal[
@@ -228,6 +228,16 @@ def check_plain_identifier(name: str) -> str:
             "not starting with a digit), and the SQL writes it unquoted",
         )
     return name
+
+
+def _check_nullable_name(number: int, table: str, name: str) -> None:
+    """Refuse a nullable column name a generated file could not hold."""
+    try:
+        check_plain_identifier(name)
+    except ValueError as error:
+        raise ValueError(
+            f"step {number} of {table!r} makes {name!r} nullable: {error}",
+        ) from None
 
 
 def check_comment(text: str) -> str:
@@ -379,8 +389,8 @@ class StepObjects:
         indexes: The indexes the step creates.
         nullable_columns: The columns the step makes nullable
             (``ALTER COLUMN ... DROP NOT NULL``). Each is a column of the
-            table's description that is nullable there, which ``TableSchema``
-            checks; an earlier step creates it.
+            table's description that is nullable there, and a step with a
+            lower number creates or adds it; ``TableSchema`` checks both.
     """
 
     creates_table: bool
@@ -392,7 +402,7 @@ class StepObjects:
 @dataclass(frozen=True)
 class MigrationStep:
     """
-    One idempotent step of a table's migration: additive, or relaxing ``NOT NULL``.
+    One idempotent step of a table's migration: it adds, or relaxes ``NOT NULL``.
 
     Steps run in ``number`` order and each one is idempotent, so the whole
     list brings a table of any earlier release up to date. A step adds tables,
@@ -431,8 +441,10 @@ class TableSchema:
 
     Raises:
         ValueError: if a step's ``nullable_columns`` names a column that is not
-            in ``columns``, or one that is not nullable there: the final
-            description would contradict the step.
+            in ``columns``, one that is not nullable there, or one that no
+            step with a lower number creates or adds: the final description
+            would contradict the step, or the statement would fail on a table
+            built from scratch.
     """
 
     kind: ComponentKind
@@ -445,8 +457,15 @@ class TableSchema:
         # A step needs the final description to be checked against, so the
         # check lives here and not in MigrationStep.
         final = {column.name: column for column in self.columns}
+        added_at: dict[str, int] = {}
+        for step in self.steps:
+            for name in step.objects.columns:
+                added_at.setdefault(name, step.number)
         for step in self.steps:
             for name in step.objects.nullable_columns:
+                # The name is written into a docstring and a comment line of
+                # a generated file, and the class is public.
+                _check_nullable_name(step.number, self.name, name)
                 column = final.get(name)
                 if column is None:
                     raise ValueError(
@@ -457,6 +476,11 @@ class TableSchema:
                     raise ValueError(
                         f"step {step.number} of {self.name!r} makes {name!r} "
                         "nullable, but the final description has it NOT NULL",
+                    )
+                if added_at.get(name, step.number) >= step.number:
+                    raise ValueError(
+                        f"step {step.number} of {self.name!r} makes {name!r} "
+                        "nullable, and no earlier step adds it",
                     )
 
     @property
@@ -892,12 +916,21 @@ class CatalogState:
                     )
                     for index in table["indexes"]
                 }
+                not_null = table["not_null"]
+                # A string would read as a set of characters, a dict as its keys.
+                if not_null is not None and not (
+                    type(not_null) is list
+                    and all(type(name) is str for name in not_null)
+                ):
+                    raise ValueError(
+                        f"not_null must be null or a list of strings, got {not_null!r}",
+                    )
                 tables[table["name"]] = TableState(
                     name=table["name"],
                     relkind=table["relkind"],
                     columns=dict(table["columns"] or ()),
                     indexes=indexes,
-                    not_null=frozenset(table.get("not_null") or ()),
+                    not_null=frozenset(not_null or ()),
                 )
         except (TypeError, KeyError, ValueError) as error:
             raise ValueError(
@@ -909,10 +942,11 @@ class CatalogState:
 @dataclass(frozen=True)
 class PendingStep:
     """
-    A step that has not fully run on a table: some object it creates is absent.
+    A step that has not fully run on a table: an object it creates is absent.
 
-    Running it again is safe: every statement only adds what is missing, or
-    relaxes a ``NOT NULL`` that is still there.
+    Or a column it makes nullable is still ``NOT NULL``. Running it again is
+    safe: every statement only adds what is missing, or relaxes a ``NOT NULL``
+    that is still there.
 
     Attributes:
         table: The table name.
@@ -921,9 +955,12 @@ class PendingStep:
         table_missing: Whether the table itself is absent.
         missing_columns: The step's columns the table lacks.
         missing_indexes: The step's indexes that no relation is named after.
-        not_null_columns: The columns the step makes nullable that exist and
-            are still ``NOT NULL``. A column the table lacks is in
-            ``missing_columns`` of the step that adds it, not here.
+        not_null_columns: The columns the step makes nullable that are still
+            ``NOT NULL``, or that an earlier pending step of the table adds
+            ``NOT NULL`` (they are then in its ``missing_columns``, and this
+            step is pending in the same run). A column the table lacks and no
+            pending step adds is not here: it is a ``missing_column`` problem
+            when ``CREATE TABLE`` created it.
     """
 
     table: str
@@ -1098,7 +1135,8 @@ class MigrationPlan:
         Render the script that runs the pending steps.
 
         The script is only right for the database the plan was computed
-        from, at that moment; every statement still only adds what is missing.
+        from, at that moment; every statement still only adds what is
+        missing, or relaxes a ``NOT NULL`` that is still there.
 
         Args:
             transaction: Wrap the script in ``BEGIN`` and ``COMMIT``.
@@ -1214,9 +1252,9 @@ def plan_migration(
 
     A step is pending when an object it creates is absent, or a column it
     makes nullable is still ``NOT NULL``: then running it again completes it.
-    An object that exists in another shape than the
-    description, or under a name another object took, is a problem instead,
-    because ``IF NOT EXISTS`` would skip it: nothing runs DDL for it.
+    An object that exists in another shape than the description, or under a
+    name another object took, is a problem instead, because ``IF NOT EXISTS``
+    would skip it: nothing runs DDL for it.
 
     Args:
         schemas: The tables, as given to ``catalog_query``.
@@ -1329,6 +1367,8 @@ class RenderedStep:
         statements: The statements of ``step_statements`` for this step of
             this table: the bound on lock waits around the advisory lock and
             the step's own statements.
+        nullable_columns: The columns the step makes nullable, which the text
+            of a downgrade needs: it leaves them nullable.
 
     Raises:
         ValueError: if ``table`` is empty or holds a line break or a NUL,
@@ -1343,6 +1383,7 @@ class RenderedStep:
     number: int
     comments: tuple[str, ...]
     statements: tuple[str, ...]
+    nullable_columns: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         """Refuse a table, kind or step number a comment line cannot hold."""
@@ -1359,6 +1400,8 @@ class RenderedStep:
         # but the checked constructors may be trusted to have checked them.
         for comment in self.comments:
             check_comment(comment)
+        for name in self.nullable_columns:
+            _check_nullable_name(self.number, self.table, name)
 
     @classmethod
     def of(
@@ -1410,13 +1453,37 @@ class RenderedStep:
             number=step.number,
             comments=(
                 f"taskiq-postgresql {title}: the SQL run_migrations=True runs,",
-                "and each statement only adds what is missing.",
+                f"and each statement {statements_effect([step])}.",
                 transaction_note,
                 *(f"{note}." for note in notes),
                 *([bound] if lock_timeout else []),
             ),
             statements=tuple(statements),
+            nullable_columns=step.objects.nullable_columns,
         )
+
+
+def statements_effect(steps: Iterable[MigrationStep]) -> str:
+    """
+    Say what the statements of ``steps`` do, for a generated file's comment.
+
+    Every released step only adds, so the text for those is the one every
+    release wrote; a step that makes columns nullable says so too.
+
+    Args:
+        steps: The steps the comment is about.
+
+    Returns:
+        A phrase that follows "each statement", such as ``only adds what is
+        missing``.
+    """
+    nullable = [name for step in steps for name in step.objects.nullable_columns]
+    if not nullable:
+        return "only adds what is missing"
+    return (
+        f"only adds what is missing, or makes {', '.join(nullable)} nullable "
+        "where it is still NOT NULL"
+    )
 
 
 def render_steps(
@@ -1738,17 +1805,19 @@ def _table_state_sql(table: TableSchema) -> str:
         "(SELECT json_build_object("  # noqa: S608
         f"'name', {name}, "
         "'relkind', c.relkind, "
-        "'columns', (SELECT json_agg(json_build_array(a.attname,"
-        " format_type(a.atttypid, a.atttypmod)) ORDER BY a.attnum)"
-        " FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0"
-        " AND NOT a.attisdropped), "
-        # Beside the columns, not inside them: the pairs above keep their shape.
-        "'not_null', (SELECT json_agg(a.attname ORDER BY a.attnum)"
-        " FROM pg_attribute a WHERE a.attrelid = c.oid AND a.attnum > 0"
-        " AND NOT a.attisdropped AND a.attnotnull), "
+        "'columns', ac.columns, "
+        # Beside the columns, not inside them: the pairs keep their shape.
+        "'not_null', ac.not_null, "
         f"'indexes', json_build_array({indexes})) "
         f"FROM (SELECT to_regclass({name}) AS oid) AS t "
-        "LEFT JOIN pg_class c ON c.oid = t.oid)"
+        "LEFT JOIN pg_class c ON c.oid = t.oid "
+        # One scan of pg_attribute for both. An aggregate without GROUP BY
+        # yields one row even for none, with NULL, as the subqueries did.
+        "LEFT JOIN LATERAL (SELECT json_agg(json_build_array(a.attname,"
+        " format_type(a.atttypid, a.atttypmod)) ORDER BY a.attnum) AS columns,"
+        " json_agg(a.attname ORDER BY a.attnum) FILTER (WHERE a.attnotnull)"
+        " AS not_null FROM pg_attribute a WHERE a.attrelid = c.oid"
+        " AND a.attnum > 0 AND NOT a.attisdropped) AS ac ON true)"
     )
 
 
@@ -1812,6 +1881,9 @@ def _compare_table(
         )
         return [], problems
     pending = []
+    # What an earlier pending step adds is not there yet, and no catalog says
+    # it is NOT NULL: a step that relaxes it must run in the same pass.
+    adding: set[str] = set()
     for step in schema.steps:
         missing_columns = tuple(
             name for name in step.objects.columns if name not in table.columns
@@ -1837,12 +1909,15 @@ def _compare_table(
                 for name in missing_columns
             )
             missing_columns = ()
-        # A column the table lacks is for the step that adds it to report.
+        # A column the table lacks is reported by the earlier step that adds
+        # it, or as a missing_column problem when CREATE TABLE created it; the
+        # step that relaxes it is pending too only in the first case.
         not_null_columns = tuple(
             name
             for name in step.objects.nullable_columns
-            if name in table.columns and name in table.not_null
+            if name in adding or (name in table.columns and name in table.not_null)
         )
+        adding.update(missing_columns)
         if missing_columns or missing_indexes or not_null_columns:
             pending.append(
                 PendingStep(

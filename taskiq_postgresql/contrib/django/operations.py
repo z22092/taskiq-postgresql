@@ -33,7 +33,8 @@ class RunTaskiqStep(Operation):
     that has the step, one statement at a time, in the migration's
     transaction. They are the statements ``run_migrations=True`` runs: the
     advisory lock it takes comes first, so workers that start meanwhile wait
-    for the migration, and every statement only adds what is missing. The
+    for the migration, and every statement only adds what is missing, or
+    relaxes a ``NOT NULL`` that is still there. The
     lock waits are bounded as ``taskiq postgresql generate`` bounds them:
     ``SET LOCAL lock_timeout`` to ``TASKIQ_POSTGRESQL_LOCK_TIMEOUT`` seconds
     (``DEFAULT_LOCK_TIMEOUT`` unless set, no statement with ``0``) after
@@ -44,9 +45,11 @@ class RunTaskiqStep(Operation):
     a database that is not PostgreSQL is refused.
 
     The reverse runs nothing, so ``migrate taskiq_postgresql zero`` leaves
-    the tables in place: a step only adds tables, columns and indexes, which
-    an earlier release ignores, and dropping them would lose the messages,
-    results and schedules they hold.
+    the tables in place: a step adds tables, columns and indexes, which an
+    earlier release ignores, and dropping them would lose the messages,
+    results and schedules they hold; a step that makes a column nullable
+    leaves it so, because putting ``NOT NULL`` back would fail on a row that
+    holds a ``NULL``.
 
     Args:
         number: The step it runs.
