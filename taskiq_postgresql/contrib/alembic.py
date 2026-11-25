@@ -36,7 +36,6 @@ import hashlib
 import logging
 import re
 from collections.abc import Callable, Sequence
-from importlib.metadata import PackageNotFoundError, version
 from typing import TYPE_CHECKING, Final, Optional, Union
 
 try:
@@ -57,7 +56,6 @@ from taskiq_postgresql.contrib.sqlalchemy import (
     taskiq_metadata,
 )
 from taskiq_postgresql.migrations import (
-    COMPONENT_KINDS,
     DEFAULT_LOCK_TIMEOUT,
     CatalogState,
     ComponentKind,
@@ -65,15 +63,15 @@ from taskiq_postgresql.migrations import (
     MigrationFormatOptionError,
     MigrationStep,
     PendingStep,
+    RenderedStep,
     TableSchema,
-    _check_comment,
-    _check_lock_timeout,
-    _check_table_name,
-    _scoped_lock_timeout,
-    _script_statements,
     catalog_query,
-    migration_statements,
+    check_lock_timeout,
+    package_version,
     plan_migration,
+    render_steps,
+    scoped_lock_timeout,
+    step_statements,
 )
 
 if TYPE_CHECKING:
@@ -114,7 +112,7 @@ _REVISION_ID: Final = re.compile(r"[A-Za-z0-9_]+")
 _DEFAULT_REVISION_LENGTH: Final = 12
 _INDENT: Final = "    "
 _TRANSACTION_NOTE: Final = (
-    "# The lock and the bound need the revision's transaction: never run this "
+    "The lock and the bound need the revision's transaction: never run this "
     "step in an autocommit block."
 )
 _REVISION: Final = '''\
@@ -188,21 +186,17 @@ class TaskiqStepOp(MigrateOperation):
         lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
         notes: Sequence[str] = (),
     ) -> None:
-        _check_lock_timeout(lock_timeout)
         # table, kind and number are written into comments of the revision
-        # file: a line break in one of them would put code into it.
-        _check_table_name(table)
-        if kind not in COMPONENT_KINDS:
-            raise ValueError(
-                f"unknown component kind {kind!r}; expected one of "
-                f"{', '.join(COMPONENT_KINDS)}",
-            )
-        if type(step.number) is not int:
-            raise TypeError(
-                f"the step number must be an int, got {type(step.number).__name__}",
-            )
-        if step.number < 1:
-            raise ValueError(f"the step number must be positive, got {step.number}")
+        # file: laying the step out refuses what would put code into it.
+        RenderedStep.of(
+            table,
+            kind,
+            step,
+            transaction_note=_TRANSACTION_NOTE,
+            lock=lock,
+            lock_timeout=lock_timeout,
+            notes=notes,
+        )
         self.table = table
         self.kind = kind
         self.step = step
@@ -248,12 +242,22 @@ class TaskiqStepOp(MigrateOperation):
         return self.step.number
 
     @property
+    def rendered(self) -> RenderedStep:
+        """The step as the revision writes it: its comments and statements."""
+        return RenderedStep.of(
+            self.table,
+            self.kind,
+            self.step,
+            transaction_note=_TRANSACTION_NOTE,
+            lock=self.lock,
+            lock_timeout=self.lock_timeout,
+            notes=self.notes,
+        )
+
+    @property
     def statements(self) -> list[str]:
         """The statements the revision executes, the lock timeout and lock first."""
-        return _scoped_lock_timeout(
-            _script_statements([(self.table, (self.step,))], lock=self.lock),
-            self.lock_timeout,
-        )
+        return list(self.rendered.statements)
 
     def reverse(self) -> TaskiqStepNoopOp:
         """
@@ -309,7 +313,7 @@ class TaskiqStepNoopOp(MigrateOperation):
 
 @renderers.dispatch_for(TaskiqStepOp)
 def _render_step(autogen_context: AutogenContext, op: TaskiqStepOp) -> list[str]:
-    return _step_lines(op, _prefix(autogen_context))
+    return _step_lines(op.rendered, _prefix(autogen_context))
 
 
 @renderers.dispatch_for(TaskiqStepNoopOp)
@@ -361,7 +365,7 @@ def compare_taskiq_steps(
     # Checked before the catalog is read, so a wrong value fails every run,
     # not only the ones that find a step missing.
     lock_timeout = autogen_context.opts.get(LOCK_TIMEOUT_OPTION, DEFAULT_LOCK_TIMEOUT)
-    _check_lock_timeout(lock_timeout)
+    check_lock_timeout(lock_timeout)
     found = connection.execute(text(_escape_colons(catalog_query(tables)))).scalar()
     plan = plan_migration(tables, CatalogState.from_json(found))
     for problem in plan.problems:
@@ -496,9 +500,10 @@ def upgrade_taskiq_tables(
         RuntimeError: if the connection is in autocommit mode and Alembic is
             not printing SQL (``--sql``). Nothing runs then.
     """
-    statements = _scoped_lock_timeout(
-        migration_statements(_schemas(targets, app_dir), through=through),
-        lock_timeout,
+    statements = step_statements(
+        _schemas(targets, app_dir),
+        through=through,
+        lock_timeout=lock_timeout,
     )
     _require_transaction(op)
     for statement in statements:
@@ -545,40 +550,25 @@ def alembic_format(
     Raises:
         MigrationFormatOptionError: if an option is unknown or its value is
             not one the format accepts.
-        ValueError: if a table name is not a plain SQL identifier (the name is
-            written unquoted), if a comment holds a line break or a NUL, or as
-            ``TaskiqStepOp`` does.
+        ValueError: if a table name is not a plain SQL identifier (the steps
+            and the drops write it unquoted, so ``"a, users"`` would name two
+            tables), if a comment holds a line break, a NUL or an encoding
+            declaration, or as ``TaskiqStepOp`` does.
         TypeError: as ``TaskiqStepOp`` does.
     """
-    # A line break would end the comment and leave the rest of it as code.
-    for comment in comments:
-        _check_comment(comment)
-    unknown = [key for key in options.extra if key not in _OPTIONS]
-    if unknown:
-        raise MigrationFormatOptionError(
-            f"the alembic format takes {', '.join(_OPTIONS)}; unknown "
-            f"option{'s' if len(unknown) > 1 else ''}: {', '.join(unknown)}",
-        )
+    steps = render_steps(
+        schemas,
+        options,
+        format_name="alembic",
+        accepted=_OPTIONS,
+        transaction_note=_TRANSACTION_NOTE,
+        comments=comments,
+    )
     downgrade = options.extra.get("downgrade", "none")
     if downgrade not in _DOWNGRADES:
         raise MigrationFormatOptionError(
             f"downgrade must be 'none' or 'drop', got {downgrade!r}",
         )
-    for schema in schemas:
-        # The SQLAlchemy path's rule: the steps and the drop write the name
-        # unquoted, so "a, users" would name two tables.
-        _name(schema.name)
-    steps = [
-        TaskiqStepOp(
-            schema.name,
-            schema.kind,
-            step,
-            lock=options.lock,
-            lock_timeout=options.lock_timeout,
-        )
-        for schema in sorted(schemas, key=lambda table: table.name)
-        for step in schema.steps
-    ]
     revision = options.extra.get("revision")
     if revision is None:
         upgrade = [statement for step in steps for statement in step.statements]
@@ -594,7 +584,7 @@ def alembic_format(
         drops = [f"DROP TABLE IF EXISTS {schema.name}" for schema in reversed(schemas)]
         downgrade_lines = [
             _execute_line("op.", statement)
-            for statement in _scoped_lock_timeout(drops, options.lock_timeout)
+            for statement in scoped_lock_timeout(drops, options.lock_timeout)
         ]
     else:
         downgrade_lines = [
@@ -603,7 +593,7 @@ def alembic_format(
     return "".join(f"# {comment}\n" for comment in comments) + _REVISION.format(
         revision=revision,
         revises="" if down_revision is None else f" {down_revision}",
-        version=_package_version(),
+        version=package_version(),
         revision_literal=f'"{revision}"',
         down_revision_literal="None" if down_revision is None else f'"{down_revision}"',
         upgrade=_body([line for step in steps for line in _step_lines(step, "op.")]),
@@ -711,23 +701,14 @@ def _prefix(autogen_context: AutogenContext) -> str:
     return autogen_context.opts.get("alembic_module_prefix", "op.") or ""
 
 
-def _step_lines(step: TaskiqStepOp, prefix: str) -> list[str]:
-    title = f"step {step.number} of the {step.kind} table {step.table}"
-    bound = (
-        f"# Lock waits end after {step.lock_timeout} s; the last statement "
-        "restores the transaction's lock timeout."
-    )
+def _step_lines(step: RenderedStep, prefix: str) -> list[str]:
     return [
-        f"# taskiq-postgresql {title}: the SQL run_migrations=True runs,",
-        "# and each statement only adds what is missing.",
-        _TRANSACTION_NOTE,
-        *(f"# {note}." for note in step.notes),
-        *([bound] if step.lock_timeout else []),
+        *(f"# {comment}" for comment in step.comments),
         *(_execute_line(prefix, statement) for statement in step.statements),
     ]
 
 
-def _noop_lines(step: TaskiqStepOp) -> list[str]:
+def _noop_lines(step: Union[TaskiqStepOp, RenderedStep]) -> list[str]:
     title = f"step {step.number} of {step.table}"
     # A body of comments alone is not valid Python: pass makes it a statement.
     return [f"# taskiq-postgresql {title} is additive: it stays.", "pass"]
@@ -745,11 +726,3 @@ def _escape_colons(statement: str) -> str:
 
 def _body(lines: Sequence[str]) -> str:
     return "\n".join(f"{_INDENT}{line}" for line in (lines or ["pass"]))
-
-
-def _package_version() -> str:
-    try:
-        return version("taskiq-postgresql")
-    except PackageNotFoundError:
-        # A source tree that was never installed has no metadata.
-        return "unknown"

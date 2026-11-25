@@ -21,7 +21,7 @@ from taskiq_postgresql.migrations import table_schema
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from taskiq_postgresql.utils import get_db_driver
-from tests.helpers import address_of
+from tests.helpers import BROKER_TABLE_0_4_SQL, address_of, close_component
 
 if TYPE_CHECKING:
     from asyncpg import Connection
@@ -38,16 +38,6 @@ COMPONENTS = ["broker", "result_backend", "scheduler_source"]
 # only serialize their migrations if both take this exact lock.
 MIGRATION_LOCK_SQL = "SELECT pg_advisory_xact_lock(hashtext($1), hashtext($2))"
 MIGRATION_LOCK_NAMESPACE = "taskiq_postgresql"
-
-# The broker's table and index exactly as 0.4.x creates them, before the
-# claim columns existed.
-BROKER_TABLE_0_4_SQL = (
-    "CREATE TABLE {table} (id SERIAL NOT NULL PRIMARY KEY, "
-    "task_id Uuid NOT NULL, task_name VARCHAR NOT NULL, message BYTEA NOT NULL, "
-    "labels JSONB NOT NULL, "
-    "created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());"
-    "CREATE INDEX {table}_id_idx ON {table} USING HASH (id);"
-)
 
 # The smallest pool each driver accepts. psqlpy refuses fewer than two
 # connections, so the one-connection case only exists for asyncpg and psycopg.
@@ -111,22 +101,6 @@ def build_component(kind: str, dsn: str, table: str, driver: str) -> Component:
         driver=driver,
         run_migrations=True,
     )
-
-
-async def close_component(component: Component) -> None:
-    """
-    Close what ``startup()`` opened, also after a failed ``startup()``.
-
-    The broker's own ``shutdown()`` cannot do it: it fails when LISTEN never
-    started.
-    """
-    if component.driver.pool is not None:
-        await component.driver.on_shutdown()
-    if isinstance(component, PostgresqlBroker) and hasattr(
-        component.listen_driver,
-        "connection",
-    ):
-        await component.listen_driver.on_shutdown()
 
 
 @pytest.fixture

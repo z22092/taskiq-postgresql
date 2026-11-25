@@ -478,7 +478,7 @@ index, so that a deploy can stop before the workers start; a component that
 does not migrate runs the same check when it starts
 ([Check at startup](#check-at-startup)).
 
-SQLAlchemy, SQLModel and Alembic can also hold the tables (see
+SQLAlchemy, SQLModel, Alembic and Django can also hold the tables (see
 [Integrations](#integrations)).
 
 The commands take the `module:object` paths that `taskiq worker` and
@@ -587,8 +587,9 @@ it is right for that database at that moment, and each statement still only
 adds what is missing. The locks each step takes (`note:` lines) and what no
 step fixes (`problem:` lines), such as an invalid index or an index name that
 another table took, go to standard error, each with what to do.
-`--format alembic` writes a revision file with only the pending steps, whose
-first line is the same comment. A plan
+`--format alembic` writes a revision file with only the pending steps, and
+`--format django` a Django migration, whose first line is the same comment. A
+plan
 is for one database: when the components use different connection strings,
 pass `--dsn`, or plan one table at a time with `--component`.
 
@@ -672,27 +673,25 @@ waited for a connection for its `timeout`, 30 seconds by default.
 
 ### Alembic, Django and Flyway
 
-Django and Flyway run each migration in a transaction of their own, so give
-them the script without `BEGIN` and `COMMIT`. The lock and the lock timeout
-stay, and last until their transaction ends. For Flyway, write the script as a
-versioned migration, with the next free version number:
+Flyway runs each migration in a transaction of its own, so give it the script
+without `BEGIN` and `COMMIT`. The lock and the lock timeout stay, and last
+until its transaction ends. Write the script as a versioned migration, with
+the next free version number:
 
 ```bash
 taskiq postgresql generate app:scheduler --no-transaction > db/migration/V2__taskiq_tables.sql
 ```
 
-For Alembic, install the `alembic` extra instead of copying the script:
+A Flyway file holds the SQL of the release that generated it, and the script
+only adds what is missing, so when an upgrade changes the tables (the
+changelog says so), add a new migration with the new script.
+
+For Alembic and Django, install their extra instead of copying the script.
 [Alembic](#alembic) shows how autogenerate writes the steps a database lacks,
 each with a lock timeout that ends with the step, a helper for a revision of
-your own, and a format that writes the revision file. In Django, pass
-`render_sql(..., transaction=False)` from
-`taskiq_postgresql.migrations` to `migrations.RunSQL` in a migration of your
-own; describing the tables by component kind (`table_schema("broker")` and so
-on) keeps the migration from importing your application. A Flyway file holds
-the SQL of the release that generated it, while such a Django migration
-renders the SQL of the installed release each time it runs. Either way the
-script only adds what is missing, so when an upgrade changes the tables (the
-changelog says so), add a new migration with the new script.
+your own, and a format that writes the revision file. [Django](#django) shows
+an app whose migrations run the steps, and a format that writes a migration
+file for an app of your own.
 
 ### Writing a migration format
 
@@ -753,6 +752,12 @@ The contract:
   `--lock-timeout`, 10 by default, 0 for none), and `extra`, the
   `--option KEY=VALUE` pairs. Raise `MigrationFormatOptionError` for an option
   the format does not accept; `generate` then exits with 2.
+- A format may also take a keyword-only `comments` parameter, a sequence of
+  lines: `plan` then passes the line that names the database the plan is for,
+  to write as a comment at the top of the file. For a file another migration
+  tool runs, `render_steps(schemas, options, ...)` refuses a comment, an option
+  or a table name the file cannot hold, and returns each step with its comment
+  lines and its statements, the lock and the lock timeout included.
 - When the format needs an optional dependency, import it at module level and
   put it in an extra named after the format. If the import fails, `generate`
   tells the user to run `pip install '<your-package>[<format>]'`. Listing the
@@ -766,23 +771,25 @@ All these names are importable from `taskiq_postgresql.migrations`.
 
 ## Integrations
 
-SQLAlchemy, SQLModel and Alembic can hold the tables too. Each integration is
-an extra, installed with the extra of your driver:
+SQLAlchemy, SQLModel, Alembic and Django can hold the tables too. Each
+integration is an extra, installed with the extra of your driver:
 
 ```bash
 pip install "taskiq-postgresql[asyncpg,sqlalchemy]"
 pip install "taskiq-postgresql[asyncpg,sqlmodel]"
 pip install "taskiq-postgresql[asyncpg,alembic]"
+pip install "taskiq-postgresql[psycopg,django]"
 ```
 
-`sqlmodel` and `alembic` bring SQLAlchemy with them. The integrations build the
-tables from the description that `generate` renders as SQL, so the columns,
-types, defaults, indexes and their names are the ones `run_migrations=True`
-creates.
-Like the commands, they take `module:object` paths (with `app_dir=` for
-`--app-dir`), components, brokers and schedulers. They also take
-`table_schema(...)` descriptions, which need neither your application nor a
-DSN.
+`sqlmodel` and `alembic` bring SQLAlchemy with them, and `django` brings
+Django. The integrations build the tables from the description that
+`generate` renders as SQL, so the columns, types, defaults, indexes and their
+names are the ones `run_migrations=True` creates.
+Like the commands, the SQLAlchemy, SQLModel and Alembic integrations take
+`module:object` paths (with `app_dir=` for `--app-dir`), components, brokers
+and schedulers. They also take `table_schema(...)` descriptions, which need
+neither your application nor a DSN; the Django app reads paths and such
+descriptions from its settings.
 
 ### SQLAlchemy and SQLModel
 
@@ -989,6 +996,125 @@ that database and its `search_path`. It checks them before it connects, and
 refuses `downgrade=drop`, with exit status 2, when a table it would drop
 already exists, such as a broker table 0.4.x created that only needs step 2:
 the revision does not create that table, so its downgrade must not drop it.
+
+### Django
+
+The `django` extra adds a Django app whose migrations create the tables with
+the SQL `run_migrations=True` runs. It allows Django 5.2 LTS (5.2.19 or
+later) and, on Python 3.12 and later, Django 6.0 and 6.1. Add the app to
+`INSTALLED_APPS` and name in `TASKIQ_POSTGRESQL_TARGETS` the components whose
+tables it creates, as the `module:object` paths the commands take:
+
+```python
+# settings.py
+INSTALLED_APPS = [
+    # ... your apps
+    "taskiq_postgresql.contrib.django",
+]
+
+# The quickstart's app:scheduler brings its broker, the broker's result
+# backend and the scheduler source.
+TASKIQ_POSTGRESQL_TARGETS = ["app:scheduler"]
+```
+
+Then migrate it with your other apps, or on its own:
+
+```bash
+python manage.py migrate taskiq_postgresql
+```
+
+The app, labelled `taskiq_postgresql`, has no models, only migrations: one
+per migration step. `0001` runs step 1 of every table (the table and its
+indexes) and `0002` step 2 (the broker table's `channel` and `not_before`,
+which also completes a broker table 0.4.x created); a release that adds a step
+adds a migration. Each migration runs its statements one at a time, in the
+migration's transaction. It first keeps the transaction's own `lock_timeout`,
+then sets `SET LOCAL lock_timeout = '10s'`, so that a statement that waits
+longer for a lock fails and rolls the migration back instead of stalling the
+broker. It then takes the advisory lock `run_migrations=True` takes, so
+workers that start meanwhile wait for the migration, and runs statements that
+only add what is missing; its last statement gives the transaction back the
+`lock_timeout` it kept, so the other migrations of the same transaction wait
+for locks as before. `python manage.py sqlmigrate taskiq_postgresql 0001`
+shows the SQL. Once the tables exist, the workers can run with
+`run_migrations=False`.
+
+An entry can also be a dict that describes a table by kind, which needs no
+import of your application: `kind` is `broker`, `result_backend` or
+`scheduler_source`, and `table_name` and `field_for_task_id` default to the
+component's own. `TASKIQ_POSTGRESQL_LOCK_TIMEOUT` sets the seconds of the
+lock timeout; `0` leaves the bound out:
+
+```python
+# settings.py
+TASKIQ_POSTGRESQL_TARGETS = [
+    {"kind": "broker", "table_name": "jobs", "field_for_task_id": "Text"},
+    {"kind": "result_backend", "table_name": "job_results"},
+]
+TASKIQ_POSTGRESQL_LOCK_TIMEOUT = 5
+```
+
+The migrations read the settings when they run, not when they were written.
+With `TASKIQ_POSTGRESQL_TARGETS` missing or empty, or with a table name that
+is not a plain SQL identifier (letters, digits, `_` and `$`, not starting with
+a digit), `migrate` raises `ImproperlyConfigured` before any statement runs,
+instead of recording migrations that created nothing, and `manage.py check`
+reports `taskiq_postgresql.E001`, or `taskiq_postgresql.E002` for a lock
+timeout that is not a whole number of seconds. The check only reads the
+settings; the paths, and so the table names of their components, are
+imported when `migrate` or `sqlmigrate` runs. Unlike the `taskiq postgresql`
+commands, the app imports them with the project's own `sys.path`, the one
+`manage.py` starts with its own directory first, and never from the
+directory the command runs in.
+
+Django never applies a migration twice, so a table you add to the settings,
+or rename, after the app was migrated is not created by the next `migrate`.
+Create it with `taskiq postgresql migrate` ([Apply it with
+migrate](#apply-it-with-migrate)) or with the SQL `taskiq postgresql plan`
+prints for that database ([Plan and check](#plan-and-check)), or keep it in
+a migration of your own, written by the format below.
+
+The app's migrations reverse to nothing, the same default as the Alembic
+`downgrade()`: the tables and their rows stay, because the steps only add
+tables, columns and indexes that an earlier release ignores. Drop the tables
+yourself if you mean to. To unapply them:
+
+```bash
+python manage.py migrate taskiq_postgresql zero
+```
+
+That also unapplies every migration of your other apps that depends on one of
+this app's, such as a migration that grants a role access to the tables or
+adds a trigger to them, and each of those runs its own reverse: a reversed
+`CreateModel` drops its table, with its rows. `migrate taskiq_postgresql zero
+--plan` lists them without running anything.
+
+The migrations run on the database `migrate` migrates (`--database`), and a
+database router's `allow_migrate` decides for the label `taskiq_postgresql`
+as for any app. On a database that is not PostgreSQL they raise
+`NotSupportedError`: keep the app off it with a router.
+
+To keep the tables in an app of your own instead of installing this one,
+`generate --format django` writes a migration file with every step, its SQL
+written out, so that the file never imports this package. Writing the file
+needs no Django, so the format works without the `django` extra:
+
+```bash
+taskiq postgresql generate app:scheduler --format django --option dependencies=shop.0004_orders > shop/migrations/0005_taskiq_tables.py
+```
+
+The option `dependencies` names the migrations it follows, as
+`app_label.migration_name` separated by commas, usually the latest migration
+of that app; by default there are none. Each step becomes a
+`migrations.RunSQL` with the advisory lock (`--no-lock` leaves it out) and the
+lock timeout (`--lock-timeout`), whose reverse runs nothing; keep the
+migration atomic, since both only last inside its transaction.
+`--no-transaction` changes nothing: Django runs each migration in a
+transaction of its own. Table names must be plain SQL identifiers, and any
+other option exits with 2. `plan --format django` writes the same file with
+only the steps the database it reads still lacks, under a first comment line
+that names that database. A released step never changes, so when a release
+adds one, add a migration with the new step.
 
 ## Compatibility
 

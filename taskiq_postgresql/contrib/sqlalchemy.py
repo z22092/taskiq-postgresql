@@ -15,7 +15,6 @@ The metadata also keeps the table descriptions themselves, under
 
 from __future__ import annotations
 
-import re
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, Any, Final, Optional
 
@@ -45,6 +44,7 @@ from taskiq_postgresql.migrations import (
     ColumnSchema,
     TableSchema,
     TypeName,
+    check_plain_identifier,
     collect_schemas,
 )
 
@@ -73,7 +73,6 @@ _TYPES: Final[Mapping[TypeName, Callable[[ColumnSchema], TypeEngine[Any]]]] = {
 # The SQL names tables and indexes without quotes, which PostgreSQL folds to
 # lower case and cuts to 63 bytes; SQLAlchemy quotes a name with a capital
 # letter and refuses a longer one, so it gets the name PostgreSQL keeps.
-_UNQUOTED_NAME: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
 _MAX_NAME_LENGTH: Final = 63
 _PRIMARY_KEY_SUFFIX: Final = "_pkey"
 
@@ -157,13 +156,7 @@ def _schemas(targets: Sequence[object], app_dir: Optional[str]) -> list[TableSch
             "name at least one target: a component, a broker, a scheduler, a "
             "'module:object' path or a TableSchema",
         )
-    schemas: list[TableSchema] = []
-    for target in targets:
-        if isinstance(target, TableSchema):
-            schemas.append(target)
-        else:
-            schemas.extend(collect_schemas(target, app_dir=app_dir))
-    return schemas
+    return collect_schemas(*targets, app_dir=app_dir)
 
 
 def _add(metadata: MetaData, schema: TableSchema) -> Table:
@@ -224,12 +217,7 @@ def _column_type(column: ColumnSchema) -> TypeEngine[Any]:
 
 
 def _name(name: str) -> str:
-    if _UNQUOTED_NAME.fullmatch(name) is None:
-        raise ValueError(
-            f"{name!r} is not a plain SQL identifier (letters, digits, _ and $, "
-            "not starting with a digit), so it has no SQLAlchemy table name",
-        )
-    return name.lower()[:_MAX_NAME_LENGTH]
+    return check_plain_identifier(name).lower()[:_MAX_NAME_LENGTH]
 
 
 def _ddl(table: Table) -> tuple[str, ...]:

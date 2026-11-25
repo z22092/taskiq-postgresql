@@ -40,9 +40,15 @@ from taskiq_postgresql.migrations import (
     table_schema,
 )
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
-from tests.helpers import create_database, drop_database, in_database
+from tests.helpers import (
+    block,
+    close_component,
+    create_database,
+    drop_database,
+    in_database,
+    tables_in,
+)
 from tests.test_migration_script import SHAPE_IDS, SHAPES, build_component
-from tests.test_migrations import close_component
 
 UNUSED_DSN = "postgresql://localhost/unused"
 KINDS = ("broker", "result_backend", "scheduler_source")
@@ -149,17 +155,6 @@ def catalog(dsn: str) -> dict[str, list[tuple[Any, ...]]]:
             await connection.close()
 
     return asyncio.run(fetch())
-
-
-def block(monkeypatch: pytest.MonkeyPatch, package: str) -> None:
-    """Make ``package`` and every submodule of it unimportable, as uninstalled."""
-    loaded = [name for name in sys.modules if name.startswith(f"{package}.")]
-    for name in (package, *loaded):
-        monkeypatch.setitem(sys.modules, name, None)
-
-
-def tables_in(dsn: str) -> set[str]:
-    return {row[0] for row in catalog(dsn)["columns"]}
 
 
 def databases(postgresql_dsn: str) -> Iterator[Callable[[], str]]:

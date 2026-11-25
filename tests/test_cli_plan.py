@@ -13,15 +13,22 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
-from importlib.metadata import version
+from importlib.metadata import EntryPoint, version
 from pathlib import Path
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Sequence
 from urllib.parse import urlsplit
 
 import asyncpg
 import pytest
 
-from taskiq_postgresql.migrations import FormatOptions, render_sql, table_schema
+from taskiq_postgresql import migrations
+from taskiq_postgresql.migrations import (
+    MIGRATION_FORMATS_GROUP,
+    FormatOptions,
+    TableSchema,
+    render_sql,
+    table_schema,
+)
 from tests.helpers import (
     closed_local_port,
     fetch_on_server,
@@ -296,6 +303,58 @@ def test_plan_writes_a_revision_of_only_the_pending_steps(
     assert "step 2 of the broker table taskiq_messages" in out
     assert "step 1 " not in out
     assert f"{PROG}: note: plan for database {database} " in err
+
+
+def headed_format(
+    schemas: Sequence[TableSchema],
+    options: FormatOptions,
+    *,
+    comments: Sequence[str] = (),
+) -> str:
+    """Stand for another package's format that takes the plan's header."""
+    names = " ".join(f"{schema.name}:{len(schema.steps)}" for schema in schemas)
+    return "".join(f"// {comment}\n" for comment in comments) + names + "\n"
+
+
+def bare_format(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
+    """Stand for another package's format without ``comments``."""
+    return " ".join(schema.name for schema in schemas) + "\n"
+
+
+@pytest.mark.parametrize(
+    ("function", "header"),
+    [
+        pytest.param("headed_format", True, id="keyword-only-comments"),
+        pytest.param("bare_format", False, id="no-comments"),
+    ],
+)
+def test_plan_gives_its_header_to_any_format_that_takes_comments(
+    function: str,
+    header: bool,
+    scratch_dsn: str,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # Registered by no module of this package, under a name of its own.
+    installed = list(migrations._entry_points())
+    entry = EntryPoint("other", f"{__name__}:{function}", MIGRATION_FORMATS_GROUP)
+    monkeypatch.setattr(migrations, "_entry_points", lambda: [*installed, entry])
+    execute(scratch_dsn, OLD_SQL)
+    database, search_path = database_of(scratch_dsn)
+    line = (
+        f"plan for database {database} (search_path {search_path}): valid only "
+        "for this database"
+    )
+
+    code, out, err = run_in_process(
+        ["plan", *broker_options(scratch_dsn), "--format", "other"],
+        capsys,
+    )
+
+    assert code == 0, err
+    # Only step 2 is pending, so each format gets the broker with one step.
+    assert out == (f"// {line}\ntaskiq_messages:1\n" if header else "taskiq_messages\n")
+    assert f"{PROG}: note: {line}" in err
 
 
 def test_the_plan_brings_a_database_to_what_a_new_install_holds(

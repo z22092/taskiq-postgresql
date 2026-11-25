@@ -108,8 +108,12 @@ Upgrading from 0.4.x:
   lacks: the script of `generate`, with its options (`--lock-timeout`,
   `--no-transaction`, `--no-lock`, `--format alembic` for a revision of the
   pending steps), under a comment that names the database and `search_path` it
-  is valid for, and nothing when every step has run. The locks each step takes
-  and the problems no step fixes go to standard error.
+  is valid for, and nothing when every step has run. Any format, this
+  package's or another's, that takes a keyword-only `comments` parameter gets
+  that comment as the first line of its file; a name that holds a line break
+  or an encoding declaration (`coding: ...`, which Python reads on a file's
+  first two lines) is written escaped. The locks each step takes and the
+  problems no step fixes go to standard error.
 - `taskiq postgresql check` reads the same catalog, changes nothing, and
   reports the pending steps and the problems on standard error (and as JSON
   with `--json`). It exits with 0 when the database is up to date or lacks
@@ -127,12 +131,17 @@ Upgrading from 0.4.x:
   as before (`RelationsExistQuery`) and takes no lock and runs no DDL once they
   exist.
 - `taskiq_postgresql.migrations` describes the tables as data (`table_schema`,
-  `collect_schemas`) and renders the script (`render_sql`), or its statements
-  one by one (`migration_statements`, which stops after a given step with
-  `through=N`), for tools that build their own migrations. Other packages can
-  add output formats to `generate --format` through the
-  `taskiq_postgresql.migration_formats` entry point group; the README has the
-  contract.
+  and `collect_schemas`, which also takes `table_schema(...)` descriptions and
+  describes each table once) and renders the script (`render_sql`), or its
+  statements one by one (`migration_statements`, which stops after a given
+  step with `through=N`; `step_statements`, which also bounds their lock waits
+  inside a transaction they share), for tools that build their own
+  migrations. Other packages can add output formats to `generate --format`
+  through the `taskiq_postgresql.migration_formats` entry point group; the
+  README has the contract. A format that writes another tool's migration file
+  can start from `render_steps`, which refuses a comment, an option or a table
+  name the file cannot hold and lays out each step with its lock and lock
+  timeout.
 - `taskiq_postgresql.migrations` also compares a database with that
   description. Each migration step declares the table, columns and indexes it
   creates (`MigrationStep.objects`); `catalog_query` reads, in one read-only
@@ -177,8 +186,32 @@ Upgrading from 0.4.x:
   `upgrade_taskiq_tables` raises `RuntimeError` on an autocommit connection
   (for example inside `autocommit_block()`) before it runs a statement. The
   format and `TaskiqStepOp` refuse a table name that is not a plain SQL
-  identifier, a line break in a table name, or an unknown component kind, and
+  identifier, a line break in a table name, or an unknown component kind, the
+  format refuses a comment that holds an encoding declaration, and
   `downgrade=drop` bounds its `DROP TABLE` statements by the same lock timeout.
+- A Django app, installed with the `django` extra
+  (`pip install "taskiq-postgresql[django]"`), which allows Django 5.2 LTS
+  (5.2.19 or later) and, on Python 3.12 and later, Django 6.0 and 6.1. Add
+  `"taskiq_postgresql.contrib.django"` to `INSTALLED_APPS` and name the
+  components in `TASKIQ_POSTGRESQL_TARGETS`, as `module:object` paths or as
+  dicts such as `{"kind": "broker", "table_name": "jobs"}`:
+  `manage.py migrate taskiq_postgresql` then creates their tables with the SQL
+  `run_migrations=True` runs, one migration per migration step, each in its
+  transaction with the advisory lock and a lock timeout
+  (`TASKIQ_POSTGRESQL_LOCK_TIMEOUT`, 10 seconds by default, `0` for none),
+  after which the transaction gets its own `lock_timeout` back. The
+  migrations read the settings when they run: missing or empty settings, or a
+  table name that is not a plain SQL identifier, fail `migrate` with
+  `ImproperlyConfigured` before any statement runs, and `manage.py check`
+  reports them as `taskiq_postgresql.E001`, except the names behind a
+  `module:object` path, which only `migrate` imports. Reversing the app's migrations
+  drops nothing of its tables. A table added to the settings after the first
+  `migrate` comes from `taskiq postgresql migrate` or `plan`, or from a
+  migration of your own: `taskiq postgresql generate --format django` writes
+  a migration file with every step, which never imports this package (option
+  `dependencies`), and `plan --format django` writes one with only the
+  pending steps. The format imports no Django, so neither command needs the
+  `django` extra.
 - `PostgresqlBroker(health_check_interval=30.0, query_timeout=30.0)`. When the
   LISTEN connection stays silent for `health_check_interval` seconds (with
   psycopg, every `health_check_interval` seconds), the worker sends the same
