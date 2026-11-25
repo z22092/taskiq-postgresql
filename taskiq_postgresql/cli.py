@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import re
 import sys
+from contextlib import asynccontextmanager, suppress
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -23,10 +25,12 @@ from typing import (
     NamedTuple,
     Sequence,
 )
+from urllib.parse import unquote, urlsplit
 
 from taskiq.abc.cmd import TaskiqCMD
 
 if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
     from types import ModuleType
 
     from taskiq_postgresql.abc.driver import QueryDriver
@@ -54,6 +58,15 @@ _CHECK_EXIT_STATUS = (
 )
 _BEHIND: Final = 3
 _NEEDS_A_PERSON: Final = 4
+_UNREADABLE_DSN: Final = (
+    "the connection string is not valid: in a URL, percent-encode %, /, ?, # "
+    "and @ in the password; in key=value form, quote a value that holds a space"
+)
+# libpq's password option: a word of the key=value form, quoted or not, or a
+# parameter of a URL's query.
+_PASSWORD_OPTION: Final = re.compile(
+    r"(?:^|[\s?&])password\s*=\s*(?:'((?:[^'\\]|\\.)*)'|([^\s&]+))",
+)
 
 
 class PostgresqlCMD(TaskiqCMD):
@@ -97,6 +110,29 @@ class _Database(NamedTuple):
             f"plan for database {_shown(self.name)} (search_path "
             f"{_shown(self.search_path)}): valid only for this database"
         )
+
+
+class _ConnectionStringError(Exception):
+    """An error raised while a driver read, or connected with, a connection string."""
+
+    def __init__(self, error: Exception, dsn: str) -> None:
+        super().__init__()
+        self.error = error
+        self.dsn = dsn
+
+    def __str__(self) -> str:
+        """The driver's error, without the connection string or its password."""
+        from taskiq_postgresql.utils.dsn import _describe  # noqa: PLC0415
+
+        name = type(self.error).__name__
+        unreadable = _unreadable(self.error)
+        if unreadable is not None:
+            return (
+                f"{name}: {_UNREADABLE_DSN}. The driver raised "
+                f"{_describe(unreadable)}, whose message is left out: it can "
+                "quote the password."
+            )
+        return f"{name}: {_without_dsn(str(self.error), self.dsn)}"
 
 
 def _run(args: list[str]) -> int:
@@ -246,8 +282,13 @@ def _add_component(
 def _add_dsn(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dsn",
+        type=_dsn,
         metavar="DSN",
-        help="connection string of the database to read; default: each component's own",
+        help="connection string of the database to read; default: each "
+        "component's own. Other users of the machine can read a command line: "
+        "leave the password out, and give it with PGPASSWORD or a password "
+        "file (~/.pgpass, or the one PGPASSFILE names), which asyncpg and "
+        "psycopg read and psqlpy does not",
     )
 
 
@@ -294,6 +335,20 @@ def _target(text: str) -> str:
     module, _, attribute = text.partition(":")
     if not module or not attribute or ":" in attribute:
         raise argparse.ArgumentTypeError(f"{text!r} is not a 'module:object' path")
+    return text
+
+
+def _dsn(text: str) -> str:
+    from taskiq_postgresql.utils.dsn import _is_blank  # noqa: PLC0415
+
+    # libpq and asyncpg read an empty string as "use the local defaults", so
+    # it would read a server nobody named. The value is never echoed: a
+    # connection string can hold a password.
+    if _is_blank(text):
+        raise argparse.ArgumentTypeError(
+            "the connection string is empty; give the database's own, or "
+            "leave out --dsn to read each component's",
+        )
     return text
 
 
@@ -391,7 +446,7 @@ def _plan(
         )
     (database,) = asyncio.run(_read(connections, migrations))
     plan = database.plan
-    _check_downgrade(namespace, options, plan, migrations)
+    _check_downgrade(render, options, plan, migrations)
     for note in plan.notes:
         _say(f"note: {note}")
     _say_problems(plan.problems)
@@ -420,14 +475,13 @@ def _check_format_options(
 
 
 def _check_downgrade(
-    namespace: argparse.Namespace,
+    render: MigrationFormat,
     options: FormatOptions,
     plan: MigrationPlan,
     migrations: ModuleType,
 ) -> None:
-    # The alembic format's downgrade=drop drops every table it is given, and
-    # load_format always picks this package's own format for that name.
-    if namespace.format != "alembic" or options.extra.get("downgrade") != "drop":
+    # The alembic format's downgrade=drop drops every table it is given.
+    if options.extra.get("downgrade") != "drop" or _alembic_format(render) is None:
         return
     kept = sorted({item.table for item in plan.pending if not item.table_missing})
     if kept:
@@ -455,7 +509,27 @@ def _plan_script(
             comments=[database.header],
         )
     _say(f"note: {database.header}")
-    return render(plan.pending_schemas(database.schemas), options)
+    schemas = plan.pending_schemas(database.schemas)
+    alembic_format = _alembic_format(render)
+    if alembic_format is not None:
+        # The revision names the database too: on another database, which
+        # may have the table, its downgrade=drop would drop that table.
+        return alembic_format(schemas, options, comments=[database.header])
+    return render(schemas, options)
+
+
+def _alembic_format(render: MigrationFormat) -> Callable[..., str] | None:
+    """Return this package's alembic format if ``render`` is it, else ``None``."""
+    # By identity, not by the name after --format: another package can
+    # register the same callable under a name of its own.
+    try:
+        from taskiq_postgresql.contrib.alembic import (  # noqa: PLC0415
+            alembic_format,
+        )
+    except ImportError:
+        # Without Alembic installed, no format can be this one.
+        return None
+    return alembic_format if render is alembic_format else None
 
 
 def _check(
@@ -557,11 +631,12 @@ async def _read_database(
         return found.get("catalog")
 
     driver.connection_string = dsn
-    try:
-        state = await migrations.read_catalog(schemas, fetch_value)
-    finally:
-        if getattr(driver, "pool", None) is not None:
-            await driver.on_shutdown()
+    async with _connecting(dsn):
+        try:
+            state = await migrations.read_catalog(schemas, fetch_value)
+        finally:
+            if getattr(driver, "pool", None) is not None:
+                await driver.on_shutdown()
     return _Database(
         name=str(found["database"]),
         search_path=str(found["search_path"]),
@@ -641,20 +716,86 @@ def _migrate(
 async def _apply(components: Sequence[Component]) -> None:
     for component in components:
         driver = component.driver
-        driver.connection_string = component.dsn
+        dsn = component.dsn
+        driver.connection_string = dsn
         run_migrations = driver.run_migrations
         # The startup path runs its DDL only with the flag set; migrate runs it
         # whatever the component says, then leaves the flag as it found it.
         driver.run_migrations = True
-        try:
-            await driver.on_startup()
-        finally:
-            driver.run_migrations = run_migrations
-            if getattr(driver, "pool", None) is not None:
-                await driver.on_shutdown()
+        async with _connecting(dsn):
+            try:
+                await driver.on_startup()
+            finally:
+                driver.run_migrations = run_migrations
+                if getattr(driver, "pool", None) is not None:
+                    await driver.on_shutdown()
+
+
+@asynccontextmanager
+async def _connecting(dsn: str) -> AsyncGenerator[None, None]:
+    """Tag an error raised in the block with ``dsn``, which ``_fail`` leaves out."""
+    try:
+        yield
+    except Exception as error:
+        raise _ConnectionStringError(error, dsn) from error
+
+
+def _unreadable(error: Exception) -> BaseException | None:
+    """Return the driver's own exception if it could not read the string."""
+    from taskiq_postgresql.exceptions import DatabaseConnectionError  # noqa: PLC0415
+
+    # asyncpg reads the string as it opens its pool and raises ValueError for
+    # what it cannot read, which the driver wraps; psqlpy refuses to build its
+    # pool. Either message can quote any part of the string.
+    if isinstance(error, DatabaseConnectionError) and isinstance(
+        error.__cause__,
+        ValueError,
+    ):
+        return error.__cause__
+    build_error = getattr(
+        sys.modules.get("psqlpy.exceptions"),
+        "ConnectionPoolBuildError",
+        None,
+    )
+    if build_error is not None and isinstance(error, build_error):
+        return error
+    return None
+
+
+def _without_dsn(text: str, dsn: str) -> str:
+    """Return ``text`` without ``dsn`` and without the password in it."""
+    if dsn:
+        text = text.replace(dsn, "<connection string>")
+    # The longest first, so a password that holds another goes whole.
+    for password in sorted(_passwords(dsn), key=len, reverse=True):
+        text = text.replace(password, "***")
+    return text
+
+
+def _passwords(dsn: str) -> set[str]:
+    """Return the password in ``dsn``, as written and percent-decoded."""
+    written: list[str | None] = []
+    with suppress(ValueError):
+        # urllib refuses a URL with a malformed IPv6 address.
+        written.append(urlsplit(dsn).password)
+    for quoted, bare in _PASSWORD_OPTION.findall(dsn):
+        written.append(re.sub(r"\\(.)", r"\1", quoted) or bare)
+    return {
+        form
+        for password in written
+        if password
+        for form in (password, unquote(password))
+    }
 
 
 def _fail(error: Exception) -> int:
-    # The message, not a traceback: these are errors in the user's setup.
-    sys.stderr.write(f"{_PROG}: error: {type(error).__name__}: {error}\n")
+    # The message, not a traceback: these are errors in the user's setup. A
+    # driver's error comes as a _ConnectionStringError, whose text leaves out the
+    # connection string and its password.
+    text = (
+        str(error)
+        if isinstance(error, _ConnectionStringError)
+        else f"{type(error).__name__}: {error}"
+    )
+    sys.stderr.write(f"{_PROG}: error: {text}\n")
     return 1

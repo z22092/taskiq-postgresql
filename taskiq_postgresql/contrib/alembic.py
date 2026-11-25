@@ -66,6 +66,7 @@ from taskiq_postgresql.migrations import (
     MigrationStep,
     PendingStep,
     TableSchema,
+    _check_comment,
     _check_lock_timeout,
     _check_table_name,
     _scoped_lock_timeout,
@@ -504,7 +505,12 @@ def upgrade_taskiq_tables(
         op.execute(_escape_colons(statement))
 
 
-def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> str:
+def alembic_format(
+    schemas: Sequence[TableSchema],
+    options: FormatOptions,
+    *,
+    comments: Sequence[str] = (),
+) -> str:
     """
     Render the ``alembic`` migration format: a revision file.
 
@@ -513,7 +519,9 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
     and ``COMMIT`` (Alembic runs each revision in a transaction of its own,
     so ``options.transaction`` changes nothing). ``options.lock`` keeps or
     leaves out the advisory locks, and ``options.lock_timeout`` is each
-    step's own bound on lock waits (see ``TaskiqStepOp``).
+    step's own bound on lock waits (see ``TaskiqStepOp``). ``comments`` open
+    the file, one comment line each: ``taskiq postgresql plan`` names there
+    the database the revision was planned for.
 
     Options (``--option KEY=VALUE``):
 
@@ -528,6 +536,8 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
     Args:
         schemas: The tables.
         options: The options of ``taskiq postgresql generate``.
+        comments: Lines written as comments at the top of the file, before
+            its docstring.
 
     Returns:
         The revision file.
@@ -536,9 +546,13 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
         MigrationFormatOptionError: if an option is unknown or its value is
             not one the format accepts.
         ValueError: if a table name is not a plain SQL identifier (the name is
-            written unquoted), or as ``TaskiqStepOp`` does.
+            written unquoted), if a comment holds a line break or a NUL, or as
+            ``TaskiqStepOp`` does.
         TypeError: as ``TaskiqStepOp`` does.
     """
+    # A line break would end the comment and leave the rest of it as code.
+    for comment in comments:
+        _check_comment(comment)
     unknown = [key for key in options.extra if key not in _OPTIONS]
     if unknown:
         raise MigrationFormatOptionError(
@@ -586,7 +600,7 @@ def alembic_format(schemas: Sequence[TableSchema], options: FormatOptions) -> st
         downgrade_lines = [
             line for step in reversed(steps) for line in _noop_lines(step)
         ]
-    return _REVISION.format(
+    return "".join(f"# {comment}\n" for comment in comments) + _REVISION.format(
         revision=revision,
         revises="" if down_revision is None else f" {down_revision}",
         version=_package_version(),

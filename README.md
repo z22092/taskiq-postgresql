@@ -587,7 +587,8 @@ it is right for that database at that moment, and each statement still only
 adds what is missing. The locks each step takes (`note:` lines) and what no
 step fixes (`problem:` lines), such as an invalid index or an index name that
 another table took, go to standard error, each with what to do.
-`--format alembic` writes a revision file with only the pending steps. A plan
+`--format alembic` writes a revision file with only the pending steps, whose
+first line is the same comment. A plan
 is for one database: when the components use different connection strings,
 pass `--dsn`, or plan one table at a time with `--component`.
 
@@ -608,7 +609,23 @@ own, and, like `generate`, `--component` with `--table-name` and
 `--component` needs `--dsn`, and reads with the first driver installed of
 asyncpg, psycopg and psqlpy. Their
 query reads only `pg_catalog`, which every role can read by default, so a role
-without DDL privileges can run them. The exit status says what to do:
+without DDL privileges can run them.
+
+Other users of the machine can read a command line (`ps`), and it stays in
+the shell history and in a CI job's definition: give `--dsn` a connection
+string without the password, and the password through a password file
+(`~/.pgpass`, or the file `PGPASSFILE` names) or `PGPASSWORD`. asyncpg and
+psycopg use them when the string has no password, `PGPASSWORD` first; psqlpy
+reads neither. When a driver cannot read the connection string, the error of
+`plan`, `check` and `migrate` leaves out the driver's message, which can quote
+part of the password, and says what to check; their other errors leave out
+the connection string and its password.
+
+```bash
+PGPASSFILE=/run/secrets/pgpass taskiq postgresql check --component broker --dsn postgresql://taskiq@db.internal/app
+```
+
+The exit status says what to do:
 
 | Exit status | `plan` | `check` |
 |---|---|---|
@@ -967,7 +984,8 @@ out the locks, and `--lock-timeout` sets each step's bound on lock waits as
 above. Any other option, or a value the format does not accept, exits with 2.
 `plan --format alembic` takes the same options and writes the same file with
 only the steps that the database it reads still lacks
-([Plan and check](#plan-and-check)). It checks them before it connects, and
+([Plan and check](#plan-and-check)), under a first comment line that names
+that database and its `search_path`. It checks them before it connects, and
 refuses `downgrade=drop`, with exit status 2, when a table it would drop
 already exists, such as a broker table 0.4.x created that only needs step 2:
 the revision does not create that table, so its downgrade must not drop it.

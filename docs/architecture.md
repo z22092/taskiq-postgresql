@@ -162,12 +162,19 @@ database's catalog, in one `SELECT` that also returns `current_database()`
 and `current_schemas(false)`, through the driver of a component (or a
 throwaway one with `--component`): `plan` prints `MigrationPlan.render_sql`
 with a comment naming that database, or hands the tables cut down to their
-pending steps (`MigrationPlan.pending_schemas`) to another format; `check`
+pending steps (`MigrationPlan.pending_schemas`) to another format, and to the
+alembic format the same comment, as the revision's first line; `check`
 reports, exits with 3 for a missing table or column and 4 for a problem, and
 prints JSON with `--json`. `plan` lets the format refuse its options before it
 connects, by rendering no table, and refuses the alembic format's
 `downgrade=drop` when a pending step's table already exists, since the
-revision would drop a table it did not create.
+revision would drop a table it did not create. It tells the alembic format by
+the callable `load_format` returns, not by the name given to `--format`.
+An error raised while a driver reads or connects with a connection string
+reaches `_fail` tagged with that string: the message leaves out the string and
+its password, and when the driver could not read the string at all (asyncpg's
+`ValueError`, psqlpy's `ConnectionPoolBuildError`), the driver's message too,
+since it can quote any part of the string.
 `tests/test_migration_script.py` checks that the
 steps are the statements the drivers build for `on_startup` and that the
 script builds the catalog `on_startup` builds.

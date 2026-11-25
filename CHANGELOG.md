@@ -387,6 +387,19 @@ Upgrading from 0.4.x:
   checkers flag the call. `None` or an empty string, given directly or returned
   by a callable `dsn`, raises `TypeError` with an example of the expected value.
 
+### Security
+
+- The error `taskiq postgresql migrate`, `plan` and `check` print when a
+  driver fails on a connection string no longer holds its password. When the
+  driver cannot read the string at all, as asyncpg with an unencoded `/` in
+  the password or psqlpy with an unquoted space in a `key=value` password,
+  its message quoted part of the password: it is left out, and the error says
+  what to check instead. Any other driver message loses the connection string
+  and its password, as written and percent-decoded. Other users of the
+  machine can read a command line, so give `--dsn` a connection string
+  without the password, and the password through a password file or
+  `PGPASSWORD`, which asyncpg and psycopg read and psqlpy does not.
+
 Earlier versions are not described in this file; see the
 [GitHub releases page](https://github.com/z22092/taskiq-postgresql/releases) and
 the [PyPI release history](https://pypi.org/project/taskiq-postgresql/#history).
