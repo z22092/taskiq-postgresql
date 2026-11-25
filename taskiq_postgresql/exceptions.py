@@ -36,9 +36,10 @@ class SchemaNotReadyError(BaseTaskiqAsyncpgError):
     With ``run_migrations=False``, ``startup()`` raises it before anything else
     starts when the table is missing, when a migration step that adds columns
     has not run (a broker table created by 0.4.x lacks ``channel`` and
-    ``not_before``), or when something no step fixes keeps the component from
-    working. Nothing is created: the message says how to create what a step
-    creates (``HOW_TO_MIGRATE``), and what to do about the rest.
+    ``not_before``), when a step that makes a column nullable has not run, or
+    when something no step fixes keeps the component from working. Nothing is
+    created: the message says how to create what a step creates
+    (``HOW_TO_MIGRATE``), and what to do about the rest.
 
     Attributes:
         table: The table name.

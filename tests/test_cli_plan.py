@@ -37,6 +37,7 @@ from tests.helpers import (
     run_script,
     with_netloc,
 )
+from tests.relax_schema import RELAXED, relaxing_schema
 from tests.test_cli import (
     APP,
     TABLES,
@@ -98,6 +99,7 @@ CHECK_JSON_GOLDEN = {
                 "columns": ["channel", "not_before"],
                 "indexes": ["taskiq_messages_not_before_idx"],
             },
+            "not_null_columns": [],
         },
     ],
     "problems": [],
@@ -517,6 +519,44 @@ def test_check_json_is_the_documented_report(
         f"{PROG}: pending: taskiq_messages step 2 (required): missing columns: "
         "channel, not_before; missing indexes: taskiq_messages_not_before_idx\n"
     )
+
+
+def test_plan_and_check_follow_a_step_that_relaxes_not_null(
+    scratch_dsn: str,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    schema = relaxing_schema()
+    # No released step relaxes a column, so the commands describe a table a
+    # test defines; what they read and print is the real flow.
+    monkeypatch.setattr(migrations, "table_schema", lambda *_, **__: schema)
+    execute(scratch_dsn, ";\n".join(schema.steps[0].statements))
+    options = ["--component", "result_backend", "--dsn", scratch_dsn]
+
+    code, out, err = run_in_process(["check", *options, "--json"], capsys)
+
+    assert code == 3  # noqa: PLR2004
+    (item,) = json.loads(out)["pending"]
+    assert (item["step"], item["severity"]) == (2, "required")
+    assert item["not_null_columns"] == [RELAXED]
+    assert item["missing"] == {"table": False, "columns": [], "indexes": []}
+    assert (
+        f"{PROG}: pending: {schema.name} step 2 (required): "
+        f"columns still NOT NULL: {RELAXED}\n"
+    ) in err
+
+    code, out, err = run_in_process(["plan", *options], capsys)
+
+    assert code == 0, err
+    assert f"-- pending: {schema.name} step 2\n" in out
+    assert f"{schema.steps[1].statements[0]};\n" in out
+    assert "ACCESS EXCLUSIVE" in err
+
+    execute(scratch_dsn, out)
+    code, out, err = run_in_process(["check", *options], capsys)
+
+    assert code == 0, err
+    assert f"tables up to date: {schema.name}" in err
 
 
 def test_check_fails_with_1_when_the_database_refuses(
