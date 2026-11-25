@@ -591,7 +591,8 @@ async def test_when_the_broker_shuts_down_before_any_query__then_shutdown_succee
         table_name=postgres_table,
         driver=driver,
     )
-    await worker.startup()
+    # startup() reads the catalog, which opens the pool: only a broker that
+    # never started has none.
     await worker.shutdown()
     await worker.shutdown()
 
