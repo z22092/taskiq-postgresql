@@ -21,6 +21,7 @@ import ast
 import asyncio
 import contextlib
 import inspect
+import io
 import os
 import queue
 import random
@@ -47,6 +48,8 @@ from urllib.parse import urlsplit
 import alembic as alembic_package
 import asyncpg
 import pytest
+from django.core.management import call_command
+from django.test.utils import override_settings
 from sqlalchemy import create_engine
 from sqlalchemy.orm import DeclarativeBase
 from sqlmodel import SQLModel
@@ -57,6 +60,7 @@ from taskiq.serializers import JSONSerializer, MSGPackSerializer
 from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend, migrations
 from taskiq_postgresql.cli import PostgresqlCMD
 from taskiq_postgresql.contrib.alembic import alembic_format
+from taskiq_postgresql.contrib.django.formats import django_format
 from taskiq_postgresql.contrib.sqlalchemy import add_taskiq_tables
 from taskiq_postgresql.migrations import (
     FormatOptions,
@@ -78,6 +82,7 @@ from tests.test_contrib_alembic import (
     offline_sql,
     run_upgrade,
 )
+from tests.test_contrib_django import configure_django, django_database
 from tests.test_contrib_sqlalchemy import sqlalchemy_url
 from tests.test_migrations import scram_verifier
 
@@ -99,6 +104,7 @@ FORMAT_SECTION = "writing-a-migration-format"
 INTEGRATIONS_SECTION = "integrations"
 SQLALCHEMY_SECTION = "sqlalchemy-and-sqlmodel"
 ALEMBIC_SECTION = "alembic"
+DJANGO_SECTION = "django"
 DEFAULT_TABLES = {"taskiq_messages", "taskiq_results", "taskiq_schedulers"}
 README_ROLE = "taskiq_worker"
 
@@ -163,7 +169,7 @@ def _other_blocks() -> list[Block]:
         block
         for block in _blocks("python")
         if block.id not in SCRIPTS
-        and block.section not in {SQLALCHEMY_SECTION, ALEMBIC_SECTION}
+        and block.section not in {SQLALCHEMY_SECTION, ALEMBIC_SECTION, DJANGO_SECTION}
     ]
 
 
@@ -1006,7 +1012,7 @@ def test_when_the_integration_install_lines_are_read__then_each_extra_exists() -
     provided = set(
         importlib_metadata.metadata("taskiq-postgresql").get_all("Provides-Extra") or []
     )
-    assert {"sqlalchemy", "sqlmodel", "alembic"} <= named <= provided
+    assert {"sqlalchemy", "sqlmodel", "alembic", "django"} <= named <= provided
 
 
 def test_when_the_sqlalchemy_examples_run__then_their_metadata_creates_the_tables(
@@ -1241,3 +1247,74 @@ def test_when_the_alembic_revision_examples_run__then_they_create_the_tables(
     exec(compile(result.stdout, str(written), "exec"), generated)  # noqa: S102
     run_upgrade(scratch_dsn, "psycopg", generated["upgrade"])
     assert asyncio.run(_tables(scratch_dsn)) == DEFAULT_TABLES
+
+
+def _taskiq_settings(namespace: dict[str, Any]) -> dict[str, Any]:
+    """The app's settings a README ``settings.py`` block defines."""
+    return {
+        name: value
+        for name, value in namespace.items()
+        if name.startswith("TASKIQ_POSTGRESQL_")
+    }
+
+
+@pytest.mark.timeout(180)
+def test_when_the_django_examples_run__then_migrate_creates_the_tables(
+    project: Path,
+    scratch_dsn: str,
+    ca_file: Path,
+) -> None:
+    with_paths, with_dicts = _section_blocks(DJANGO_SECTION)
+    assert with_paths.source.startswith("# settings.py\n")
+    paths = _run_block(with_paths, ca_file)
+    dicts = _run_block(with_dicts, ca_file)
+    lines = _shell_lines(DJANGO_SECTION)
+    manage = [
+        line.split()[2:] for line in lines if line.startswith("python manage.py ")
+    ]
+    assert manage == [
+        ["migrate", "taskiq_postgresql"],
+        ["migrate", "taskiq_postgresql", "zero"],
+    ]
+    migrate, zero = manage
+    assert "taskiq_postgresql.contrib.django" in paths["INSTALLED_APPS"]
+    configure_django()
+
+    with django_database(scratch_dsn):
+        with override_settings(**_taskiq_settings(paths)):
+            call_command(*migrate, verbosity=0)
+        created = asyncio.run(_tables(scratch_dsn))
+        call_command(*zero, verbosity=0)
+        after_zero = asyncio.run(_tables(scratch_dsn))
+        with override_settings(**_taskiq_settings(dicts)):
+            shown = call_command(
+                "sqlmigrate",
+                "taskiq_postgresql",
+                "0001",
+                stdout=io.StringIO(),
+            )
+            call_command(*migrate, verbosity=0)
+
+    assert created == {*DEFAULT_TABLES, "django_migrations"}
+    # zero leaves the tables; migrating again reads the settings again.
+    assert after_zero == created
+    assert asyncio.run(_tables(scratch_dsn)) == {*created, "jobs", "job_results"}
+    assert "SET LOCAL lock_timeout = '5s'" in shown
+
+    (line,) = [line for line in lines if line.startswith("taskiq ")]
+    command, _, target = line.partition(" > ")
+    result = subprocess.run(  # noqa: S603
+        _taskiq(command.split()),
+        cwd=project,
+        env=_environment(scratch_dsn),
+        capture_output=True,
+        text=True,
+        timeout=SCRIPT_TIMEOUT,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == django_format(
+        _default_schemas(),
+        FormatOptions(extra={"dependencies": "shop.0004_orders"}),
+    )
+    assert target == "shop/migrations/0005_taskiq_tables.py"
