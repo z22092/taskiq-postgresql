@@ -15,6 +15,7 @@ from typing_extensions import override
 
 from taskiq_postgresql import migrations
 from taskiq_postgresql.abc.driver import QueryDriver
+from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
     Column,
@@ -28,6 +29,7 @@ from taskiq_postgresql.core.stores.schema import (
     SchemaStore,
     Session,
     read_database,
+    schema_store,
     start_table,
 )
 
@@ -400,3 +402,18 @@ def test_the_catalog_only_driver_reads_no_table_of_its_own() -> None:
     assert driver.table_name == "taskiq_catalog"
     assert list(driver.columns) == []
     assert driver.connection_string == DSN
+
+
+def test_schema_store_of_a_broker_is_its_store_and_follows_a_swapped_driver() -> None:
+    broker = PostgresqlBroker(DSN)
+    store = schema_store(broker)
+
+    assert store is broker._store.schema
+    assert store.kind == "broker"
+    assert store.driver is broker.driver
+
+    other = FakeDriver("other_messages")
+    broker.driver = other
+
+    assert schema_store(broker) is store
+    assert store.driver is other
