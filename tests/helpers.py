@@ -196,6 +196,11 @@ def address_of(parts: SplitResult) -> str:
     return parts.netloc.rpartition("@")[2]
 
 
+def word() -> str:
+    """Letters only, made at run time: no literal looks like a credential."""
+    return "".join(random.choices(string.ascii_lowercase, k=12))
+
+
 def with_netloc(
     parts: SplitResult,
     *,
