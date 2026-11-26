@@ -86,12 +86,20 @@ async def test_failure_connection_database(
     missing_database_dsn: str,
 ) -> None:
     """Test exception raising in connection database."""
-    with pytest.raises(expected_exception=DatabaseConnectionError):
-        await PostgresqlBroker(
-            dsn=missing_database_dsn,
-            table_name="postgres_table",
-            driver=driver,
-        ).startup()
+    broker = PostgresqlBroker(
+        dsn=missing_database_dsn,
+        table_name="postgres_table",
+        driver=driver,
+    )
+    try:
+        with pytest.raises(expected_exception=DatabaseConnectionError):
+            await broker.startup()
+    finally:
+        # The failed startup leaves psycopg's pool open, its workers retrying
+        # the missing database. A worker cancelled while it connects swallows
+        # the cancellation, so the event loop closing at the end of the test
+        # would wait for it without a limit; closing the pool stops them.
+        await broker.shutdown()
 
 
 async def test_when_broker_deliver_message__then_worker_receive_message(
