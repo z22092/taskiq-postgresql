@@ -12,6 +12,7 @@ from taskiq_postgresql.core.sql.catalog import (
     CreatedAtColumn,
     CreateIndexQuery,
     CreateTableQuery,
+    DeclaredStep,
     DeleteByDateQuery,
     DeleteQuery,
     ExistsQuery,
@@ -56,6 +57,30 @@ class _ConnectionStringHolder:
         self._connection_string = value
 
 
+def _legacy_steps(
+    added_columns: Sequence[Column],
+    added_indexes: Sequence[AddedIndex],
+) -> tuple[DeclaredStep, ...]:
+    """
+    Return the steps of a driver built the old way, with no list of steps.
+
+    It exists for a driver that passes ``added_columns`` and ``added_indexes``
+    to the constructor, as every driver did before a table's steps were a list:
+    what it adds is one step. The bundled components replace the result with
+    the steps they declare.
+
+    Args:
+        added_columns: The columns added after ``CREATE TABLE``.
+        added_indexes: The indexes added with them.
+
+    Returns:
+        One step, or none when nothing is added.
+    """
+    if not added_columns and not added_indexes:
+        return ()
+    return (DeclaredStep(added_columns, added_indexes),)
+
+
 class QueryDriver(_ConnectionStringHolder, ABC):
     """Base class for all PostgreSQL backends."""
 
@@ -75,6 +100,13 @@ class QueryDriver(_ConnectionStringHolder, ABC):
     #: nothing: it probes its relations when it migrates, and checks nothing
     #: when it does not.
     component_kind: Optional["ComponentKind"] = None
+    #: The migration steps after ``CREATE TABLE``, in the order they run: the
+    #: one stored form of what the table gets after its ``CREATE``s. The
+    #: bundled components set it on their driver after building it; a driver
+    #: built the old way, with ``added_columns`` and ``added_indexes``, has them
+    #: as its one step. ``added_columns`` and ``added_indexes`` are derived from
+    #: it.
+    steps: Sequence[DeclaredStep] = ()
 
     def __init__(
         self,
@@ -94,7 +126,8 @@ class QueryDriver(_ConnectionStringHolder, ABC):
 
         ``added_columns`` and ``added_indexes`` are not part of
         ``CREATE TABLE``: ``on_startup`` adds them last, so a table created by
-        an older release gets them too.
+        an older release gets them too. They become one step in ``steps``, from
+        which ``added_columns`` and ``added_indexes`` are read back.
         """
         self.table: Identifier = as_identifier(table_name, what="table name")
         self.connection_string = connection_string
@@ -104,8 +137,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self.primary_key = primary_key
         self.created_at = created_at or CreatedAtColumn()
         self.index_columns = index_columns
-        self.added_columns = added_columns
-        self.added_indexes = added_indexes
+        self.steps = _legacy_steps(added_columns, added_indexes)
         self.connection_kwargs = connection_kwargs
         check_table_objects(
             self.table,
@@ -132,6 +164,16 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self.insert_or_update_query = InsertOrUpdateQuery(self.table)
         self.exists_query = ExistsQuery(self.table)
         self.run_migrations = run_migrations
+
+    @property
+    def added_columns(self) -> tuple[Column, ...]:
+        """The columns every step adds, in the order the steps run."""
+        return tuple(column for step in self.steps for column in step.added_columns)
+
+    @property
+    def added_indexes(self) -> tuple[AddedIndex, ...]:
+        """The indexes every step adds, in the order the steps run."""
+        return tuple(index for step in self.steps for index in step.added_indexes)
 
     @abstractmethod
     async def __aenter__(self) -> Self:
@@ -211,12 +253,28 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         columns: Sequence[Column],
         where_columns: Optional[Sequence[Column]] = None,
         where_values: Optional[Sequence[Any]] = None,
+        not_null: Sequence[Column] = (),
     ) -> list[dict[str, Any]]:
-        """Select a row from a table."""
+        """
+        Select a row from a table.
+
+        Args:
+            columns: The columns to return.
+            where_columns: The columns compared with ``where_values``.
+            where_values: The values of ``where_columns``, in the same order.
+            not_null: Columns that must not be ``NULL``: a row where one is
+                is not returned.
+        """
 
     @abstractmethod
-    async def exists(self, id: Any) -> bool:
-        """Check if a row exists in a table."""
+    async def exists(self, id: Any, not_null: Sequence[Column] = ()) -> bool:
+        """
+        Check if a row exists in a table.
+
+        Args:
+            id: The value of the primary key.
+            not_null: Columns that must not be ``NULL`` for the row to count.
+        """
 
     @abstractmethod
     async def on_startup(self) -> None:

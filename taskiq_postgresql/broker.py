@@ -34,6 +34,7 @@ from taskiq_postgresql.core.sql.catalog import (
     ClaimColumns,
     Column,
     CreatedAtColumn,
+    DeclaredStep,
     NotBeforeColumn,
     PrimaryKeyColumn,
     index_name,
@@ -223,6 +224,32 @@ class Table:
     not_before = NotBeforeColumn()
 
 
+def claim_step(table: str, columns: Table) -> DeclaredStep:
+    """
+    Return step 2 of the broker's table: the claim columns and their index.
+
+    The one definition: the broker declares it, and ``migrations`` describes the
+    same step for a kind.
+
+    Args:
+        table: The table name, as configured.
+        columns: The broker's columns.
+
+    Returns:
+        The step.
+    """
+    claim_columns = ClaimColumns(channel=columns.channel, not_before=columns.not_before)
+    return DeclaredStep(
+        added_columns=claim_columns,
+        added_indexes=[
+            AddedIndex(
+                name=index_name(table, columns.not_before),
+                columns=[*claim_columns, columns.primary_key],
+            ),
+        ],
+    )
+
+
 class PostgresqlBroker(AsyncBroker):
     """Broker that uses PostgreSQL and asyncpg with LISTEN/NOTIFY."""
 
@@ -326,10 +353,6 @@ class PostgresqlBroker(AsyncBroker):
         self._listen_readers: set[Task[None]] = set()
 
         self.columns = Table(task_id=Column(name="task_id", type_=field_for_task_id))
-        claim_columns = ClaimColumns(
-            channel=self.columns.channel,
-            not_before=self.columns.not_before,
-        )
 
         declaration = TableDeclaration(
             table=table,
@@ -342,13 +365,7 @@ class PostgresqlBroker(AsyncBroker):
             ],
             created_at=self.columns.created_at,
             index_columns=[self.columns.primary_key],
-            added_columns=claim_columns,
-            added_indexes=[
-                AddedIndex(
-                    name=index_name(self.table_name, self.columns.not_before),
-                    columns=[*claim_columns, self.columns.primary_key],
-                ),
-            ],
+            steps=[claim_step(self.table_name, self.columns)],
         )
         self.driver = build_driver(
             "broker",

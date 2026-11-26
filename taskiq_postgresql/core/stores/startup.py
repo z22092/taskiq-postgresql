@@ -23,11 +23,11 @@ from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Optional
 
 from taskiq_postgresql.core.sql.catalog import (
-    AddColumnsQuery,
     CreateIndexQuery,
     CreateTableQuery,
     MigrationLockQuery,
     RelationsExistQuery,
+    declared_step_script,
 )
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
 from taskiq_postgresql.exceptions import HOW_TO_MIGRATE, SchemaNotReadyError
@@ -190,14 +190,14 @@ async def _migrate(declaration: TableDeclaration, connection: Session) -> None:
         await connection.execute(
             CreateIndexQuery(table).make_query(declaration.index_columns),
         )
-    # Last, so a table an older release created gets them too.
-    if declaration.added_columns or declaration.added_indexes:
-        await connection.execute(
-            AddColumnsQuery(table).make_query(
-                declaration.added_columns,
-                declaration.added_indexes,
-            ),
-        )
+    # Last, one script per step in the order they are declared, so a table an
+    # older release created gets them too. The statements are the ones the
+    # migration description holds for the step (declared_step_statements).
+    for step in declaration.steps:
+        script = declared_step_script(table, step)
+        # A step that declares nothing has no statement to run.
+        if script:
+            await connection.execute(script)
 
 
 def _warn(

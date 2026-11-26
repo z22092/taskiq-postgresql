@@ -66,6 +66,9 @@ def build_driver(
         **connect_kwargs,
     )
     driver.component_kind = kind
+    # Set on the instance, not passed to the constructor, so that a driver a
+    # third party wrote keeps its signature.
+    driver.steps = declaration.steps
     return driver
 
 
