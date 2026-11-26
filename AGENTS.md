@@ -45,6 +45,8 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `tests/test_startup_check.py`, `tests/test_cli_plan.py` | The table check of `startup()` without `run_migrations`, and `taskiq postgresql plan` and `check`, against real catalogs |
 | `tests/test_contrib_*.py` | The SQLAlchemy, SQLModel, Alembic and Django integrations; the Alembic ones carry the `alembic` mark (`pytest -m alembic`), which CI also runs on the oldest Alembic the extra allows; the Django ones configure Django once per session with `settings.configure()` (no pytest-django) and point its default database at a database of their own |
 | `scripts/check_pins.py` | Checks that pins declared in several places agree |
+| `cliff.toml` | The git-cliff rules that turn the squash titles on `main` into a changelog section: which types make an entry, the Keep a Changelog groups, `!` and `BREAKING CHANGE:` as breaking, and the 0.x bump (breaking bumps the minor, anything else the patch); the `release` dependency group pins git-cliff |
+| `scripts/release.py`, `tests/unit/test_release.py` | `make release` (`prepare`: adds the `## [X.Y.Z]` section of `CHANGELOG.md` and its compare links, from git-cliff or from the hand-written `[Unreleased]`), `notes` and `check`; no git write; the tests replace its one `run` function and need no repository |
 | `docs/` | Architecture, ADRs; `docs/spikes/` holds dated planning notes |
 
 ## Commands
@@ -62,6 +64,9 @@ runs; `make help` lists them, and the `Makefile` holds the exact commands.
 | `make build` | Build the sdist and wheel into `dist/` | CD `build` |
 | `make audit` | Audit every locked dependency with `pip-audit`, hashes required (needs network) | `pip-audit` |
 | `make pins` | Check that pins declared in more than one place agree | part of `lint` |
+| `make changelog` | Preview the next `CHANGELOG.md` section from the commits since the last tag (git-cliff); writes nothing | - |
+| `make release VERSION=X.Y.Z [SOURCE=unreleased] [DATE=YYYY-MM-DD] [ALLOW_MISMATCH=1]` | Add the `## [X.Y.Z]` section and its compare links to `CHANGELOG.md`; refuses an existing section or tag, a version not above the newest tag and one other than git-cliff's bump (unless `ALLOW_MISMATCH=1`); no git write | - |
+| `make release-notes VERSION=X.Y.Z` | Print the body of that section, for the GitHub Release | - |
 
 Narrower runs while iterating:
 
@@ -154,8 +159,9 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   `refactor`, `style`, `build`, `ci` or `chore`, an optional scope
   (`fix(psycopg): ...`) and `!` for a breaking change (`feat!: ...`); subject
   under 72 characters, body says why.
-- **CHANGELOG.md** (Keep a Changelog) gets an entry for every user-visible
-  change; the rules are under "Changelog" in
+- **CHANGELOG.md**: from 0.5.1 a PR does not edit it; the PR title (a
+  Conventional Commit, `!` if breaking) is the entry and git-cliff generates
+  the list at release. Rules: "Changelog" in
   [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md).
 - **Tests prove changes.** A behaviour change comes with a test that fails
   without it and passes with it.
@@ -183,8 +189,12 @@ A release is a GitHub Release with tag `vX.Y.Z` on `main`, created by the
 maintainer. The version comes from the tag: there is no version bump commit,
 and neither `version` in `pyproject.toml` nor `uv.lock` changes for a release.
 
-1. A pull request moves the `[Unreleased]` entries of `CHANGELOG.md` under
-   the new version and updates the compare links at the bottom of the file.
+1. A pull request adds the version to `CHANGELOG.md` after `git fetch --tags`:
+   `make release VERSION=X.Y.Z [SOURCE=unreleased] [DATE=YYYY-MM-DD]
+   [ALLOW_MISMATCH=1]` (`SOURCE=unreleased` only for 0.5.0), then the
+   hand-written "Upgrade notes"; `make release-notes VERSION=X.Y.Z` prints the
+   GitHub Release body. Details: "Release Process" in
+   [`.github/CONTRIBUTING.md`](.github/CONTRIBUTING.md).
 2. Publishing the release runs `cd.yml`: it sets the version from the tag,
    builds and attests the sdist and wheel, and smoke-tests the wheel.
 3. The `publish-pypi` job waits for approval on the `pypi` environment, then

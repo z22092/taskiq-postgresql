@@ -259,18 +259,35 @@ with this exact command, with an empty diff for all eight entries, including
 
 `CHANGELOG.md` follows [Keep a Changelog 1.1.0](https://keepachangelog.com/en/1.1.0/).
 
-- Every PR that changes what a user sees or has to do (a feature, a fix, a
-  deprecation, a removal, a changed default, a changed dependency range) adds an
-  entry under `## [Unreleased]`, in the group that fits: Added, Changed,
-  Deprecated, Removed, Fixed or Security. Docs-only, test-only, CI and tooling
-  changes need no entry.
-- Write for the person who installs the package: say what changed and, for a
-  breaking change, what to do about it. Start a breaking entry with
-  `**BREAKING:**`.
-- The release moves the `## [Unreleased]` entries under a new
-  `## [X.Y.Z] - YYYY-MM-DD` heading, leaves an empty `## [Unreleased]` above it
-  and updates the comparison links at the bottom. That change goes in the PR
-  that precedes the release.
+From 0.5.1 on, git-cliff generates the list of each release from the commit
+titles on `main`, so **a PR does not edit `CHANGELOG.md`**. The repository
+merges by squash and the squash title is the PR title, so the PR title, a
+Conventional Commit, is the changelog entry. `cliff.toml` holds the rules:
+
+- Write the title for the person who installs the package: say what changed.
+  What is listed: `feat` under Added, `fix` under Fixed, `fix(security)` under
+  Security, and under Changed `refactor`, `perf`, a plain `build:` (it changes
+  what users install) and a revert (GitHub's `Revert "..."` titles included).
+  What is dropped, unless it is breaking: `build(deps)`, `docs`, `ci`, `test`,
+  `style`, `chore`, merge commits and release commits. So type a user-visible
+  change `feat` or `fix`, whatever files it touches. The scope
+  (`fix(broker): ...`) is printed in bold before the text, and the PR number
+  is linked.
+- A breaking change marks the title with `!` (`feat(broker)!: ...`), whatever
+  its type, and fills the "Breaking change" section of the PR template: what
+  breaks, who is affected and how to migrate. The release PR turns those
+  sections into an "Upgrade notes" block, the only text of a release written
+  by hand.
+- A `BREAKING CHANGE:` footer in a commit message is printed under its entry.
+  Inside that footer paragraph no line may start with `word: `: the parser
+  reads such a line as the next footer and cuts the paragraph there.
+
+`make changelog` previews the next section from the commits and writes
+nothing.
+
+The 0.5.0 release is the one exception: it ships the hand-written
+`## [Unreleased]` that was kept up to that point, renamed by
+`make release VERSION=0.5.0 SOURCE=unreleased`, with nothing dropped.
 
 ## Submitting Changes
 
@@ -301,8 +318,10 @@ with this exact command, with an empty diff for all eight entries, including
    [`AGENTS.md`](../AGENTS.md); keep the first line under 72 characters and
    say why in the body.
 
-4. **Update CHANGELOG**: Add an entry under `## [Unreleased]` for a
-   user-visible change (see [Changelog](#changelog))
+4. **Title the PR for the changelog**: From 0.5.1 do not edit `CHANGELOG.md`;
+   the PR title, a Conventional Commit, is the entry, and a breaking change
+   uses `!` and fills the template's "Breaking change" section (see
+   [Changelog](#changelog))
 
 5. **Submit PR**: Use the pull request template
 
@@ -447,8 +466,28 @@ in `tests/test_broker.py`, which is the maintained version.
 
 Releases are the maintainer's. The steps, and the rule that the version
 comes from the tag with no version bump commit, are under "Releases" in
-[`AGENTS.md`](../AGENTS.md); the changelog step follows
-[Changelog](#changelog).
+[`AGENTS.md`](../AGENTS.md). The changelog step of the release PR:
+
+1. `git fetch --tags`: the script checks local tags only, for an existing tag
+   and for the newest one.
+2. `make release VERSION=X.Y.Z` adds `## [X.Y.Z] - <date>` under an empty
+   `## [Unreleased]` from the commits since the last tag, moves the
+   `[unreleased]` link and adds the `[X.Y.Z]` one. Optional variables:
+   `SOURCE=unreleased` (only the 0.5.0 release: it renames the hand-written
+   `[Unreleased]`), `DATE=YYYY-MM-DD` (default: today) and `ALLOW_MISMATCH=1`.
+   The variables reach the script through the environment, and the script is
+   what validates them.
+3. The script refuses a version that already has a section or a tag, a
+   version not above the newest `vA.B.C` tag (a backport is out of scope, and
+   `ALLOW_MISMATCH` does not lift this), and a version other than the one
+   `git-cliff --bumped-version` derives from the commit types (in 0.x, `!`
+   bumps the minor and anything else the patch) unless `ALLOW_MISMATCH=1`; it
+   still prints the version git-cliff expects. It runs no git write: you
+   commit, push, tag and publish.
+4. Write the "Upgrade notes" block by hand under the new heading, from the
+   "Breaking change" sections of the PRs.
+5. `make release-notes VERSION=X.Y.Z` prints that section, without its
+   heading, as the GitHub Release body.
 
 ## Getting Help
 

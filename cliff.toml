@@ -1,0 +1,81 @@
+# git-cliff configuration. `scripts/release.py` (`make release`) calls it with
+# `--strip all`, so what git-cliff prints is only the body of a release section:
+# the groups and their bullets. The script writes the `## [X.Y.Z] - date`
+# heading and the compare links itself, because `--strip` removes only the
+# header and the footer, not a heading or a link written inside `body`.
+
+[changelog]
+body = """
+{%- macro entry(commit) -%}
+- {% if commit.scope %}**{{ commit.scope }}:** {% endif -%}
+  {% if commit.breaking %}**BREAKING:** {% endif -%}
+  {{ commit.message | upper_first | trim }}
+  {%- if commit.breaking and commit.breaking_description and commit.breaking_description != commit.message %}
+{{ commit.breaking_description | trim | indent(prefix="  ", first=true) }}
+  {%- endif %}
+{%- endmacro entry -%}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+
+{% for commit in commits | filter(attribute="breaking", value=true) -%}
+{{ self::entry(commit=commit) }}
+{% endfor -%}
+{#- `breaking` is null, not false, on a commit that is not a Conventional
+    Commit (GitHub's `Revert "..."` title), so a filter on false would drop it. -#}
+{% for commit in commits -%}
+{% if not commit.breaking -%}
+{{ self::entry(commit=commit) }}
+{% endif -%}
+{% endfor -%}
+{% endfor %}
+"""
+trim = true
+
+[git]
+conventional_commits = true
+# A commit that is not a Conventional Commit (a merge commit) is dropped by the
+# `^Merge ` parser below, so nothing unconventional reaches the changelog.
+filter_unconventional = false
+split_commits = false
+# A breaking commit stays even when its type is skipped below.
+protect_breaking_commits = true
+tag_pattern = "v[0-9]*"
+sort_commits = "oldest"
+# The squash title ends with "(#N)"; the (?m) flag matters because the message
+# of a squash commit has a body after that first line.
+commit_preprocessors = [
+  { pattern = '(?m)[ ]*\(#(\d+)\)$', replace = " ([#${1}](https://github.com/z22092/taskiq-postgresql/pull/${1}))" },
+]
+# The first parser that matches wins. The numeric comments order the groups the
+# way Keep a Changelog lists them, and `striptags` in the body removes them.
+#
+# What is listed: `feat` (Added), `fix` (Fixed, or Security for `fix(security)`),
+# `refactor`, `perf`, a plain `build:` (it changes what users install) and a
+# revert (GitHub's `Revert "..."` titles too, in any case), all under Changed
+# except where said, and any breaking commit whatever its type.
+#
+# What is dropped, unless it is breaking: merge commits, `chore` or `ci`
+# release commits, `build(deps)`, `docs`, `ci`, `test`, `style`, `chore`, and
+# any other title.
+commit_parsers = [
+  { message = "^Merge ", skip = true },
+  { message = "^(chore|ci)(\\(.*\\))?!?: release", skip = true },
+  { message = "^feat", group = "<!-- 0 -->Added" },
+  { message = "^(refactor|perf)", group = "<!-- 1 -->Changed" },
+  { message = "^fix\\(security\\)", group = "<!-- 5 -->Security" },
+  { message = "^fix", group = "<!-- 4 -->Fixed" },
+  { message = "(?i)^revert", group = "<!-- 1 -->Changed" },
+  # Before the skips below, so a breaking `docs`, `test`, `ci`, `style`,
+  # `chore` or `build(deps)` commit is listed, under Changed.
+  { field = "breaking", pattern = "true", group = "<!-- 1 -->Changed" },
+  { message = "^build\\(deps", skip = true },
+  { message = "^build", group = "<!-- 1 -->Changed" },
+  { message = ".*", skip = true },
+]
+
+[bump]
+# In 0.x a breaking change bumps the minor and everything else the patch; with
+# the defaults (true, true) the range v0.4.1..HEAD would give v1.0.0.
+features_always_bump_minor = false
+breaking_always_bump_major = false
+initial_tag = "v0.1.0"
