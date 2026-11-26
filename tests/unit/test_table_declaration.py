@@ -11,12 +11,14 @@ from __future__ import annotations
 from typing import Any, Optional
 
 import pytest
+from typing_extensions import override
 
+from taskiq_postgresql import migrations
 from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.abc.query import Column, PrimaryKeyColumn
 from taskiq_postgresql.core.sql.catalog import AddedIndex, CreatedAtColumn
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
-from taskiq_postgresql.migrations import _schema, declared_schema, table_schema
+from taskiq_postgresql.migrations import declared_schema, table_schema
 from tests.helpers import build_component
 
 KINDS = ("broker", "result_backend", "scheduler_source")
@@ -32,39 +34,51 @@ DSN = "postgresql://postgres@localhost:5432/postgres"
 class _Driver(QueryDriver):
     """A query driver with no I/O, to be built from what a component passes."""
 
+    @override
     async def __aenter__(self) -> Any:
         return self
 
+    @override
     async def __aexit__(self, *exc_info: object) -> None:
         return None
 
+    @override
     async def insert(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @override
     async def insert_or_update(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @override
     async def delete(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @override
     async def fetch_row(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @override
     async def delete_by_date(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @override
     async def select(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @override
     async def exists(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @override
     async def execute(self, *args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError
 
+    @override
     async def on_startup(self) -> None:
         raise NotImplementedError
 
+    @override
     async def on_shutdown(self) -> None:
         raise NotImplementedError
 
@@ -158,7 +172,7 @@ def test_a_driver_is_described_by_its_own_builders(
     driver = build_component(kind, table_name="jobs", field=field).driver
     driver.component_kind = kind  # type: ignore[assignment]
 
-    expected = _schema(
+    expected = migrations._schema(
         kind,  # type: ignore[arg-type]
         driver.create_table_query,
         driver.create_index_query,
