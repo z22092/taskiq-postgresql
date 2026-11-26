@@ -7,13 +7,18 @@ from taskiq.abc.serializer import TaskiqSerializer
 from taskiq.serializers.pickle import PickleSerializer
 
 from taskiq_postgresql.abc.driver import QueryDriver
-from taskiq_postgresql.core.sql.catalog import Column, PrimaryKeyColumn
+from taskiq_postgresql.core.sql.catalog import (
+    Column,
+    CreatedAtColumn,
+    PrimaryKeyColumn,
+)
 from taskiq_postgresql.core.sql.identifier import Identifier
-from taskiq_postgresql.exceptions import ResultIsMissingError
+from taskiq_postgresql.core.stores.declaration import TableDeclaration
+from taskiq_postgresql.core.stores.results import ResultStore
+from taskiq_postgresql.core.stores.schema import SchemaStore
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
-    get_db_driver,
     require_dsn,
     resolve_dsn,
 )
@@ -84,19 +89,40 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             ),
         )
 
-        self.driver = get_db_driver(driver)(
-            dsn_before_startup(dsn),
-            table,
+        declaration = TableDeclaration(
+            table=table,
+            primary_key=self.columns.primary_key,
             columns=[
                 self.columns.result,
             ],
-            primary_key=self.columns.primary_key,
+            created_at=CreatedAtColumn(),
             index_columns=[self.columns.primary_key],
-            run_migrations=run_migrations,
-            **connect_kwargs,
         )
-        # So that on_startup can describe the table and check it.
-        self.driver.component_kind = "result_backend"
+        self._store = ResultStore(
+            SchemaStore.build(
+                "result_backend",
+                declaration,
+                driver,
+                dsn_before_startup(dsn),
+                run_migrations=run_migrations,
+                **connect_kwargs,
+            ),
+            self.columns,
+        )
+
+    @property
+    def driver(self) -> QueryDriver:
+        """
+        The query driver of the table.
+
+        Assigning another one makes the backend use it, which is how a driver
+        of your own replaces the bundled one.
+        """
+        return self._store.driver
+
+    @driver.setter
+    def driver(self, driver: QueryDriver) -> None:
+        self._store.driver = driver
 
     @property
     def dsn(self) -> str:
@@ -123,10 +149,9 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
                 or one of its columns is missing; see
                 ``QueryDriver.on_startup``.
         """
-        self.driver.connection_string = self.dsn
-        # Again here, for a driver swapped in after the constructor.
-        self.driver.component_kind = "result_backend"
-        await self.driver.on_startup()
+        # Binds again here, for a driver swapped in after the constructor.
+        self._store.bind(self.dsn)
+        await self._store.start()
 
     async def shutdown(self) -> None:
         """
@@ -136,7 +161,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         a result holds one too. Nothing to close before startup(), or after a
         previous shutdown().
         """
-        await self.driver.on_shutdown()
+        await self._store.close()
 
     async def set_result(
         self,
@@ -151,22 +176,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             result (TaskiqResult[_ReturnType]):  result of the task.
 
         """
-        await self.driver.insert_or_update(
-            [
-                self.columns.primary_key,
-                self.columns.result,
-            ],
-            [
-                task_id,
-                self.serializer.dumpb(result),
-            ],
-            [
-                self.columns.primary_key,
-            ],
-            [
-                self.columns.result,
-            ],
-        )
+        await self._store.set(task_id, self.serializer.dumpb(result))
 
     async def is_result_ready(self, task_id: Any) -> bool:
         """
@@ -179,7 +189,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             bool: True if the result is ready else False.
 
         """
-        return await self.driver.exists(task_id)
+        return await self._store.exists(task_id)
 
     async def get_result(
         self,
@@ -199,28 +209,10 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         Raises:
             ResultIsMissingError: if there is no result when trying to get it.
         """
-        data = await self.driver.select(
-            [
-                self.columns.result,
-            ],
-            [
-                self.columns.primary_key,
-            ],
-            [task_id],
-        )
-
-        if len(data) == 0:
-            raise ResultIsMissingError(
-                f"Cannot find record with task_id = {task_id} in PostgreSQL",
-            )
-
-        result_in_bytes = next(iter(data))["result"]
+        result_in_bytes = await self._store.get(task_id)
 
         if not self.keep_results:
-            await self.driver.delete(
-                self.columns.primary_key,
-                task_id,
-            )
+            await self._store.delete(task_id)
 
         taskiq_result: TaskiqResult[_ReturnType] = self.serializer.loadb(
             result_in_bytes,
@@ -248,4 +240,4 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             to_date (datetime | date | None): Delete only results created at or
                 before it. Left out, every result from ``from_date`` on goes.
         """
-        await self.driver.delete_by_date(from_date, to_date)
+        await self._store.delete_by_date(from_date, to_date)
