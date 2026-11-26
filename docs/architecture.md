@@ -25,9 +25,10 @@ at construction, so creating one never opens a connection.
 A component does not call its driver directly: it holds a store from
 `taskiq_postgresql/core/stores/` (`MessageStore`, `ResultStore`,
 `ScheduleStore`), which calls the `QueryDriver`. The layers are component,
-store, driver. All three stores share a `SchemaStore`, which builds the driver
-from the component's `TableDeclaration` and runs its startup and shutdown; the
-CLI and `migrations.py` reach the same `SchemaStore` through `schema_store`, so
+store, driver. Each component has its own `SchemaStore`, which keeps the
+component's `TableDeclaration` and runs its driver's startup and shutdown;
+`build_driver` makes the driver from that declaration. The CLI and
+`migrations.py` reach the component's `SchemaStore` through `schema_store`, so
 they too never read `component.driver`. A test that reads the source keeps the
 boundary.
 

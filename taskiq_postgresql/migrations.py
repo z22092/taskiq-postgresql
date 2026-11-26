@@ -495,7 +495,7 @@ def table_schema(
     Describe the table of a component, of its query driver, or of a kind.
 
     Given a component, the description comes from the columns its driver
-    uses. Given that query driver, it comes from the driver's own builders,
+    uses. Given that query driver, it comes from the driver's declaration,
     under the ``component_kind`` the component set on it, so a driver can
     describe its own table. Given a kind, it needs no instance, no DSN and no
     driver: the component's defaults apply unless ``table_name`` or

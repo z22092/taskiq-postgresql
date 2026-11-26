@@ -362,7 +362,7 @@ class PostgresqlBroker(AsyncBroker):
             SchemaStore("broker", declaration, lambda: self.driver),
             self.columns,
         )
-        # The text of the claims, which tests and tools read.
+        # The text of the claims, which tests read.
         self._claim_due_query = self._store.claim_due_statement.text
         self._claim_by_id_query = self._store.claim_by_id_statement.text
         self.listen_driver: ListenDriver = get_db_listen_driver(driver)(
