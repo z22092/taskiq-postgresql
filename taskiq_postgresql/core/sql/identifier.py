@@ -7,9 +7,9 @@ PostgreSQL itself reads as a plain identifier gets through (ADR 0008).
 
 import re
 import warnings
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Final, Literal, Optional, Union
 
 # PostgreSQL's NAMEDATALEN - 1.
 MAX_IDENTIFIER_BYTES = 63
@@ -188,25 +188,34 @@ def object_name(name1: str, name2: Optional[str], label: str) -> str:
     return result + "_" + label
 
 
-def _mixed_case_message(what: str, value: str, folded: str) -> str:
+# What a name is, for the error and for what switching the spelling costs.
+NameKind = Literal["table name", "channel name", "name"]
+
+# The channel column is written from the configured spelling, so a worker on
+# the new spelling never claims those rows by NOTIFY or sweep. The migration
+# lock key hashes the table name as configured.
+_SWITCHING_COST: Final[Mapping[NameKind, str]] = {
+    "channel name": (
+        "Rows already stored keep {value!r} in the channel column: before "
+        "switching, stop producers and workers, then drain the queue or UPDATE "
+        "the rows' channel from {value!r} to {folded!r}."
+    ),
+    "table name": (
+        "Switching changes the migration lock key: switch with no migration "
+        "pending or with the workers stopped."
+    ),
+    "name": "",
+}
+
+
+def _mixed_case_message(what: NameKind, value: str, folded: str) -> str:
     """Return the warning for a name with upper case: what it costs to switch."""
     head = (
         f"{what} {value!r} has upper case letters; PostgreSQL folds it to "
         f"{folded!r}, the name it really has. Configure {folded!r}."
     )
-    if what == "channel name":
-        # The channel column is written from the configured spelling, so a
-        # worker on the new spelling never claims those rows by NOTIFY or sweep.
-        return (
-            f"{head} Rows already stored keep {value!r} in the channel column: "
-            "before switching, stop producers and workers, then drain the queue "
-            f"or UPDATE the rows' channel from {value!r} to {folded!r}."
-        )
-    # The migration lock key hashes the table name as configured.
-    return (
-        f"{head} Switching changes the migration lock key: switch with no "
-        "migration pending or with the workers stopped."
-    )
+    cost = _SWITCHING_COST[what].format(value=value, folded=folded)
+    return f"{head} {cost}" if cost else head
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,7 +236,7 @@ class Identifier:
         cls,
         value: object,
         *,
-        what: str,
+        what: NameKind,
         warn: bool = True,
         stacklevel: int = 2,
     ) -> "Identifier":
@@ -282,7 +291,7 @@ class Identifier:
         return cls(configured=value, name=folded)
 
 
-def as_identifier(value: Union[str, Identifier], *, what: str) -> Identifier:
+def as_identifier(value: Union[str, Identifier], *, what: NameKind) -> Identifier:
     """
     Return ``value`` as an ``Identifier``, checking it when it is a string.
 
@@ -350,9 +359,7 @@ def derived_names(
 
 def check_table_names(
     table: Identifier,
-    *,
-    index_names: Iterable[str],
-    serial_column: Optional[str],
+    named: Iterable[tuple[str, str]],
 ) -> None:
     """
     Refuse a table name whose derived names collide.
@@ -362,22 +369,16 @@ def check_table_names(
 
     Args:
         table: The checked table name.
-        index_names: Index names as the package writes them, with the
-            configured case; each is folded and then cut here.
-        serial_column: The ``SERIAL`` column, or None when there is none.
+        named: The ``(kind, name)`` pairs ``derived_names`` returns.
 
     Raises:
         IdentifierError: Two of the names, the table name included, are equal.
     """
-    named = derived_names(
-        table,
-        index_names=index_names,
-        serial_column=serial_column,
-    )
+    pairs = tuple(named)
     clashes = [
         f"{excerpt(first[1])} ({first[0]}) and {excerpt(second[1])} ({second[0]})"
-        for position, first in enumerate(named)
-        for second in named[position + 1 :]
+        for position, first in enumerate(pairs)
+        for second in pairs[position + 1 :]
         if first[1] == second[1]
     ]
     if clashes:

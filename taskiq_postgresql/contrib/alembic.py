@@ -358,7 +358,8 @@ def compare_taskiq_steps(
 
     Raises:
         ValueError: if the configured lock timeout is not a whole number of
-            seconds from 0 to 2147483.
+            seconds from 0 to 2147483, or the metadata describes one table
+            with two spellings of its name or with different columns.
     """
     dialect = autogen_context.dialect
     connection = autogen_context.connection

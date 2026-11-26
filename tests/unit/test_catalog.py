@@ -31,8 +31,8 @@ from taskiq_postgresql.core.sql.catalog import (
     RelationsExistQuery,
     SelectQuery,
     UpdatedAtColumn,
-    _sql_literal,
 )
+from taskiq_postgresql.core.sql.catalog.base import _sql_literal
 from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.core.sql.statement import ParamType, Script, Statement
 
@@ -252,6 +252,16 @@ def test_make_query_accepts_the_drivers_literal_column() -> None:
     )
 
 
+def test_exists_query_text_does_not_type_the_key() -> None:
+    # No ParamType covers NUMERIC: a third-party driver with such a key column
+    # still gets the text.
+    key = Column("id", "NUMERIC")
+
+    text = catalog.ExistsQuery("jobs").make_query(key)
+
+    assert text == "SELECT 1 FROM jobs WHERE id = $1"
+
+
 def test_exists_query_statement_is_the_text_the_drivers_build_today() -> None:
     key = Column("id", "SERIAL")
 
@@ -355,3 +365,26 @@ def test_catalog_and_database_reads_wrap_the_same_text() -> None:
     )
     with pytest.raises(ValueError, match="at least one table schema"):
         catalog.catalog_read([])
+
+
+@pytest.mark.parametrize(
+    ("type_", "serial"),
+    [
+        ("SERIAL", True),
+        ("serial", True),
+        ("SERIAL4", True),
+        ("BIGSERIAL", True),
+        ("SERIAL8", True),
+        ("SMALLSERIAL", True),
+        ("SERIAL2", True),
+        ("INTEGER", False),
+        ("BIGINT", False),
+        ("UUID", False),
+    ],
+)
+def test_a_serial_column_is_any_of_the_serial_pseudo_types(
+    type_: str,
+    serial: bool,
+) -> None:
+    # PostgreSQL gives each of these a sequence of its own.
+    assert Column("id", type_).is_serial is serial

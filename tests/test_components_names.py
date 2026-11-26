@@ -211,7 +211,7 @@ async def test_a_listen_driver_built_with_mixed_case_receives_the_folded_notify(
         await asyncio.sleep(0.3)  # let the listener subscribe before notifying
         await fetch_on_server(
             postgresql_dsn,
-            "SELECT pg_notify($1, $2)::text",
+            "SELECT pg_notify($1, $2)",
             channel.lower(),
             "7",
         )

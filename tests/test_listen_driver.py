@@ -9,7 +9,7 @@ import pytest
 from taskiq import AckableMessage, BrokerMessage
 
 from taskiq_postgresql import PostgresqlBroker
-from taskiq_postgresql.broker import _payload_excerpt
+from taskiq_postgresql.core.sql.identifier import excerpt
 from taskiq_postgresql.utils import get_db_listen_driver
 from tests.helpers import NOTIFY_DELIVERS_WITHIN
 
@@ -158,8 +158,7 @@ async def test_when_payload_is_an_integer_out_of_the_id_range__then_it_is_skippe
     assert received.data == message.message
     broker_records = [r for r in caplog.records if r.name == "taskiq.asyncpg_broker"]
     assert [r.getMessage() for r in broker_records] == [
-        f"Invalid NOTIFY payload {_payload_excerpt(payload)} "
-        f"on channel {broker.channel_name}"
+        f"Invalid NOTIFY payload {excerpt(payload)} on channel {broker.channel_name}"
         for payload in OUT_OF_RANGE_IDS
     ]
     assert all(record.exc_info is None for record in broker_records)

@@ -27,7 +27,6 @@ from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
     Column,
-    listen_script,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.drivers._health import check_listen
@@ -332,7 +331,7 @@ class PsycopgDriver(QueryDriver):
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
                 sql(
-                    self.exists_text,
+                    self.exists_query.make_query(self.primary_key),
                 ),
                 params=encode_params([self.primary_key], [id]),
             )
@@ -420,7 +419,7 @@ class PsycopgListenDriver(ListenDriver):
         """Initialize the listen driver."""
         super().__init__(connection_string, channel_name, **connection_kwargs)
         self.connection: Optional[AsyncConnection[TupleRow]] = None
-        self._listen_statement = sql(listen_script(self.channel).text)
+        self._listen_statement = sql(self.listen_text)
 
     async def on_startup(self) -> None:
         """Connect and LISTEN on the channel."""

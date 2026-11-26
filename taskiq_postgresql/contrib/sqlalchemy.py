@@ -104,8 +104,9 @@ def add_taskiq_tables(
         TypeError: if no target is given.
         ValueError: if the metadata holds a different table under one of the
             names, a table name is not a plain SQL identifier, two targets
-            spell one table name differently ('Jobs' and 'jobs'), or a target
-            cannot be described (see ``collect_schemas``).
+            spell one table name differently ('Jobs' and 'jobs') or describe
+            it with different columns, or a target cannot be described (see
+            ``collect_schemas``).
         LookupError: if a target holds no component of this package.
         ImportError: if a path's module cannot be imported.
         AttributeError: if a path's module has no such object.

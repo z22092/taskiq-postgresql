@@ -29,7 +29,7 @@ from taskiq.schedule_sources import LabelScheduleSource
 from taskiq_postgresql import migrations
 from taskiq_postgresql.abc.query import MIGRATION_LOCK_NAMESPACE, Column
 from taskiq_postgresql.broker import PostgresqlBroker
-from taskiq_postgresql.core.sql.catalog import _sql_literal
+from taskiq_postgresql.core.sql.catalog.base import _sql_literal
 from taskiq_postgresql.migrations import (
     DEFAULT_LOCK_TIMEOUT,
     ColumnSchema,

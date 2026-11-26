@@ -82,6 +82,9 @@ Upgrading from 0.4.x:
   (`check` exits 3 while it is pending), and the Alembic integration leaves its
   `ALTER COLUMN ... DROP NOT NULL` to the step instead of proposing it twice.
   No step of this release relaxes a column.
+- `taskiq_postgresql.migrations.catalog_state`, `catalog_tables` and
+  `keep_table_schema`: the catalog read of `taskiq postgresql check` and the
+  one-description-per-table rule the integrations share.
 - Python 3.14 and 3.15 support.
 - taskiq 0.13 support: the dependency range is now `taskiq>=0.11.7,<0.14`. The
   package no longer imports `taskiq.compat`, whose pydantic helpers taskiq 0.13
@@ -272,6 +275,10 @@ Upgrading from 0.4.x:
   refuses two spellings of one table, such as `Jobs` and `jobs`. PostgreSQL has
   one table for both, and each spelling would take its own migration lock. Use
   one spelling.
+- **BREAKING:** `add_taskiq_tables` (and so `taskiq_metadata`) and the Alembic
+  autogenerate comparator `compare_taskiq_steps` refuse one table described
+  twice with different columns, with a `ValueError`. Before, each silently kept
+  the first description. Give each component a table of its own.
 - The broker sends its notification with `SELECT FROM pg_notify($1, $2)`, the
   channel and the message id as bind values, instead of a `NOTIFY` statement
   with the id written in the text. Workers listening on the channel receive
@@ -279,8 +286,8 @@ Upgrading from 0.4.x:
 - A table or channel name with upper case letters is accepted and warns with a
   `DeprecationWarning` that names the folded form PostgreSQL uses. Configure
   that form. Python hides a `DeprecationWarning` raised outside `__main__` by
-  default; it shows under pytest, with `python -W default`, or when your
-  logging setup captures warnings. The `channel` column and the claim keep the
+  default; it shows under pytest or with `python -W default::DeprecationWarning`,
+  and `logging.captureWarnings(True)` then routes it to your logs. The `channel` column and the claim keep the
   name as configured, so switching a channel to its folded spelling strands the
   rows stored under the old one (delayed messages, a backlog, a producer on the
   old setting during a rolling deploy): stop producers and workers, then drain
@@ -372,6 +379,9 @@ Upgrading from 0.4.x:
 - With asyncpg, the broker's pool now gives up after `query_timeout` seconds
   waiting for a free connection, so `kick()` raises `asyncio.TimeoutError`
   instead of waiting for good when the pool stays exhausted that long.
+- Custom drivers: `ListenDriver.__init__` now checks the channel name and raises
+  `IdentifierError` for one outside the rule, and stores the folded name in
+  `channel_name`.
 - Custom drivers: the broker calls a listen driver's `on_shutdown()` and then
   `on_startup()` to reopen LISTEN, so both must work any number of times and
   `on_shutdown()` must not fail on a connection that is already gone. A reopen
@@ -401,6 +411,8 @@ Upgrading from 0.4.x:
 
 ### Fixed
 
+- With asyncpg, `PostgresqlResultBackend.is_result_ready()` returns `True` or
+  `False`, as with the other drivers; it returned `1` or `None`.
 - With `asyncpg`, a worker listening on a channel with upper case letters now
   receives the broker's notification at once. asyncpg quoted the name in
   `LISTEN` while `NOTIFY` folded it, so such a worker delivered only through

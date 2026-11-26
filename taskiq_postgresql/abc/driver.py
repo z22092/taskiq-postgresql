@@ -21,6 +21,7 @@ from taskiq_postgresql.core.sql.catalog import (
     RelationsExistQuery,
     SelectQuery,
     check_table_objects,
+    listen_script,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier, as_identifier
 from taskiq_postgresql.exceptions import DatabaseConnectionError
@@ -95,10 +96,6 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         ``CREATE TABLE``: ``on_startup`` adds them last, so a table created by
         an older release gets them too.
         """
-        # A component passes the Identifier it parsed, and warned about, where
-        # the user wrote the name. A string is only checked, so a driver built
-        # on its own, or by a third party, gets the same refusals without a
-        # second warning.
         self.table: Identifier = as_identifier(table_name, what="table name")
         self.connection_string = connection_string
         # The name as configured, which the SQL writes.
@@ -132,9 +129,6 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self.select_query = SelectQuery(self.table)
         self.insert_or_update_query = InsertOrUpdateQuery(self.table)
         self.exists_query = ExistsQuery(self.table)
-        # The text, not the typed statement: the key column of a driver no
-        # component owns may be one no ParamType covers.
-        self.exists_text = self.exists_query.make_query(self.primary_key)
         self.run_migrations = run_migrations
 
     @abstractmethod
@@ -313,10 +307,9 @@ class ListenDriver(_ConnectionStringHolder, ABC):
             IdentifierError: ``channel_name`` is a string the rule refuses.
         """
         self.channel: Identifier = as_identifier(channel_name, what="channel name")
-        # The folded name: asyncpg's add_listener() quotes what it is given, so
-        # only the name PostgreSQL folds an unquoted LISTEN to receives the
-        # NOTIFY.
+        # The folded name, which is the one an unquoted LISTEN subscribes to.
         self.channel_name = self.channel.name
+        self.listen_text = listen_script(self.channel).text
         self.connection_string = connection_string
         self.connection_kwargs = connection_kwargs
 

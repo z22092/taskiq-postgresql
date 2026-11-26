@@ -6,6 +6,7 @@ from taskiq_postgresql.core.sql.catalog.base import QueryBase
 from taskiq_postgresql.core.sql.catalog.columns import Column
 from taskiq_postgresql.core.sql.identifier import (
     Identifier,
+    as_identifier,
     check_table_names,
     derived_names,
 )
@@ -65,29 +66,22 @@ class AddedIndex(NamedTuple):
     columns: Sequence[Column]
 
 
-class _NameInputs(NamedTuple):
-    index_names: list[str]
-    serial_column: Optional[str]
-
-
-def _name_inputs(
-    table: Identifier,
-    columns: Sequence[Column],
+def index_names(
+    table_name: str,
     index_columns: Optional[Sequence[Column]],
     added_indexes: Sequence[AddedIndex],
-) -> _NameInputs:
-    # The one place that reads a table's declaration into the inputs of the
-    # derived-name rules.
-    return _NameInputs(
-        index_names=[
-            *(index_name(table.configured, column) for column in index_columns or ()),
-            *(index.name for index in added_indexes),
-        ],
-        serial_column=next(
-            (column.name for column in columns if column.is_serial),
-            None,
-        ),
-    )
+) -> list[str]:
+    """
+    Return the names of a table's indexes, as the package writes them.
+
+    First the hash index of each of ``index_columns`` (``CreateIndexQuery``),
+    then each of ``added_indexes`` (``AddColumnsQuery``), with the case of
+    ``table_name``.
+    """
+    return [
+        *(index_name(table_name, column) for column in index_columns or ()),
+        *(index.name for index in added_indexes),
+    ]
 
 
 def table_object_names(
@@ -100,6 +94,10 @@ def table_object_names(
     """
     Return the names PostgreSQL gives the objects of a declared table.
 
+    This is the one place that reads a table's declaration (its columns and
+    indexes) into the inputs of ``derived_names``; ``check_table_objects`` and
+    the tests go through it.
+
     Args:
         table: The checked table name.
         columns: Every column ``CREATE TABLE`` declares.
@@ -109,11 +107,13 @@ def table_object_names(
     Returns:
         ``(kind, name)`` pairs, as ``derived_names`` returns them.
     """
-    inputs = _name_inputs(table, columns, index_columns, added_indexes)
     return derived_names(
         table,
-        index_names=inputs.index_names,
-        serial_column=inputs.serial_column,
+        index_names=index_names(table.configured, index_columns, added_indexes),
+        serial_column=next(
+            (column.name for column in columns if column.is_serial),
+            None,
+        ),
     )
 
 
@@ -127,10 +127,9 @@ def check_table_objects(
     """
     Refuse a table name whose derived names collide.
 
-    The one place that turns a table's declaration into the inputs of that
-    check. A driver runs it when it is built and the migration description
-    runs it again when it is built, from the same lists, so a table that is
-    described but never run through a driver gets the same refusal.
+    A driver runs it when it is built and the migration description runs it
+    again when it is built, from the same lists, so a table that is described
+    but never run through a driver gets the same refusal.
     ``CREATE INDEX IF NOT EXISTS`` skips an index whose cut name already
     exists, so a collision would lose an index without an error.
 
@@ -143,11 +142,14 @@ def check_table_objects(
     Raises:
         IdentifierError: Two of the names the table's objects get are equal.
     """
-    inputs = _name_inputs(table, columns, index_columns, added_indexes)
     check_table_names(
         table,
-        index_names=inputs.index_names,
-        serial_column=inputs.serial_column,
+        table_object_names(
+            table,
+            columns=columns,
+            index_columns=index_columns,
+            added_indexes=added_indexes,
+        ),
     )
 
 
@@ -196,22 +198,6 @@ class DropNotNullQuery(QueryBase):
         return Script(self.make_query(column))
 
 
-def _probe_text(relation_count: int, column_count: int) -> str:
-    checks = [
-        f"to_regclass(${position}) IS NOT NULL"
-        for position in range(1, relation_count + 1)
-    ]
-    checks.extend(
-        "EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1)"  # noqa: S608
-        f" AND attname::text = ${position} AND NOT attisdropped)"
-        for position in range(
-            relation_count + 1,
-            relation_count + 1 + column_count,
-        )
-    )
-    return "SELECT " + " AND ".join(checks)
-
-
 class RelationsExistQuery(QueryBase):
     """
     Query telling whether a table and every index it gets all exist.
@@ -233,8 +219,7 @@ class RelationsExistQuery(QueryBase):
         """Return the table name, then the name of each index on it."""
         return [
             self.table_name,
-            *(index_name(self.table_name, column) for column in index_columns or ()),
-            *(index.name for index in added_indexes),
+            *index_names(self.table_name, index_columns, added_indexes),
         ]
 
     def params(
@@ -261,7 +246,19 @@ class RelationsExistQuery(QueryBase):
         relation_count = len(
             self.relation_names(index_columns, added_indexes=added_indexes),
         )
-        return _probe_text(relation_count, len(added_columns))
+        checks = [
+            f"to_regclass(${position}) IS NOT NULL"
+            for position in range(1, relation_count + 1)
+        ]
+        checks.extend(
+            "EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1)"  # noqa: S608
+            f" AND attname::text = ${position} AND NOT attisdropped)"
+            for position in range(
+                relation_count + 1,
+                relation_count + 1 + len(added_columns),
+            )
+        )
+        return "SELECT " + " AND ".join(checks)
 
     def statement(
         self,
@@ -271,16 +268,23 @@ class RelationsExistQuery(QueryBase):
         added_indexes: Sequence[AddedIndex] = (),
     ) -> Statement:
         """Return the query typed: one text parameter per item of ``params``."""
-        relation_count = len(
-            self.relation_names(index_columns, added_indexes=added_indexes),
+        params = self.params(
+            index_columns,
+            added_columns=added_columns,
+            added_indexes=added_indexes,
         )
         return Statement(
-            _probe_text(relation_count, len(added_columns)),
-            (ParamType.TEXT,) * (relation_count + len(added_columns)),
+            self.make_query(
+                index_columns,
+                added_columns=added_columns,
+                added_indexes=added_indexes,
+            ),
+            (ParamType.TEXT,) * len(params),
             (("?column?", ParamType.BOOL),),
         )
 
 
 def drop_table_script(table: Union[str, Identifier]) -> Script:
     """Return the script that drops ``table`` if it exists."""
-    return Script(f"DROP TABLE IF EXISTS {QueryBase(table).table_name}")
+    table_name = as_identifier(table, what="table name").configured
+    return Script(f"DROP TABLE IF EXISTS {table_name}")

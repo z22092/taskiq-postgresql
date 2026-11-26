@@ -136,13 +136,6 @@ def _parse_message_id(payload: str) -> Optional[int]:
     return message_id
 
 
-def _payload_excerpt(payload: str) -> str:
-    """Return ``payload`` as a log line may carry it: quoted, cut if long."""
-    # Any role with CONNECT can NOTIFY the channel, and a payload can hold
-    # close to 8 KB, so a log line must not carry it whole.
-    return excerpt(payload)
-
-
 async def _ack() -> None:
     """Do nothing: the row was deleted when the message was claimed."""
 
@@ -624,9 +617,12 @@ class PostgresqlBroker(AsyncBroker):
             async for payload in self.listen_driver:
                 message_id = _parse_message_id(payload)
                 if message_id is None:
+                    # Any role with CONNECT can NOTIFY the channel, and a
+                    # payload can hold close to 8 KB: the log line must not
+                    # carry it whole.
                     logger.warning(
                         "Invalid NOTIFY payload %s on channel %s",
-                        _payload_excerpt(payload),
+                        excerpt(payload),
                         self.channel_name,
                     )
                 else:

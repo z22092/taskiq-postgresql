@@ -26,6 +26,7 @@ import re
 import sys
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from importlib import import_module
 from importlib.metadata import PackageNotFoundError, entry_points, version
 from inspect import isfunction, signature
@@ -58,6 +59,7 @@ from taskiq_postgresql.core.sql.catalog import (
     check_table_objects,
     in_transaction,
     index_name,
+    index_names,
     lock_timeout_scripts,
     migration_lock_script,
 )
@@ -455,13 +457,14 @@ class TableSchema:
                         "nullable, and no earlier step adds it",
                     )
 
-    @property
+    @cached_property
     def table(self) -> Identifier:
         """
         Return the table name as a checked ``Identifier``.
 
         Not checked when the description is built, because the class is
-        public; checked, without a warning, each time a tool reads it here.
+        public; checked, without a warning, the first time a tool reads it
+        here. A name the rule refuses is not kept: it raises again.
 
         Raises:
             IdentifierError: if the name is not one the rule accepts.
@@ -779,9 +782,10 @@ def scoped_lock_timeout(statements: Sequence[str], lock_timeout: int) -> list[st
         ValueError: if ``lock_timeout`` is not a whole number of seconds from
             0 to 2147483.
     """
-    scripts = lock_timeout_scripts(lock_timeout)
+    check_lock_timeout(lock_timeout)
     if not lock_timeout:
         return list(statements)
+    scripts = lock_timeout_scripts(lock_timeout)
     return [
         scripts.save.text,
         scripts.set_local.text,
@@ -1016,7 +1020,8 @@ class PendingStep:
         Returns:
             The statements, without the trailing semicolon.
         """
-        return _script_statements([(self.table, (self.step,))], lock=lock)
+        table = as_identifier(self.table, what="table name")
+        return _script_statements([(table, (self.step,))], lock=lock)
 
 
 @dataclass(frozen=True)
@@ -1079,7 +1084,11 @@ class MigrationPlan:
             The statements in the order they run; none when nothing is
             pending.
         """
-        return _script_statements(list(self._steps_by_table().items()), lock=lock)
+        tables = [
+            (as_identifier(table, what="table name"), steps)
+            for table, steps in self._steps_by_table().items()
+        ]
+        return _script_statements(tables, lock=lock)
 
     def pending_schemas(self, schemas: Iterable[TableSchema]) -> list[TableSchema]:
         """
@@ -1452,7 +1461,10 @@ class RenderedStep:
             TypeError: as the class does.
         """
         statements = scoped_lock_timeout(
-            _script_statements([(table, (step,))], lock=lock),
+            _script_statements(
+                [(as_identifier(table, what="table name"), (step,))],
+                lock=lock,
+            ),
             lock_timeout,
         )
         bound = (
@@ -1699,17 +1711,15 @@ def _checked_tables(
 
 
 def _script_statements(
-    tables: Sequence[tuple[Union[str, Identifier], Sequence[MigrationStep]]],
+    tables: Sequence[tuple[Identifier, Sequence[MigrationStep]]],
     *,
     lock: bool,
 ) -> list[str]:
     statements: list[str] = []
     if lock:
         # Sorted, so two scripts that lock the same tables take the locks in
-        # the same order and cannot deadlock each other. A name that is still
-        # a string (a rendered step carries one) is checked here.
-        checked = (as_identifier(table, what="table name") for table, _ in tables)
-        locked = {table.configured: table for table in checked}
+        # the same order and cannot deadlock each other.
+        locked = {table.configured: table for table, _ in tables}
         statements.extend(
             migration_lock_script(locked[name]).text for name in sorted(locked)
         )
@@ -1755,12 +1765,11 @@ def _script_text(
 
 
 def _lock_timeout_first(statements: Sequence[str], lock_timeout: int) -> list[str]:
-    # Validated by lock_timeout_scripts, which builds the lines once.
-    scripts = lock_timeout_scripts(lock_timeout)
+    check_lock_timeout(lock_timeout)
     if not lock_timeout:
         return list(statements)
     # First, so that it also bounds the wait for the advisory lock.
-    return [scripts.set_local.text, *statements]
+    return [lock_timeout_scripts(lock_timeout).set_local.text, *statements]
 
 
 # The type format_type() reports for each TypeName. SERIAL is an integer
@@ -1976,21 +1985,22 @@ def _schema(
     added_indexes: Sequence[AddedIndex],
 ) -> TableSchema:
     name = create_table.table_name
+    names = index_names(name, index_columns, added_indexes)
     created_indexes = tuple(
-        IndexSchema(
-            name=index_name(name, column),
-            columns=(column.name,),
-            method="hash",
-        )
-        for column in index_columns
+        IndexSchema(name=index, columns=(column.name,), method="hash")
+        for index, column in zip(names, index_columns, strict=False)
     )
     added = tuple(
         IndexSchema(
-            name=index.name,
-            columns=tuple(column.name for column in index.columns),
+            name=index,
+            columns=tuple(column.name for column in added_index.columns),
             method="btree",
         )
-        for index in added_indexes
+        for index, added_index in zip(
+            names[len(index_columns) :],
+            added_indexes,
+            strict=True,
+        )
     )
     # The same check the driver ran when it was built, from the same lists the
     # steps are built from, and run again on purpose: a description built
@@ -2234,7 +2244,7 @@ def _components_of(
     return components
 
 
-def keep_table_schema(kept: dict[str, TableSchema], schema: TableSchema) -> bool:
+def keep_table_schema(kept: dict[str, TableSchema], schema: TableSchema) -> None:
     """
     Keep the first description of each table; refuse a table described two ways.
 
@@ -2247,17 +2257,11 @@ def keep_table_schema(kept: dict[str, TableSchema], schema: TableSchema) -> bool
         kept: The descriptions so far, by folded table name; updated in place.
         schema: The description to add.
 
-    Returns:
-        ``True`` when the table is new, ``False`` when ``kept`` already holds
-        the same description.
-
     Raises:
         ValueError: if ``schema`` spells the table name differently from the
             description kept, or describes it with different columns.
     """
-    key = fold(schema.name)
-    is_new = key not in kept
-    first = kept.setdefault(key, schema)
+    first = kept.setdefault(fold(schema.name), schema)
     if first.name != schema.name:
         raise ValueError(
             f"the table is configured as {first.name!r} and as "
@@ -2269,13 +2273,18 @@ def keep_table_schema(kept: dict[str, TableSchema], schema: TableSchema) -> bool
             f"the table {schema.name!r} is described twice, with different "
             "columns: give each component a table of its own",
         )
-    return is_new
 
 
 def _one_per_table(described: Iterable[tuple[_T, TableSchema]]) -> list[_T]:
     """Keep the first item of each table; refuse a table described two ways."""
     kept: dict[str, TableSchema] = {}
-    return [item for item, schema in described if keep_table_schema(kept, schema)]
+    items: list[_T] = []
+    for item, schema in described:
+        is_new = fold(schema.name) not in kept
+        keep_table_schema(kept, schema)
+        if is_new:
+            items.append(item)
+    return items
 
 
 def _describe(target: object) -> str:

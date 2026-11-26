@@ -29,9 +29,9 @@ whatever its driver.
 `fetch_row` and `execute` leave the public API, and `NOTIFY` becomes
 `SELECT FROM pg_notify($1, $2)`. `pg_notify` returns `void`, which psqlpy
 cannot decode, so the statement selects it as a table function and has no
-result column. A statement whose result is `void` declares zero columns. Only the core
-builds a `Statement`; a test that reads the source keeps it so. That is hygiene; the security control is the
-identifier rule plus bind parameters.
+result column. A statement whose result is `void` declares zero columns. Only
+the core builds a `Statement`; a test that reads the source keeps it so. That
+is hygiene; the security control is the identifier rule plus bind parameters.
 
 The driver contract, `typing.Protocol`s valid at the Python 3.10 floor:
 

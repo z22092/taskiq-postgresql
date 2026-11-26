@@ -17,7 +17,6 @@ from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
     Column,
-    listen_script,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.drivers._health import check_listen
@@ -245,7 +244,7 @@ class PsqlpyDriver(QueryDriver):
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
             results = await connection.fetch(
-                self.exists_text,
+                self.exists_query.make_query(self.primary_key),
                 encode_psqlpy_params([self.primary_key], [id]),
             )
             v = results.result()
@@ -316,8 +315,6 @@ class PsqlpyListenDriver(ListenDriver):
         super().__init__(connection_string, channel_name, **connection_kwargs)
         self.connection: Optional[ConnectionPool] = None
         self.listener: Optional[Listener] = None
-        # The folded name, which add_callback() registers as well.
-        self._listen_statement = listen_script(self.channel).text
         # A payload, or the error that ended the listener.
         self._queue: AsyncQueue[Union[str, BaseException]] = AsyncQueue()
         self._reader: Optional[Task[None]] = None
@@ -338,7 +335,7 @@ class PsqlpyListenDriver(ListenDriver):
             # iterating starts, so a NOTIFY before that would be lost: listen
             # before returning (psqlpy-python/psqlpy#179).
             await wait_for(
-                listener.connection.execute(self._listen_statement),
+                listener.connection.execute(self.listen_text),
                 self.query_timeout,
             )
         except Exception as error:
@@ -416,7 +413,7 @@ class PsqlpyListenDriver(ListenDriver):
                 # the channel.
                 await check_listen(
                     wait_for(
-                        listener.connection.execute(self._listen_statement),
+                        listener.connection.execute(self.listen_text),
                         self.query_timeout,
                     ),
                     partial(_close, pool),

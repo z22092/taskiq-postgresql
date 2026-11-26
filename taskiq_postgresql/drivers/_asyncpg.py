@@ -15,7 +15,6 @@ from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
     Column,
-    listen_script,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.drivers._health import check_listen
@@ -193,10 +192,12 @@ class AsyncpgDriver(QueryDriver):
     async def exists(self, id: Any) -> bool:
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
-            return await connection.fetchval(
-                self.exists_text,
+            found = await connection.fetchval(
+                self.exists_query.make_query(self.primary_key),
                 id,
             )
+            # The query selects the constant 1, or no row at all.
+            return found is not None
 
     async def delete_by_date(
         self,
@@ -265,7 +266,6 @@ class AsyncpgListenDriver(ListenDriver):
         # given, so only the folded one receives the NOTIFY.
         super().__init__(connection_string, channel_name, **connection_kwargs)
         self.connection: Optional[Connection] = None
-        self._listen_statement = listen_script(self.channel).text
         # None: a connection closed, see _termination_handler.
         self._queue: AsyncQueue[Optional[str]] = AsyncQueue()
 
@@ -357,7 +357,7 @@ class AsyncpgListenDriver(ListenDriver):
             except AsyncTimeoutError:
                 await check_listen(
                     connection.execute(
-                        self._listen_statement,
+                        self.listen_text,
                         timeout=self.query_timeout,
                     ),
                     partial(_terminate, connection),

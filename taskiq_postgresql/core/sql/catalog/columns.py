@@ -5,6 +5,10 @@ from typing import Any, NamedTuple
 from taskiq_postgresql.core.sql.catalog.base import QueryBase
 from taskiq_postgresql.core.sql.statement import ParamType, param_type
 
+_SERIAL_TYPES = frozenset(
+    {"SMALLSERIAL", "SERIAL2", "SERIAL", "SERIAL4", "BIGSERIAL", "SERIAL8"},
+)
+
 
 class Column(QueryBase):
     """Base class for all columns."""
@@ -36,8 +40,14 @@ class Column(QueryBase):
 
     @property
     def is_serial(self) -> bool:
-        """Whether PostgreSQL gives the column a sequence of its own."""
-        return self.type.upper() == "SERIAL"
+        """
+        Whether PostgreSQL gives the column a sequence of its own.
+
+        True for the serial pseudo-types: ``SMALLSERIAL``, ``SERIAL``,
+        ``BIGSERIAL`` and their ``SERIAL2``, ``SERIAL4`` and ``SERIAL8``
+        spellings, in any case.
+        """
+        return self.type.upper() in _SERIAL_TYPES
 
     def make_query(self) -> str:
         """Return the column definition as a SQL string."""

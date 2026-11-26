@@ -15,6 +15,7 @@ from taskiq_postgresql.core.sql.identifier import (
     Identifier,
     IdentifierError,
     check_table_names,
+    derived_names,
     excerpt,
     fold,
     object_name,
@@ -303,7 +304,7 @@ def test_broker_accepts_up_to_61_bytes(length: int) -> None:
 
 @pytest.mark.parametrize("length", [62, 63])
 def test_broker_refuses_62_bytes_and_more(length: int) -> None:
-    with pytest.raises(IdentifierError):
+    with pytest.raises(IdentifierError, match="too long"):
         check("b" * length, BROKER)
 
 
@@ -313,7 +314,7 @@ def test_result_backend_accepts_up_to_62_bytes(length: int) -> None:
 
 
 def test_result_backend_refuses_63_bytes() -> None:
-    with pytest.raises(IdentifierError):
+    with pytest.raises(IdentifierError, match="too long"):
         check("r" * 63, RESULT_BACKEND)
 
 
@@ -323,14 +324,14 @@ def test_scheduler_accepts_up_to_61_bytes(length: int) -> None:
 
 
 def test_scheduler_refuses_62_bytes() -> None:
-    with pytest.raises(IdentifierError):
+    with pytest.raises(IdentifierError, match="too long"):
         check("s" * 62, SCHEDULER)
 
 
 def test_a_mixed_case_62_byte_broker_name_is_refused() -> None:
     name = "Jobs" + "b" * 58
     assert len(name) == BROKER_NAME_BYTES
-    with pytest.raises(IdentifierError):
+    with pytest.raises(IdentifierError, match="too long"):
         check(name, BROKER)
 
 
@@ -357,16 +358,26 @@ def test_a_cut_index_equal_to_the_table_name_is_refused() -> None:
 
 def test_the_primary_key_name_takes_part() -> None:
     # The cut primary key of a 63 byte table is "t"*58 + "_pkey".
-    with pytest.raises(IdentifierError):
+    table = parse("t" * 63)
+    with pytest.raises(IdentifierError, match="too long"):
         check_table_names(
-            parse("t" * 63),
-            index_names=["t" * 58 + "_pkey"],
-            serial_column=None,
+            table,
+            derived_names(
+                table,
+                index_names=["t" * 58 + "_pkey"],
+                serial_column=None,
+            ),
         )
 
 
 def test_the_serial_sequence_name_takes_part() -> None:
     table = parse("jobs")
-    with pytest.raises(IdentifierError):
-        check_table_names(table, index_names=["jobs_id_seq"], serial_column="id")
-    check_table_names(table, index_names=["jobs_id_seq"], serial_column=None)
+    with pytest.raises(IdentifierError, match="too long"):
+        check_table_names(
+            table,
+            derived_names(table, index_names=["jobs_id_seq"], serial_column="id"),
+        )
+    check_table_names(
+        table,
+        derived_names(table, index_names=["jobs_id_seq"], serial_column=None),
+    )

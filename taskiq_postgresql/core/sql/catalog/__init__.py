@@ -9,7 +9,7 @@ re-exports every name, so ``taskiq_postgresql.core.sql.catalog`` is the one
 place to import them from.
 """
 
-from taskiq_postgresql.core.sql.catalog.base import QueryBase, _sql_literal
+from taskiq_postgresql.core.sql.catalog.base import QueryBase
 from taskiq_postgresql.core.sql.catalog.columns import (
     ClaimColumns,
     Column,
@@ -28,6 +28,7 @@ from taskiq_postgresql.core.sql.catalog.ddl import (
     check_table_objects,
     drop_table_script,
     index_name,
+    index_names,
     table_object_names,
 )
 from taskiq_postgresql.core.sql.catalog.introspection import (
@@ -87,7 +88,6 @@ __all__ = [
     "RelationsExistQuery",
     "SelectQuery",
     "UpdatedAtColumn",
-    "_sql_literal",
     "catalog_read",
     "check_lock_timeout",
     "check_table_objects",
@@ -95,6 +95,7 @@ __all__ = [
     "drop_table_script",
     "in_transaction",
     "index_name",
+    "index_names",
     "listen_script",
     "lock_timeout_scripts",
     "migration_lock_script",

@@ -665,6 +665,34 @@ async def test_a_driver_no_component_owns_runs_no_ddl_once_its_table_exists(
 
 
 @pytest.mark.anyio
+async def test_a_driver_with_a_key_no_param_type_covers_still_answers_exists(
+    driver: str,
+    postgresql_dsn: str,
+    postgres_table: str,
+    admin: Connection,
+) -> None:
+    """A SMALLINT key has no ParamType, so exists() must not declare one."""
+    alone = get_db_driver(driver)(
+        postgresql_dsn,
+        postgres_table,
+        columns=[Column("value", "TEXT", nullable=True)],
+        primary_key=Column("id", "SMALLINT", primary_key=True),
+        run_migrations=True,
+    )
+    try:
+        await alone.on_startup()
+        await admin.execute(
+            f"INSERT INTO {postgres_table} (id) VALUES (7)",  # noqa: S608
+        )
+
+        assert await alone.exists(7) is True
+        assert await alone.exists(8) is False
+    finally:
+        await alone.on_shutdown()
+        await admin.execute(f"DROP TABLE IF EXISTS {postgres_table}")
+
+
+@pytest.mark.anyio
 @pytest.mark.parametrize("kind", COMPONENTS)
 async def test_a_startup_that_migrates_logs_a_problem_no_step_fixes(
     kind: str,

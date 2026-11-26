@@ -32,7 +32,6 @@ from taskiq_postgresql.core.sql.identifier import (
     RESERVED_WORDS,
     Identifier,
     IdentifierError,
-    derived_names,
 )
 from taskiq_postgresql.core.sql.statement import ParamType, Statement
 from taskiq_postgresql.migrations import (
@@ -371,17 +370,6 @@ class _RollbackError(Exception):
     """Ends a savepoint block without keeping what it did."""
 
 
-def _serial_column(component: Component) -> Optional[str]:
-    return next(
-        (
-            column.name
-            for column in component.driver.create_table_query.columns
-            if column.is_serial
-        ),
-        None,
-    )
-
-
 @dataclass(frozen=True)
 class OnServer:
     """What ``pg_class``, ``pg_index`` and ``pg_constraint`` hold for a table."""
@@ -472,17 +460,18 @@ async def test_the_derived_names_are_the_ones_the_server_gives(
     table = _table_of_length(family, size)
     assert len(table) == size
     component = family.build(table)
-    schema = table_schema(component)
     await drop(connection, table)
     try:
         await migrate(connection, component)
         server = await _on_server(connection, table)
     finally:
         await drop(connection, table)
-    names = derived_names(
+    driver = component.driver
+    names = table_object_names(
         Identifier.parse(table, what="table name", warn=False),
-        index_names=[index.name for index in schema.indexes],
-        serial_column=_serial_column(component),
+        columns=driver.create_table_query.columns,
+        index_columns=driver.index_columns,
+        added_indexes=driver.added_indexes,
     )
     assert server.table == table
     assert server.indexes == _of_kind(names, "index")

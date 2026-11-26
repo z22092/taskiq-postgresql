@@ -10,9 +10,14 @@ spelling per folded table name.
 from __future__ import annotations
 
 import warnings
+from collections.abc import AsyncIterator
 
 import pytest
+from sqlalchemy import MetaData
 
+from taskiq_postgresql.abc.driver import ListenDriver
+from taskiq_postgresql.contrib.sqlalchemy import add_taskiq_tables
+from taskiq_postgresql.core.sql.identifier import Identifier, IdentifierError
 from taskiq_postgresql.migrations import (
     check_plain_identifier,
     collect_schemas,
@@ -61,3 +66,44 @@ def test_collect_schemas_refuses_two_spellings_of_one_table() -> None:
 def test_collect_schemas_keeps_deduplicating_one_spelling() -> None:
     first = table_schema("broker", table_name="jobs")
     assert collect_schemas(first, table_schema("broker", table_name="jobs")) == [first]
+
+
+def test_add_taskiq_tables_refuses_one_table_described_with_different_columns() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        broker = table_schema("broker", table_name="jobs")
+        results = table_schema("result_backend", table_name="jobs")
+
+    metadata = MetaData()
+    add_taskiq_tables(metadata, broker)
+
+    with pytest.raises(ValueError, match="described twice, with different columns"):
+        add_taskiq_tables(metadata, results)
+
+
+class _Listen(ListenDriver):
+    async def on_startup(self) -> None: ...
+
+    async def on_shutdown(self) -> None: ...
+
+    def __aiter__(self) -> AsyncIterator[str]:
+        raise NotImplementedError
+
+
+def test_the_base_listen_driver_refuses_a_channel_outside_the_rule() -> None:
+    with pytest.raises(IdentifierError, match="reserved word"):
+        _Listen("postgresql://unused", "select")
+
+
+def test_the_base_listen_driver_keeps_the_folded_channel() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        driver = _Listen("postgresql://unused", "Jobs_Mixed")
+
+    assert driver.channel == Identifier.parse(
+        "Jobs_Mixed",
+        what="channel name",
+        warn=False,
+    )
+    assert driver.channel_name == "jobs_mixed"
+    assert driver.listen_text == "LISTEN jobs_mixed"
