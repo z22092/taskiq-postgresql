@@ -14,7 +14,7 @@ from typing import Any, Optional
 
 import pytest
 from taskiq import BrokerMessage
-from taskiq_postgresql.core.stores.results import ResultStore
+from taskiq_postgresql.core.stores.schedules import ScheduleStore
 from typing_extensions import override
 
 from taskiq_postgresql.abc.driver import QueryDriver
@@ -29,9 +29,11 @@ from taskiq_postgresql.core.sql.catalog import (
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.core.stores.messages import MessageStore
+from taskiq_postgresql.core.stores.results import ResultStore
 from taskiq_postgresql.core.stores.schema import SchemaStore
 from taskiq_postgresql.exceptions import ResultIsMissingError
 from taskiq_postgresql.result_backend import Table as ResultTable
+from taskiq_postgresql.scheduler_source import Table as ScheduleTable
 
 DSN = "postgresql://postgres@localhost:5432/postgres"
 OTHER_DSN = "postgresql://postgres@localhost:5432/other"
@@ -337,6 +339,78 @@ async def test_a_result_store_binds_starts_and_closes_its_schema_store() -> None
 def test_a_result_store_follows_a_driver_that_was_swapped() -> None:
     store, driver, _ = _result_store()
     other = RecordingDriver("other_results")
+
+    assert store.driver is driver
+
+    store.driver = other
+
+    assert store.driver is other
+    assert store.schema.driver is other
+
+
+def _schedule_store() -> tuple[ScheduleStore, RecordingDriver, ScheduleTable]:
+    columns = ScheduleTable()
+    driver = RecordingDriver("taskiq_schedulers")
+    return (
+        ScheduleStore(SchemaStore("scheduler_source", driver), columns),
+        driver,
+        columns,
+    )
+
+
+@pytest.mark.anyio
+async def test_the_schedules_are_selected_by_id_and_schedule() -> None:
+    store, driver, columns = _schedule_store()
+    driver.select_returns = [{"id": "schedule-1", "schedule": "{}"}]
+
+    rows = await store.rows()
+
+    assert rows == [{"id": "schedule-1", "schedule": "{}"}]
+    assert driver.calls == [("select", ([columns.primary_key, columns.schedule],))]
+
+
+@pytest.mark.anyio
+async def test_a_schedule_is_inserted_without_returning() -> None:
+    store, driver, columns = _schedule_store()
+
+    await store.add("schedule-1", "tests:work", '{"cron": "* * * * *"}')
+
+    assert driver.calls == [
+        (
+            "insert",
+            (
+                [columns.primary_key, columns.task_name, columns.schedule],
+                ["schedule-1", "tests:work", '{"cron": "* * * * *"}'],
+            ),
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_schedule_is_deleted_by_id() -> None:
+    store, driver, columns = _schedule_store()
+
+    await store.delete("schedule-1")
+
+    assert driver.calls == [("delete", (columns.primary_key, "schedule-1"))]
+
+
+@pytest.mark.anyio
+async def test_a_schedule_store_binds_starts_and_closes_its_schema_store() -> None:
+    store, driver, _ = _schedule_store()
+
+    store.bind(OTHER_DSN)
+    await store.start()
+    await store.close()
+
+    assert driver.connection_string == OTHER_DSN
+    assert driver.component_kind == "scheduler_source"
+    assert [name for name, _ in driver.calls] == ["on_startup", "on_shutdown"]
+
+
+def test_a_schedule_store_follows_a_driver_that_was_swapped() -> None:
+    store, driver, _ = _schedule_store()
+    other = RecordingDriver("other_schedulers")
 
     assert store.driver is driver
 
