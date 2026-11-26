@@ -95,25 +95,22 @@ anything reaches the server.
 
 ## SQL
 
-`taskiq_postgresql/abc/query.py` builds every DDL statement and row query.
-Values are always bind parameters (`$1`, `$2`, ...). Table and column names
-come from the component's configuration and are written unquoted, so
-PostgreSQL folds them to lower case. Channel names are not handled the same by
-every driver (measured with `log_statement=all`): the broker sends
-`NOTIFY <channel>, '<id>'` unquoted, which folds the name; psycopg and psqlpy
-send `LISTEN <channel>` unquoted too, but asyncpg's `add_listener` sends
-`LISTEN "<channel>"` quoted, which keeps the case. With a channel name that
-has upper case letters, an asyncpg worker therefore gets no `NOTIFY`: the
-message waits for the next sweep, which compares the stored channel as is and
-delivers it within `poll_interval` seconds. psqlpy and psycopg workers get
-the `NOTIFY`. Use a lower-case `channel_name`, so that every driver delivers
-at once.
+`taskiq_postgresql/core/sql/catalog.py` is the one owner of SQL: it builds
+every DDL statement, row query, the `pg_notify` call, the `LISTEN` script and
+the catalog read, each as a `Statement` or `Script` that declares the type of
+its binds and result columns (`statement.py`). `abc/query.py` re-exports the
+builders for third-party drivers. No other module formats SQL, and a test that
+reads the source keeps it so.
 
-Two statements are formatted outside the builders: `LISTEN` in the listen
-drivers (the `LISTEN <channel>` with which psycopg and psqlpy subscribe, and
-in all three the health check, which repeats the statement that registered
-the channel, quoting included), and `NOTIFY <channel>, '<id>'` in the broker, whose
-payload is the integer id its own INSERT returned.
+Values are always bind parameters (`$1`, `$2`, ...). A table or channel name
+is checked by `Identifier` (`core/sql/identifier.py`, ADR 0008) when a
+component is built, so only a plain, unreserved ASCII name of at most 63 bytes
+reaches the SQL, unquoted; PostgreSQL folds it to lower case, and a name with
+upper case letters warns. The broker sends its notification as
+`SELECT FROM pg_notify($1, $2)` with the channel and the id as binds. The
+channel in `LISTEN` is the one name written into a runtime statement besides
+the table name, and all three drivers write it folded, so each one receives the
+notification, a mixed-case channel included.
 
 ### Tables
 

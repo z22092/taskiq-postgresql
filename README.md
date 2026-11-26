@@ -222,7 +222,13 @@ deleted after it is sent. `schedule_id` is stored in a `UUID` column, so keep
 the generated value or pass a UUID string.
 
 Table names, in all three components, and the broker's `channel_name` are
-placed in SQL as written. Use identifiers you control, never user input.
+checked when the component is built and then written into SQL unquoted. A name
+is accepted when it is made of ASCII letters, digits, `_` and `$`, does not
+start with a digit or `$`, is at most 63 bytes, is not a reserved word and is
+not schema-qualified (put the schema on the role's `search_path` instead);
+anything else raises `ValueError`. A name with upper case letters works, as
+PostgreSQL folds it, and warns with a `DeprecationWarning`: configure it in
+lower case. Use identifiers you control, never user input.
 
 ### Driver options
 

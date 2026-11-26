@@ -237,6 +237,47 @@ Upgrading from 0.4.x:
 
 ### Changed
 
+- **BREAKING:** table names (all three components, and `table_schema` for
+  the CLI and the Django app) and the broker's `channel_name` are checked when
+  a component is built, instead of reaching the SQL as written. A name is
+  refused with `ValueError` when it is empty, has a character outside
+  `[A-Za-z_][A-Za-z0-9_$]*` (ASCII only: no space, quote, `;` or accented
+  letter), is over 63 bytes (PostgreSQL cut it, and the migration lock was
+  taken on the whole name), or is a reserved word. A table name is also
+  refused when two of the names its steps create are the same, which loses an
+  index today without an error: a broker or scheduler source table of 62 or 63
+  bytes, a result backend table of 63. A schema-qualified name such as
+  `app.taskiq_messages` is refused too; it only worked with
+  `run_migrations=False`, because an index name cannot be qualified. A
+  deployment with such a name does the following: stop the workers, run
+  `ALTER TABLE <old> RENAME TO <new>` with a name the rule accepts, configure
+  the new name, and run the migration, which creates the indexes under their
+  derived names (the old index names stay and can be dropped). Renaming
+  changes the migration lock key, which is why the workers stop first. For a
+  schema-qualified name, leave the table where it is and put the schema on the
+  role's `search_path` (`ALTER ROLE <role> SET search_path TO app, public;`),
+  then configure the name without the schema. Names that pass keep their SQL
+  and their lock key.
+- **BREAKING:** `taskiq_postgresql.migrations.check_plain_identifier` applies
+  the same rule: besides the grammar it now refuses a reserved word and a name
+  over 63 bytes. It still returns the name unchanged, with no fold and no
+  warning.
+- **BREAKING:** collecting the tables to migrate (`taskiq postgresql`
+  commands, the Alembic and SQLAlchemy integrations, the Django settings)
+  refuses two spellings of one table, such as `Jobs` and `jobs`. PostgreSQL has
+  one table for both, and each spelling would take its own migration lock. Use
+  one spelling.
+- The broker sends its notification with `SELECT FROM pg_notify($1, $2)`, the
+  channel and the message id as bind values, instead of a `NOTIFY` statement
+  with the id written in the text. Workers listening on the channel receive
+  the same notification.
+- A table or channel name with upper case letters is accepted and warns with a
+  `DeprecationWarning` that names the folded form PostgreSQL uses. Configure
+  that form. The `channel` column and the claim keep the name as configured.
+- `taskiq_postgresql.abc.query` still exports the same builders with the same
+  SQL; they now live in `taskiq_postgresql.core.sql.catalog`, and a builder
+  refuses a table name the rule refuses. A third-party driver built on
+  `QueryDriver` needs no change.
 - **BREAKING:** with `run_migrations=False` (the default), `startup()` checks
   the component's table before anything else starts. It reads the catalog in
   one read-only query, through the component's own pool, and runs no DDL. When
@@ -346,6 +387,11 @@ Upgrading from 0.4.x:
 
 ### Fixed
 
+- With `asyncpg`, a worker listening on a channel with upper case letters now
+  receives the broker's notification at once. asyncpg quoted the name in
+  `LISTEN` while `NOTIFY` folded it, so such a worker delivered only through
+  the sweep, up to `poll_interval` seconds late. All three drivers now
+  `LISTEN` on the folded name.
 - `PostgresqlResultBackend.delete_by_date` without `to_date` deleted nothing;
   it now deletes every result created at or after `from_date`. A call that
   relied on that no-op now deletes the newer results; to delete older ones,
