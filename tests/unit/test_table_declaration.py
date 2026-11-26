@@ -245,21 +245,6 @@ def test_the_broker_and_the_scheduler_keep_the_steps_they_had() -> None:
     assert [step.number for step in scheduler.steps] == [1]
 
 
-@pytest.mark.parametrize(("kind", "field"), SHAPES, ids=SHAPE_IDS)
-def test_a_component_declares_the_steps_its_kind_describes(
-    kind: str,
-    field: Optional[str],
-) -> None:
-    component = build_component(kind, table_name="jobs", field=field)
-
-    assert migrations.table_schema(component) == table_schema(
-        kind,
-        table_name="jobs",
-        field_for_task_id=field,
-    )
-    assert component.driver.steps == TableDeclaration.of_driver(component.driver).steps
-
-
 def test_the_steps_of_a_declaration_flatten_into_what_they_add() -> None:
     from taskiq_postgresql.core.sql.catalog import DeclaredStep  # noqa: PLC0415
 
@@ -302,8 +287,11 @@ def test_a_driver_built_with_added_columns_describes_them_as_one_step() -> None:
 
     declaration = TableDeclaration.of_driver(driver)
 
-    assert driver.steps == ()
+    # The old arguments are stored as the one list of steps, and read back.
+    assert driver.steps == (DeclaredStep([added], [index]),)
     assert declaration.steps == (DeclaredStep([added], [index]),)
+    assert driver.added_columns == (added,)
+    assert driver.added_indexes == (index,)
     assert declaration.added_columns == (added,)
     assert declaration.added_indexes == (index,)
 
@@ -406,3 +394,33 @@ def test_the_statements_of_a_step_are_the_script_run_migrations_executes() -> No
     )
     # A step that declares nothing has no statement.
     assert declared_step_script("jobs", DeclaredStep()) == ""
+
+
+def test_legacy_steps_make_one_step_of_what_an_old_driver_adds() -> None:
+    from taskiq_postgresql.abc.driver import _legacy_steps  # noqa: PLC0415
+    from taskiq_postgresql.core.sql.catalog import DeclaredStep  # noqa: PLC0415
+
+    added = Column("extra", "TEXT", nullable=True)
+    index = AddedIndex(name="notes_extra_idx", columns=[added])
+
+    assert _legacy_steps([added], [index]) == (DeclaredStep([added], [index]),)
+    assert _legacy_steps([added], []) == (DeclaredStep([added], []),)
+    assert _legacy_steps([], [index]) == (DeclaredStep([], [index]),)
+    # Nothing added is no step, not an empty one.
+    assert _legacy_steps([], []) == ()
+    assert _legacy_steps((), ()) == ()
+
+
+def test_added_columns_and_indexes_are_read_from_the_steps() -> None:
+    from taskiq_postgresql.core.sql.catalog import DeclaredStep  # noqa: PLC0415
+
+    first = Column("a", "TEXT", nullable=True)
+    second = Column("b", "TEXT", nullable=True)
+    index = AddedIndex(name="notes_b_idx", columns=[second])
+    key = PrimaryKeyColumn(name="id", type_="SERIAL")
+    driver = _Driver(DSN, "notes", columns=[Column("body", "TEXT")], primary_key=key)
+
+    driver.steps = [DeclaredStep([first]), DeclaredStep([second], [index])]
+
+    assert driver.added_columns == (first, second)
+    assert driver.added_indexes == (index,)

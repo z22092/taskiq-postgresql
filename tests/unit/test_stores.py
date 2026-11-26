@@ -66,7 +66,8 @@ class RecordingDriver(QueryDriver):
         self.fetch_row_returns: Optional[dict[str, Any]] = None
         self.select_returns: list[dict[str, Any]] = []
         self.exists_returns = True
-        # The keywords a read was given, by call: only ``not_null`` is one.
+        # The keywords a read was given, by call: only ``not_null`` is one, and
+        # each test asserts the keywords of its store, so none passes unseen.
         self.keywords: list[tuple[str, dict[str, Any]]] = []
 
     @override
@@ -315,13 +316,14 @@ async def test_a_result_is_selected_by_task_id() -> None:
 
 @pytest.mark.anyio
 async def test_a_missing_result_raises_with_the_task_id() -> None:
-    store, driver, _ = _result_store()
+    store, driver, columns = _result_store()
 
     with pytest.raises(ResultIsMissingError) as raised:
         await store.get("task-1")
 
     assert str(raised.value) == "Cannot find record with task_id = task-1 in PostgreSQL"
     assert [name for name, _ in driver.calls] == ["select"]
+    assert driver.keywords == [("select", {"not_null": [columns.result]})]
 
 
 @pytest.mark.anyio
@@ -457,6 +459,9 @@ async def test_the_schedules_are_selected_by_id_and_schedule() -> None:
 
     assert rows == [{"id": "schedule-1", "schedule": "{}"}]
     assert driver.calls == [("select", ([columns.primary_key, columns.schedule],))]
+    # The schedules have no null check: the keyword is not passed at all, as
+    # before select and exists took it.
+    assert driver.keywords == [("select", {})]
 
 
 @pytest.mark.anyio
