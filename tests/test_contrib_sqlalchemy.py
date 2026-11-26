@@ -323,6 +323,21 @@ def test_the_table_is_the_description() -> None:
     } == {"hash"}
 
 
+def test_the_results_table_has_a_nullable_result_and_a_progress_column() -> None:
+    metadata = taskiq_metadata(table_schema("result_backend"))
+
+    table = metadata.tables["taskiq_results"]
+    # Step 2 made result nullable and added progress, which come last.
+    assert [(column.name, column.nullable) for column in table.columns] == [
+        ("task_id", False),
+        ("result", True),
+        ("created_at", False),
+        ("progress", True),
+    ]
+    assert str(table.c.progress.type.compile(dialect=postgresql.dialect())) == "BYTEA"
+    assert table.c.progress.server_default is None
+
+
 def test_the_metadata_keeps_each_description_once() -> None:
     metadata = MetaData()
     broker, backend = table_schema("broker"), table_schema("result_backend")

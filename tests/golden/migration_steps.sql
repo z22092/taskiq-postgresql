@@ -60,6 +60,15 @@ CREATE INDEX IF NOT EXISTS taskiq_messages_not_before_idx
 CREATE TABLE IF NOT EXISTS taskiq_results (task_id VarChar NOT NULL PRIMARY KEY, result BYTEA NOT NULL, created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());
 CREATE INDEX IF NOT EXISTS taskiq_results_task_id_idx ON taskiq_results USING HASH (task_id);
 
+-- result_backend VarChar: step 2
+-- creates table: no
+-- columns: progress
+-- indexes:
+-- nullable columns: result
+ALTER TABLE taskiq_results
+  ADD COLUMN IF NOT EXISTS progress BYTEA;
+ALTER TABLE taskiq_results ALTER COLUMN result DROP NOT NULL;
+
 -- result_backend Text: step 1
 -- creates table: yes
 -- columns: task_id, result, created_at
@@ -67,12 +76,30 @@ CREATE INDEX IF NOT EXISTS taskiq_results_task_id_idx ON taskiq_results USING HA
 CREATE TABLE IF NOT EXISTS taskiq_results (task_id Text NOT NULL PRIMARY KEY, result BYTEA NOT NULL, created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());
 CREATE INDEX IF NOT EXISTS taskiq_results_task_id_idx ON taskiq_results USING HASH (task_id);
 
+-- result_backend Text: step 2
+-- creates table: no
+-- columns: progress
+-- indexes:
+-- nullable columns: result
+ALTER TABLE taskiq_results
+  ADD COLUMN IF NOT EXISTS progress BYTEA;
+ALTER TABLE taskiq_results ALTER COLUMN result DROP NOT NULL;
+
 -- result_backend Uuid: step 1
 -- creates table: yes
 -- columns: task_id, result, created_at
 -- indexes: taskiq_results_task_id_idx hash (task_id)
 CREATE TABLE IF NOT EXISTS taskiq_results (task_id Uuid NOT NULL PRIMARY KEY, result BYTEA NOT NULL, created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());
 CREATE INDEX IF NOT EXISTS taskiq_results_task_id_idx ON taskiq_results USING HASH (task_id);
+
+-- result_backend Uuid: step 2
+-- creates table: no
+-- columns: progress
+-- indexes:
+-- nullable columns: result
+ALTER TABLE taskiq_results
+  ADD COLUMN IF NOT EXISTS progress BYTEA;
+ALTER TABLE taskiq_results ALTER COLUMN result DROP NOT NULL;
 
 -- scheduler_source: step 1
 -- creates table: yes

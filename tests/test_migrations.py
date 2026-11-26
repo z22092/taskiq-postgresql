@@ -203,7 +203,9 @@ def test_fast_path_checks_the_table_and_every_index_it_creates() -> None:
         assert f"CREATE INDEX IF NOT EXISTS {index_name} ON jobs " in create_index
 
 
-def test_only_the_broker_adds_columns_to_an_existing_table() -> None:
+def test_only_the_broker_and_the_results_table_add_columns_to_an_existing_table() -> (
+    None
+):
     broker = PostgresqlBroker(dsn="unused").driver
     result_backend = PostgresqlResultBackend(dsn="unused").driver
     scheduler_source = PostgresqlSchedulerSource(dsn="unused").driver
@@ -213,8 +215,13 @@ def test_only_the_broker_adds_columns_to_an_existing_table() -> None:
         (index.name, [column.name for column in index.columns])
         for index in broker.added_indexes
     ] == [("taskiq_messages_not_before_idx", ["channel", "not_before", "id"])]
-    for driver in (result_backend, scheduler_source):
-        assert (tuple(driver.added_columns), tuple(driver.added_indexes)) == ((), ())
+    # The results table adds the column progress and no index.
+    assert [column.name for column in result_backend.added_columns] == ["progress"]
+    assert tuple(result_backend.added_indexes) == ()
+    assert (
+        tuple(scheduler_source.added_columns),
+        tuple(scheduler_source.added_indexes),
+    ) == ((), ())
 
 
 def test_fast_path_also_checks_the_claim_columns_and_their_index() -> None:

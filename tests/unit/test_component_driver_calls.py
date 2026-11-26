@@ -20,6 +20,8 @@ from unittest import mock
 
 import pytest
 from taskiq import BrokerMessage, ScheduledTask, TaskiqResult
+from taskiq.depends.progress_tracker import TaskProgress, TaskState
+from taskiq.serializers.pickle import PickleSerializer
 from typing_extensions import Self, override
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
@@ -128,16 +130,20 @@ class RecordingDriver(QueryDriver):
         columns: Sequence[Column],
         where_columns: Optional[Sequence[Column]] = None,
         where_values: Optional[Sequence[Any]] = None,
+        not_null: Sequence[Column] = (),
     ) -> list[dict[str, Any]]:
+        # The keyword is recorded only when it is given, so a read that has no
+        # null check is pinned as it always was.
+        given = {"not_null": not_null} if not_null else {}
         if where_columns is None and where_values is None:
-            self._record("select", columns)
+            self._record("select", columns, **given)
         else:
-            self._record("select", columns, where_columns, where_values)
+            self._record("select", columns, where_columns, where_values, **given)
         return self.select_returns
 
     @override
-    async def exists(self, id: Any) -> bool:
-        self._record("exists", id)
+    async def exists(self, id: Any, not_null: Sequence[Column] = ()) -> bool:
+        self._record("exists", id, **({"not_null": not_null} if not_null else {}))
         return self.exists_returns
 
     @override
@@ -187,7 +193,7 @@ class FakeListenDriver(ListenDriver):
 
 def recording_like(original: QueryDriver) -> RecordingDriver:
     """Build a ``RecordingDriver`` declared exactly as ``original`` is."""
-    return RecordingDriver(
+    driver = RecordingDriver(
         connection_string=DSN,
         table_name=original.table,
         columns=original.columns,
@@ -197,6 +203,9 @@ def recording_like(original: QueryDriver) -> RecordingDriver:
         added_columns=original.added_columns,
         added_indexes=original.added_indexes,
     )
+    # A driver of a release before steps has none, and declares what it adds.
+    driver.steps = getattr(original, "steps", ())
+    return driver
 
 
 def make_broker() -> tuple[PostgresqlBroker, RecordingDriver, list[str]]:
@@ -218,11 +227,13 @@ def make_broker() -> tuple[PostgresqlBroker, RecordingDriver, list[str]]:
 
 def make_result_backend(
     keep_results: bool = True,
+    **options: Any,
 ) -> tuple[PostgresqlResultBackend[Any], RecordingDriver]:
     """Build a result backend over a ``RecordingDriver``."""
     backend: PostgresqlResultBackend[Any] = PostgresqlResultBackend(
         DSN,
         keep_results=keep_results,
+        **options,
     )
     driver = recording_like(backend.driver)
     backend.driver = driver
@@ -586,6 +597,26 @@ async def test_broker_when_it_shuts_down__then_both_drivers_are_closed() -> None
 
 """The calls of the result backend."""
 
+# What taskiq's ProgressTracker sends, as JSON.
+STARTED_JSON = b'{"state":"STARTED","meta":{"a":1}}'
+
+
+def a_progress(meta: Any = None) -> TaskProgress[Any]:
+    """Return a progress report of a started task."""
+    return TaskProgress(state=TaskState.STARTED, meta=meta)
+
+
+class FailingSerializer(PickleSerializer):
+    """A serializer that raises when it is used: progress never uses it."""
+
+    @override
+    def dumpb(self, value: Any) -> bytes:
+        raise AssertionError("progress must not go through the serializer")
+
+    @override
+    def loadb(self, value: bytes) -> Any:
+        raise AssertionError("progress must not go through the serializer")
+
 
 @pytest.mark.anyio
 async def test_results_when_a_result_is_set__then_it_is_upserted_by_task_id() -> None:
@@ -619,7 +650,10 @@ async def test_results_when_asked_if_a_result_is_ready__then_it_asks_exists(
 
     assert await backend.is_result_ready("task-1") is ready
 
-    assert driver.calls == [("exists", ("task-1",), {})]
+    # A row that holds only progress is not a ready result.
+    assert driver.calls == [
+        ("exists", ("task-1",), {"not_null": [backend.columns.result]}),
+    ]
 
 
 @pytest.mark.anyio
@@ -636,7 +670,7 @@ async def test_results_when_results_are_kept__then_get_result_only_selects() -> 
         (
             "select",
             ([columns.result], [columns.primary_key], ["task-1"]),
-            {},
+            {"not_null": [columns.result]},
         ),
     ]
 
@@ -655,7 +689,7 @@ async def test_results_when_not_kept__then_get_result_selects_then_deletes() -> 
         (
             "select",
             ([columns.result], [columns.primary_key], ["task-1"]),
-            {},
+            {"not_null": [columns.result]},
         ),
         ("delete", (columns.primary_key, "task-1"), {}),
     ]
@@ -675,6 +709,57 @@ async def test_results_when_there_is_no_row__then_get_result_raises_missing(
     assert str(raised.value) == (
         "Cannot find record with task_id = task-1 in PostgreSQL"
     )
+    assert [call[0] for call in driver.calls] == ["select"]
+
+
+class OldSignatureDriver(RecordingDriver):
+    """A third-party driver written before ``not_null`` existed."""
+
+    @override
+    async def select(  # ty: ignore[invalid-method-override]
+        self,
+        columns: Sequence[Column],
+        where_columns: Optional[Sequence[Column]] = None,
+        where_values: Optional[Sequence[Any]] = None,
+    ) -> list[dict[str, Any]]:
+        return await super().select(columns, where_columns, where_values)
+
+    @override
+    async def exists(self, id: Any) -> bool:  # ty: ignore[invalid-method-override]
+        return await super().exists(id)
+
+
+@pytest.mark.anyio
+async def test_results_when_a_driver_does_not_take_not_null__then_reads_fail() -> None:
+    # The breaking change of this release for a query driver written by hand:
+    # select and exists must accept the keyword, or a result cannot be read.
+    backend, _ = make_result_backend()
+    old = OldSignatureDriver(
+        connection_string=DSN,
+        table_name=backend.driver.table,
+        columns=backend.driver.columns,
+        primary_key=backend.driver.primary_key,
+    )
+    backend.driver = old
+
+    with pytest.raises(TypeError, match="not_null"):
+        await backend.is_result_ready("task-1")
+    with pytest.raises(TypeError, match="not_null"):
+        await backend.get_result("task-1")
+
+
+@pytest.mark.anyio
+async def test_results_when_a_row_has_only_progress__then_a_read_deletes_nothing() -> (
+    None
+):
+    # The select leaves a row out when its result is NULL, so none comes back;
+    # the delete of keep_results=False must not run for it.
+    backend, driver = make_result_backend(keep_results=False)
+    driver.select_returns = []
+
+    with pytest.raises(ResultIsMissingError):
+        await backend.get_result("task-1")
+
     assert [call[0] for call in driver.calls] == ["select"]
 
 
@@ -699,6 +784,148 @@ async def test_results_when_deleting_between_dates__then_both_are_passed() -> No
     await backend.delete_by_date(from_date, to_date)
 
     assert driver.calls == [("delete_by_date", (from_date, to_date), {})]
+
+
+@pytest.mark.anyio
+async def test_progress_when_it_is_set__then_only_its_column_is_upserted() -> None:
+    backend, driver = make_result_backend()
+    columns = backend.columns
+
+    await backend.set_progress("task-1", a_progress({"a": 1}))
+
+    assert driver.calls == [
+        (
+            "insert_or_update",
+            (
+                [columns.primary_key, columns.progress],
+                ["task-1", STARTED_JSON],
+                [columns.primary_key],
+                [columns.progress],
+            ),
+            {},
+        ),
+    ]
+
+
+@pytest.mark.anyio
+async def test_progress_when_it_is_set__then_the_serializer_is_not_used() -> None:
+    backend, driver = make_result_backend(serializer=FailingSerializer())
+    driver.select_returns = [{"progress": STARTED_JSON}]
+
+    await backend.set_progress("task-1", a_progress({"a": 1}))
+    found = await backend.get_progress("task-1")
+
+    assert driver.calls[0][1][1] == ["task-1", STARTED_JSON]
+    assert found is not None
+    assert found.meta == {"a": 1}
+
+
+@pytest.mark.anyio
+async def test_progress_when_it_is_not_stored__then_set_progress_calls_nothing() -> (
+    None
+):
+    backend, driver = make_result_backend(store_progress=False)
+
+    await backend.set_progress("task-1", a_progress())
+
+    assert backend.store_progress is False
+    assert driver.calls == []
+
+
+@pytest.mark.anyio
+async def test_progress_when_it_is_not_stored__then_get_progress_still_reads() -> None:
+    backend, driver = make_result_backend(store_progress=False)
+    driver.select_returns = [{"progress": STARTED_JSON}]
+    columns = backend.columns
+
+    found = await backend.get_progress("task-1")
+
+    assert found == a_progress({"a": 1})
+    assert driver.calls == [
+        ("select", ([columns.progress], [columns.primary_key], ["task-1"]), {}),
+    ]
+
+
+def test_progress_is_stored_unless_the_backend_is_told_not_to() -> None:
+    backend, _ = make_result_backend()
+
+    assert backend.store_progress is True
+
+
+@pytest.mark.anyio
+async def test_progress_when_it_is_read__then_it_is_the_one_that_was_stored() -> None:
+    backend, driver = make_result_backend()
+    driver.select_returns = [{"progress": STARTED_JSON}]
+    columns = backend.columns
+
+    found = await backend.get_progress("task-1")
+
+    assert found is not None
+    assert found.state == TaskState.STARTED
+    assert found.meta == {"a": 1}
+    assert driver.calls == [
+        ("select", ([columns.progress], [columns.primary_key], ["task-1"]), {}),
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("returned", [[], [{"progress": None}]])
+async def test_progress_when_there_is_none__then_get_progress_returns_none(
+    returned: list[dict[str, Any]],
+) -> None:
+    backend, driver = make_result_backend()
+    driver.select_returns = returned
+
+    assert await backend.get_progress("task-1") is None
+
+
+@pytest.mark.anyio
+async def test_progress_when_meta_is_not_json__then_it_raises_and_writes_nothing() -> (
+    None
+):
+    backend, driver = make_result_backend()
+
+    with pytest.raises(ValueError, match="Unable to serialize"):
+        await backend.set_progress("task-1", a_progress({"x": object()}))
+
+    assert driver.calls == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("stored", [b"not json", PickleSerializer().dumpb({"a": 1})])
+async def test_progress_when_the_column_is_not_json__then_it_raises(
+    stored: bytes,
+) -> None:
+    # No pickle fallback: what a database holds is never unpickled.
+    backend, driver = make_result_backend()
+    driver.select_returns = [{"progress": stored}]
+
+    with pytest.raises(ValueError, match=r"Invalid JSON|valid"):
+        await backend.get_progress("task-1")
+
+
+@pytest.mark.anyio
+async def test_progress_when_a_driver_gives_a_buffer__then_it_is_read_as_bytes() -> (
+    None
+):
+    backend, driver = make_result_backend()
+    driver.select_returns = [{"progress": memoryview(STARTED_JSON)}]
+
+    found = await backend.get_progress("task-1")
+
+    assert found == a_progress({"a": 1})
+
+
+@pytest.mark.anyio
+async def test_progress_state_is_a_plain_string_that_equals_the_enum() -> None:
+    backend, driver = make_result_backend()
+    driver.select_returns = [{"progress": STARTED_JSON}]
+
+    found = await backend.get_progress("task-1")
+
+    assert found is not None
+    assert type(found.state) is str
+    assert found.state == TaskState.STARTED
 
 
 @pytest.mark.anyio

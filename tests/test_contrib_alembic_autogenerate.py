@@ -507,7 +507,7 @@ def test_no_alembic_plugin_entry_point_is_published() -> None:
     ("kind", "table_name", "state", "expected"),
     [
         ("broker", "Jobs_Queue", "0.4-ddl", [2]),
-        ("result_backend", LONG_NAME, "fresh", [1]),
+        ("result_backend", LONG_NAME, "fresh", [1, 2]),
     ],
     ids=["mixed-case-0.4", "long-mixed-case-fresh"],
 )
@@ -573,6 +573,45 @@ def test_autogenerate_leaves_only_the_step_for_a_column_it_relaxes(
 
     assert produce(dsn, metadata).upgrade_ops.as_diffs() == []
     assert not asyncio.run(column_is_not_null(dsn, schema.name, RELAXED))
+
+
+def test_autogenerate_leaves_only_the_step_for_progress_and_a_relaxed_result(
+    driver: str,
+    new_database: Callable[[], str],
+) -> None:
+    dsn = new_database()
+    results = table_schema("result_backend")
+    prepare(dsn, driver, "step-1", results)
+    metadata = taskiq_metadata(results)
+
+    # The metadata has progress, which the database lacks, and result nullable,
+    # which the database has NOT NULL: step 2 covers both, so Alembic proposes
+    # neither an add_column nor an alter_column beside it.
+    script = produce(dsn, metadata)
+
+    assert script.upgrade_ops.as_diffs() == [(STEP, "taskiq_results", 2)]
+    assert all(
+        isinstance(operation, TaskiqStepOp) for operation in script.upgrade_ops.ops
+    )
+    assert not any(
+        isinstance(operation, (ops.AddColumnOp, ops.AlterColumnOp))
+        for operation in script.upgrade_ops.ops
+    )
+    # Putting NOT NULL back would refuse the first row that holds a NULL.
+    downgrade = render_python_code(script.downgrade_ops)
+    assert "SET NOT NULL" not in downgrade
+    assert "alter_column" not in downgrade
+    assert "drop_column" not in downgrade
+
+    statements = [
+        statement
+        for operation in script.upgrade_ops.ops
+        for statement in operation.statements
+    ]
+    asyncio.run(run_script(dsn, driver, script_of(statements)))
+
+    assert produce(dsn, metadata).upgrade_ops.as_diffs() == []
+    assert not asyncio.run(column_is_not_null(dsn, "taskiq_results", "result"))
 
 
 # --- upgrade_taskiq_tables with through ----------------------------------------

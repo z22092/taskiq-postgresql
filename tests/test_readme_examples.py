@@ -443,13 +443,18 @@ def test_when_the_changelog_upgrade_sql_is_read__then_startup_runs_the_same() ->
         re.DOTALL | re.MULTILINE,
     )
     concurrently = re.findall(r"`(CREATE INDEX CONCURRENTLY [^`]+)`", upgrading)
-    driver = PostgresqlBroker(dsn="unused").driver
-    upgrade = driver.add_columns_query.make_query(
-        driver.added_columns,
-        driver.added_indexes,
-    )
+    # Step 2 of the broker's table, then of the results table, as a script each.
+    upgrades = [
+        "\n".join(
+            f"{statement};" for statement in table_schema(kind).steps[1].statements
+        )
+        for kind in ("broker", "result_backend")
+    ]
+    upgrade = upgrades[0]
 
-    assert [textwrap.dedent(block) for block in blocks] == [f"{upgrade}\n"]
+    assert [textwrap.dedent(block) for block in blocks] == [
+        f"{text}\n" for text in upgrades
+    ]
     # The same index, built without blocking writes on a large table.
     assert len(concurrently) == 1
     assert _normalized_sql(concurrently[0].replace(" CONCURRENTLY", "")) in (
@@ -506,6 +511,10 @@ def test_when_the_schema_blocks_are_read__then_they_match_the_generated_sql() ->
     It is also what ``taskiq postgresql generate`` prints;
     ``tests/test_migration_script.py`` checks that both build the same tables.
     """
+    from taskiq_postgresql.core.sql.catalog import (  # noqa: PLC0415
+        declared_step_script,
+    )
+
     expected = {}
     for component in (
         PostgresqlBroker(dsn="unused"),
@@ -517,16 +526,15 @@ def test_when_the_schema_blocks_are_read__then_they_match_the_generated_sql() ->
             f"{driver.create_table_query.make_query()};",
             driver.create_index_query.make_query(driver.index_columns),
         ]
-        if driver.added_columns or driver.added_indexes:
-            # The broker's upgrade step, which startup runs after the CREATEs.
-            statements.append(
-                driver.add_columns_query.make_query(
-                    driver.added_columns,
-                    driver.added_indexes,
-                ),
-            )
+        # Each step after the CREATEs, as startup runs it: the broker's columns
+        # and index, the results table's progress column and relaxed NOT NULL.
+        statements.extend(
+            declared_step_script(driver.table, step) for step in driver.steps
+        )
         expected[driver.table_name] = _normalized_sql(" ".join(statements))
     assert "ALTER TABLE taskiq_messages" in expected["taskiq_messages"]
+    assert "ADD COLUMN IF NOT EXISTS progress BYTEA" in expected["taskiq_results"]
+    assert "ALTER COLUMN result DROP NOT NULL" in expected["taskiq_results"]
     generated = {}
     for kind in migrations.COMPONENT_KINDS:
         schema = table_schema(kind)
@@ -938,8 +946,9 @@ def test_when_the_format_example_is_installed__then_generate_prints_it(
         "# Results\n"
         "## taskiq_results (result_backend)\n"
         "- `task_id`: uuid, not null\n"
-        "- `result`: bytea, not null\n"
+        "- `result`: bytea, null\n"
         "- `created_at`: timestamptz, not null\n"
+        "- `progress`: bytea, null\n"
         "- index `taskiq_results_task_id_idx`: hash on task_id\n"
     )
     assert PostgresqlCMD().exec([*command, "--option", "color=red"]) == 2  # noqa: PLR2004

@@ -28,7 +28,11 @@ from taskiq import InMemoryBroker, TaskiqScheduler
 from taskiq.schedule_sources import LabelScheduleSource
 
 from taskiq_postgresql import migrations
-from taskiq_postgresql.abc.query import MIGRATION_LOCK_NAMESPACE, Column
+from taskiq_postgresql.abc.query import (
+    MIGRATION_LOCK_NAMESPACE,
+    Column,
+    DropNotNullQuery,
+)
 from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.core.sql.catalog.base import _sql_literal
 from taskiq_postgresql.migrations import (
@@ -155,19 +159,29 @@ def test_the_steps_are_the_sql_run_migrations_executes(
     assert "\n".join(f"{statement};" for statement in create_indexes) == (
         runtime.create_index_query.make_query(runtime.index_columns)
     )
-    # Only the broker's table got columns after its first release.
-    if kind == "broker":
-        (upgrade,) = later_steps
-        assert upgrade.number == 2  # noqa: PLR2004
-        assert "\n".join(f"{statement};" for statement in upgrade.statements) == (
-            runtime.add_columns_query.make_query(
-                runtime.added_columns,
-                runtime.added_indexes,
-            )
-        )
-    else:
+    # The broker's table got columns after its first release, and the results
+    # table one more column and a relaxed NOT NULL; each later step is one
+    # script, which run_migrations=True runs as it is.
+    if kind == "scheduler_source":
         assert later_steps == []
         assert (runtime.added_columns, runtime.added_indexes) == ((), ())
+    else:
+        (upgrade,) = later_steps
+        assert upgrade.number == 2  # noqa: PLR2004
+        script = "\n".join(f"{statement};" for statement in upgrade.statements)
+        columns_and_indexes = runtime.add_columns_query.make_query(
+            runtime.added_columns,
+            runtime.added_indexes,
+        )
+        if kind == "broker":
+            assert script == columns_and_indexes
+            assert upgrade.objects.nullable_columns == ()
+        else:
+            assert script == (
+                f"{columns_and_indexes}\n"
+                f"{DropNotNullQuery(runtime.table).make_query('result')}"
+            )
+            assert upgrade.objects.nullable_columns == ("result",)
     # A driver no component owns cannot compare, and probes instead: exactly
     # the relations the steps create.
     assert [schema.name, *(index.name for index in schema.indexes)] == (

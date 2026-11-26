@@ -288,6 +288,7 @@ def test_autogenerate_proposes_every_step_on_an_empty_database(
         ("taskiq_postgresql_step", "taskiq_messages", 1),
         ("taskiq_postgresql_step", "taskiq_messages", 2),
         ("taskiq_postgresql_step", "taskiq_results", 1),
+        ("taskiq_postgresql_step", "taskiq_results", 2),
         ("taskiq_postgresql_step", "taskiq_schedulers", 1),
     ]
 

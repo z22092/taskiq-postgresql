@@ -55,11 +55,13 @@ from tests.helpers import (
     bounded,
     build_component,
     close_component,
+    column_is_not_null,
     fetch_on_server,
     importable_modules,
     lock_of,
     plan_of,
     run_script,
+    script_of,
     tables_in,
 )
 
@@ -138,30 +140,40 @@ class NoTaskiqRouter:
 # --- the migrations ------------------------------------------------------------
 
 
-def test_there_is_one_migration_per_migration_step() -> None:
+def test_there_is_one_migration_per_migration_step_and_kind() -> None:
     from taskiq_postgresql.contrib.django.operations import (  # noqa: PLC0415
         RunTaskiqStep,
     )
 
-    highest = max(
-        step.number for kind in COMPONENT_KINDS for step in table_schema(kind).steps
-    )
     loader = MigrationLoader(None, ignore_no_migrations=True)
     names = migration_names()
+    steps_of = {kind: len(table_schema(kind).steps) for kind in COMPONENT_KINDS}
+    later = sum(count - 1 for count in steps_of.values())
 
-    # A release that adds a step must add the migration that runs it.
-    assert len(names) == highest
+    # A release that adds a step adds the migration that runs it, for the kind
+    # of table that has it: step 1 is one migration for every kind, and each
+    # later step one for its own, because step 2 of two kinds is two steps.
+    assert len(names) == 1 + later
     previous: Optional[str] = None
+    operations: list[tuple[type, int, Optional[str]]] = []
     for number, name in enumerate(names, start=1):
         migration = loader.disk_migrations[(LABEL, name)]
         assert name.startswith(f"{number:04d}_")
-        assert [
-            (type(operation), operation.number) for operation in migration.operations
-        ] == [(RunTaskiqStep, number)]
         assert migration.dependencies == (
             [] if previous is None else [(LABEL, previous)]
         )
+        assert len(migration.operations) == 1
+        (operation,) = migration.operations
+        operations.append((type(operation), operation.number, operation.kind))
         previous = name
+    assert operations[0] == (RunTaskiqStep, 1, None)
+    assert {kind for _, _, kind in operations[1:]} <= set(COMPONENT_KINDS)
+    for kind, count in steps_of.items():
+        # In migration order, each kind's steps run 2, 3, ... with none left
+        # out and none twice.
+        assert [number for _, number, found in operations[1:] if found == kind] == list(
+            range(2, count + 1)
+        )
 
 
 def test_makemigrations_finds_nothing_to_write(django_db: str) -> None:
@@ -264,6 +276,95 @@ def test_a_path_is_not_imported_from_the_working_directory(
         assert name not in sys.modules
 
 
+def test_each_later_migration_runs_the_step_of_its_own_kind(django_db: str) -> None:
+    broker, results = table_schema("broker"), table_schema("result_backend")
+    first, second, third = migration_names()
+
+    with configured([{"kind": "broker"}, {"kind": "result_backend"}]):
+        migrate(LABEL, first)
+        after_first = plan_of(django_db, [broker, results])
+        migrate(LABEL, second)
+        after_second = plan_of(django_db, [broker, results])
+        result_not_null_after_second = asyncio.run(
+            column_is_not_null(django_db, results.name, "result"),
+        )
+        migrate(LABEL, third)
+        after_third = plan_of(django_db, [broker, results])
+
+    # The first migration is step 1 of both tables; each of the next two is
+    # step 2 of one kind, and leaves the other kind's step 2 pending.
+    assert [(item.table, item.step.number) for item in after_first.pending] == [
+        (broker.name, 2),
+        (results.name, 2),
+    ]
+    (still_pending,) = after_second.pending
+    assert (still_pending.table, still_pending.step.number) == (results.name, 2)
+    assert still_pending.missing_columns == ("progress",)
+    assert still_pending.not_null_columns == ("result",)
+    assert result_not_null_after_second
+    assert after_third.is_current
+    assert after_third.problems == ()
+    assert not asyncio.run(column_is_not_null(django_db, results.name, "result"))
+
+
+def test_a_results_table_of_step_1_gets_progress_from_the_third_migration(
+    django_db: str,
+) -> None:
+    results = table_schema("result_backend")
+    asyncio.run(
+        run_script(django_db, "asyncpg", script_of(results.steps[0].statements)),
+    )
+    asyncio.run(
+        fetch_on_server(
+            django_db,
+            f"INSERT INTO {results.name} (task_id, result)"  # noqa: S608
+            " VALUES (gen_random_uuid(), 'old')",
+        ),
+    )
+    *_, third = migration_names()
+
+    with configured([{"kind": "result_backend"}]):
+        migrate(LABEL, third)
+
+    # The earlier migrations are applied too, and touch no results table.
+    assert applied() == migration_names()
+    assert plan_of(django_db, [results]).is_current
+    rows = asyncio.run(
+        fetch_on_server(django_db, f"SELECT result, progress FROM {results.name}"),  # noqa: S608
+    )
+    assert [(bytes(row["result"]), row["progress"]) for row in rows] == [(b"old", None)]
+
+
+def test_the_operation_says_which_kind_of_table_it_runs_a_step_for() -> None:
+    from taskiq_postgresql.contrib.django.operations import (  # noqa: PLC0415
+        RunTaskiqStep,
+    )
+
+    assert RunTaskiqStep(1).kind is None
+    assert "tables" in RunTaskiqStep(1).describe()
+    assert (
+        "result_backend tables"
+        in RunTaskiqStep(
+            2,
+            kind="result_backend",
+        ).describe()
+    )
+    assert (
+        RunTaskiqStep(2, kind="broker").describe()
+        != RunTaskiqStep(
+            2,
+            kind="result_backend",
+        ).describe()
+    )
+    # Django writes an operation back, in a squashed migration, by the
+    # arguments it was built with.
+    assert RunTaskiqStep(2, kind="broker").deconstruct() == (
+        "RunTaskiqStep",
+        (2,),
+        {"kind": "broker"},
+    )
+
+
 def test_a_0_4_broker_table_gets_step_2_from_the_second_migration(
     django_db: str,
 ) -> None:
@@ -274,7 +375,7 @@ def test_a_0_4_broker_table_gets_step_2_from_the_second_migration(
         ),
     )
     asyncio.run(fetch_on_server(django_db, INSERT_0_4_ROW))
-    first, second = migration_names()
+    first, second, *_ = migration_names()
 
     with configured([{"kind": "broker"}]):
         migrate(LABEL, first)
@@ -323,9 +424,13 @@ def test_sqlmigrate_shows_each_step_with_the_lock_and_the_bound(
         transaction_of(
             bounded(migration_statements([broker, results], through=1), seconds),
         ),
-        # Only the broker table has a step 2.
+        # Step 2 of the broker's table, and of nothing else.
         transaction_of(
             bounded([lock_of(broker), *broker.steps[1].statements], seconds)
+        ),
+        # Step 2 of the results table: another step, in a migration of its own.
+        transaction_of(
+            bounded([lock_of(results), *results.steps[1].statements], seconds)
         ),
     ]
     assert ("lock_timeout" in "".join(shown)) == bool(seconds)
