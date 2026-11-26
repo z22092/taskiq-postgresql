@@ -20,15 +20,18 @@ import pytest
 from taskiq import BrokerMessage, ScheduledTask, TaskiqResult
 from typing_extensions import Self
 
-from taskiq_postgresql.broker import PostgresqlBroker
-from taskiq_postgresql.result_backend import PostgresqlResultBackend
-from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
+from taskiq_postgresql.broker import PostgresqlBroker
 from taskiq_postgresql.core.sql.catalog import Column, notify_statement
 from taskiq_postgresql.drivers._asyncpg import AsyncpgDriver
 from taskiq_postgresql.exceptions import ResultIsMissingError
+from taskiq_postgresql.result_backend import PostgresqlResultBackend
+from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 
 DSN = "postgresql://u@localhost/db"
+
+# The return value of ``a_result``, which the result tests read back.
+RETURN_VALUE = 5
 
 Call = tuple[str, tuple[Any, ...], dict[str, Any]]
 
@@ -71,6 +74,7 @@ class RecordingDriver(QueryDriver):
         values: Sequence[Any],
         returning: Any = _OMITTED,
     ) -> Any:
+        """Record the call and return the fixed id."""
         passed = () if returning is _OMITTED else (returning,)
         self._record("insert", columns, values, *passed)
         return self.insert_returns
@@ -83,6 +87,7 @@ class RecordingDriver(QueryDriver):
         on_conflict_update_columns: Sequence[Column],
         returning: Any = _OMITTED,
     ) -> Any:
+        """Record the call."""
         passed = () if returning is _OMITTED else (returning,)
         self._record(
             "insert_or_update",
@@ -94,9 +99,11 @@ class RecordingDriver(QueryDriver):
         )
 
     async def delete(self, column: Column, value: Any) -> Any:
+        """Record the call."""
         self._record("delete", column, value)
 
     async def fetch_row(self, query: str, *values: Any) -> Optional[dict[str, Any]]:
+        """Record the call; return or raise what the test set."""
         self._record("fetch_row", query, *values)
         if self.fetch_row_raises is not None:
             raise self.fetch_row_raises
@@ -107,6 +114,7 @@ class RecordingDriver(QueryDriver):
         from_date: Any,
         to_date: Any = None,
     ) -> Any:
+        """Record the call."""
         self._record("delete_by_date", from_date, to_date)
 
     async def select(
@@ -115,17 +123,20 @@ class RecordingDriver(QueryDriver):
         where_columns: Optional[Sequence[Column]] = None,
         where_values: Optional[Sequence[Any]] = None,
     ) -> list[dict[str, Any]]:
+        """Record the call; return the rows the test set."""
         if where_columns is None and where_values is None:
             self._record("select", columns)
         else:
             self._record("select", columns, where_columns, where_values)
         return self.select_returns
 
-    async def exists(self, id: Any) -> bool:  # noqa: A002
+    async def exists(self, id: Any) -> bool:
+        """Record the call; return the fixed answer."""
         self._record("exists", id)
         return self.exists_returns
 
     async def on_startup(self) -> None:
+        """Record the call and what the component had set by then."""
         # What the component must have set by now, read when it is called.
         self._record("on_startup")
         self.on_startup_seen.append(
@@ -137,9 +148,11 @@ class RecordingDriver(QueryDriver):
         )
 
     async def on_shutdown(self) -> None:
+        """Record the call."""
         self._record("on_shutdown")
 
     async def execute(self, query: str, *values: Any) -> Any:
+        """Record the call; raise what the test set."""
         self._record("execute", query, *values)
         if self.execute_raises is not None:
             raise self.execute_raises
@@ -153,9 +166,11 @@ class FakeListenDriver(ListenDriver):
         self.events = events
 
     async def on_startup(self) -> None:
+        """Log the start in the shared log."""
         self.events.append("listen.on_startup")
 
     async def on_shutdown(self) -> None:
+        """Log the stop in the shared log."""
         self.events.append("listen.on_shutdown")
 
     def __aiter__(self) -> AsyncIterator[str]:
@@ -229,7 +244,7 @@ def a_result() -> TaskiqResult[int]:
     return TaskiqResult(
         is_err=False,
         log="a log",
-        return_value=5,
+        return_value=RETURN_VALUE,
         execution_time=0.5,
     )
 
@@ -253,6 +268,7 @@ class TestBroker:
     async def test_when_kicked_without_delay__then_it_inserts_and_notifies(
         self,
     ) -> None:
+        """When kicked without delay, then it inserts and notifies."""
         broker, driver, _ = make_broker()
         message = broker_message({"a": "b"})
         columns = broker.columns
@@ -294,6 +310,7 @@ class TestBroker:
     async def test_when_kicked_with_a_delay__then_it_inserts_and_does_not_notify(
         self,
     ) -> None:
+        """When kicked with a delay, then it inserts and does not notify."""
         broker, driver, _ = make_broker()
         columns = broker.columns
 
@@ -318,6 +335,7 @@ class TestBroker:
         self,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """When the notify fails, then it warns and does not raise."""
         broker, driver, _ = make_broker()
         driver.execute_raises = RuntimeError("no notify")
 
@@ -326,16 +344,20 @@ class TestBroker:
 
         assert [call[0] for call in driver.calls] == ["insert", "execute"]
         assert [record.getMessage() for record in caplog.records] == [
-            "NOTIFY of message 7 on channel MixedChannel failed "
-            "(RuntimeError('no notify')): it will be delivered by the next sweep",
+            (
+                "NOTIFY of message 7 on channel MixedChannel failed "
+                "(RuntimeError('no notify')): it will be delivered by the next sweep"
+            ),
         ]
         assert [record.levelno for record in caplog.records] == [logging.WARNING]
 
     @pytest.mark.anyio
     async def test_when_the_insert_fails__then_the_error_propagates(self) -> None:
+        """When the insert fails, then the error propagates."""
         broker, driver, _ = make_broker()
 
         async def failing_insert(*args: Any, **kwargs: Any) -> Any:
+            """Record the call."""
             driver.calls.append(("insert", args, kwargs))
             raise RuntimeError("insert failed")
 
@@ -350,6 +372,7 @@ class TestBroker:
     async def test_when_a_due_message_is_claimed__then_it_returns_its_bytes(
         self,
     ) -> None:
+        """When a due message is claimed, then it returns its bytes."""
         broker, driver, _ = make_broker()
         driver.fetch_row_returns = {"message": b"claimed"}
 
@@ -365,6 +388,7 @@ class TestBroker:
     async def test_when_a_message_is_claimed_by_id__then_it_returns_its_bytes(
         self,
     ) -> None:
+        """When a message is claimed by id, then it returns its bytes."""
         broker, driver, _ = make_broker()
         driver.fetch_row_returns = {"message": b"claimed"}
 
@@ -382,6 +406,7 @@ class TestBroker:
         self,
         by_id: bool,
     ) -> None:
+        """When no row matches, then the claim is none."""
         broker, driver, _ = make_broker()
         driver.fetch_row_returns = None
 
@@ -402,6 +427,7 @@ class TestBroker:
         what: str,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """When the claim raises, then it logs and returns none."""
         broker, driver, _ = make_broker()
         driver.fetch_row_raises = RuntimeError("boom")
 
@@ -428,6 +454,7 @@ class TestBroker:
         what: str,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
+        """When the claim times out, then it logs an error and returns none."""
         broker, driver, _ = make_broker()
         driver.fetch_row_raises = asyncio.TimeoutError()
 
@@ -438,8 +465,10 @@ class TestBroker:
 
         assert claimed is None
         assert [record.getMessage() for record in caplog.records] == [
-            f"Claiming {what} on channel MixedChannel got no answer within "
-            f"{broker.query_timeout} s",
+            (
+                f"Claiming {what} on channel MixedChannel got no answer within "
+                f"{broker.query_timeout} s"
+            ),
         ]
         assert caplog.records[0].exc_info is None
 
@@ -447,11 +476,13 @@ class TestBroker:
     async def test_when_it_starts__then_the_driver_is_set_up_before_on_startup(
         self,
     ) -> None:
+        """When it starts, then the driver is set up before on startup."""
         broker, driver, events = make_broker()
         # The listen driver shares the log, so the order across drivers shows.
         original_on_startup = driver.on_startup
 
         async def logged_on_startup() -> None:
+            """Record the call."""
             events.append("driver.on_startup")
             await original_on_startup()
 
@@ -471,6 +502,7 @@ class TestBroker:
 
     @pytest.mark.anyio
     async def test_when_it_shuts_down__then_both_drivers_are_closed(self) -> None:
+        """When it shuts down, then both drivers are closed."""
         broker, driver, events = make_broker()
 
         await broker.shutdown()
@@ -486,6 +518,7 @@ class TestResultBackend:
     async def test_when_a_result_is_set__then_it_is_upserted_by_task_id(
         self,
     ) -> None:
+        """When a result is set, then it is upserted by task id."""
         backend, driver = make_result_backend()
         result = a_result()
         columns = backend.columns
@@ -511,6 +544,7 @@ class TestResultBackend:
         self,
         ready: bool,
     ) -> None:
+        """When asked if a result is ready, then it asks exists."""
         backend, driver = make_result_backend()
         driver.exists_returns = ready
 
@@ -522,13 +556,14 @@ class TestResultBackend:
     async def test_when_results_are_kept__then_get_result_only_selects(
         self,
     ) -> None:
+        """When results are kept, then get result only selects."""
         backend, driver = make_result_backend(keep_results=True)
         driver.select_returns = [{"result": backend.serializer.dumpb(a_result())}]
         columns = backend.columns
 
         result = await backend.get_result("task-1")
 
-        assert result.return_value == 5
+        assert result.return_value == RETURN_VALUE
         assert result.log is None
         assert driver.calls == [
             (
@@ -542,13 +577,14 @@ class TestResultBackend:
     async def test_when_results_are_not_kept__then_get_result_selects_then_deletes(
         self,
     ) -> None:
+        """When results are not kept, then get result selects then deletes."""
         backend, driver = make_result_backend(keep_results=False)
         driver.select_returns = [{"result": backend.serializer.dumpb(a_result())}]
         columns = backend.columns
 
         result = await backend.get_result("task-1", with_logs=True)
 
-        assert result.return_value == 5
+        assert result.return_value == RETURN_VALUE
         assert result.log == "a log"
         assert driver.calls == [
             (
@@ -565,6 +601,7 @@ class TestResultBackend:
         self,
         keep_results: bool,
     ) -> None:
+        """When there is no row, then get result raises missing."""
         backend, driver = make_result_backend(keep_results=keep_results)
         driver.select_returns = []
 
@@ -580,6 +617,7 @@ class TestResultBackend:
     async def test_when_deleting_from_a_date__then_to_date_is_passed_as_none(
         self,
     ) -> None:
+        """When deleting from a date, then to date is passed as none."""
         backend, driver = make_result_backend()
         from_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
 
@@ -589,6 +627,7 @@ class TestResultBackend:
 
     @pytest.mark.anyio
     async def test_when_deleting_between_dates__then_both_are_passed(self) -> None:
+        """When deleting between dates, then both are passed."""
         backend, driver = make_result_backend()
         from_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
         to_date = datetime(2026, 2, 1, tzinfo=timezone.utc)
@@ -601,6 +640,7 @@ class TestResultBackend:
     async def test_when_it_starts__then_the_driver_is_set_up_before_on_startup(
         self,
     ) -> None:
+        """When it starts, then the driver is set up before on startup."""
         backend, driver = make_result_backend()
 
         await backend.startup()
@@ -616,6 +656,7 @@ class TestResultBackend:
 
     @pytest.mark.anyio
     async def test_when_it_shuts_down__then_the_driver_is_closed(self) -> None:
+        """When it shuts down, then the driver is closed."""
         backend, driver = make_result_backend()
 
         await backend.shutdown()
@@ -623,13 +664,15 @@ class TestResultBackend:
         assert driver.calls == [("on_shutdown", (), {})]
 
     @pytest.mark.anyio
-    async def test_when_a_distribution_driver_overrides_on_startup__then_startup_calls_it_once(
+    async def test_when_a_distribution_driver_overrides_on_startup__then_it_runs_once(
         self,
     ) -> None:
+        """A distribution driver that overrides on_startup is called once."""
         seen: list[str] = []
 
         class OverridingDriver(AsyncpgDriver):
             async def on_startup(self) -> None:
+                """Record the call and what the component had set by then."""
                 seen.append(self.component_kind or "")
 
         backend: PostgresqlResultBackend[Any] = PostgresqlResultBackend(DSN)
@@ -655,6 +698,7 @@ class TestSchedulerSource:
     async def test_when_schedules_are_read__then_it_selects_id_and_schedule(
         self,
     ) -> None:
+        """When schedules are read, then it selects id and schedule."""
         source, driver = make_scheduler_source()
         stored = a_schedule(cron="* * * * *")
         driver.select_returns = [
@@ -673,6 +717,7 @@ class TestSchedulerSource:
     async def test_when_a_schedule_is_added__then_it_inserts_without_returning(
         self,
     ) -> None:
+        """When a schedule is added, then it inserts without returning."""
         source, driver = make_scheduler_source()
         schedule = a_schedule(cron="* * * * *")
         columns = source.columns
@@ -697,6 +742,7 @@ class TestSchedulerSource:
 
     @pytest.mark.anyio
     async def test_when_a_schedule_is_deleted__then_it_deletes_by_id(self) -> None:
+        """When a schedule is deleted, then it deletes by id."""
         source, driver = make_scheduler_source()
 
         await source.delete_schedule("schedule-1")
@@ -709,6 +755,7 @@ class TestSchedulerSource:
     async def test_when_a_timed_schedule_was_sent__then_post_send_deletes_it(
         self,
     ) -> None:
+        """When a timed schedule was sent, then post send deletes it."""
         source, driver = make_scheduler_source()
         schedule = a_schedule(time=datetime(2030, 1, 1, tzinfo=timezone.utc))
 
@@ -722,6 +769,7 @@ class TestSchedulerSource:
     async def test_when_a_cron_schedule_was_sent__then_post_send_calls_nothing(
         self,
     ) -> None:
+        """When a cron schedule was sent, then post send calls nothing."""
         source, driver = make_scheduler_source()
 
         await source.post_send(a_schedule(cron="* * * * *"))
@@ -732,6 +780,7 @@ class TestSchedulerSource:
     async def test_when_it_starts__then_the_driver_is_set_up_before_on_startup(
         self,
     ) -> None:
+        """When it starts, then the driver is set up before on startup."""
         source, driver = make_scheduler_source()
 
         await source.startup()
@@ -747,6 +796,7 @@ class TestSchedulerSource:
 
     @pytest.mark.anyio
     async def test_when_it_shuts_down__then_the_driver_is_closed(self) -> None:
+        """When it shuts down, then the driver is closed."""
         source, driver = make_scheduler_source()
 
         await source.shutdown()
