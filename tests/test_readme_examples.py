@@ -435,8 +435,16 @@ def _signature_rows(component: type) -> list[tuple[str, Any]]:
 
 def test_when_the_changelog_upgrade_sql_is_read__then_startup_runs_the_same() -> None:
     """The SQL "Upgrading from 0.4.x" has users run is what startup() runs."""
-    unreleased = CHANGELOG.read_text().split("\n## ", 2)[1]
-    upgrading = unreleased.split("Upgrading from 0.4.x:", 1)[1].split("\n### ", 1)[0]
+    # The block sits under `[Unreleased]` until the release renames it, and
+    # under `[0.5.0]` after it, with an empty `[Unreleased]` above. So it is
+    # found by its title, not by the position of the first section, and it ends
+    # at the next group or the next section, whichever comes first.
+    upgrading = (
+        CHANGELOG.read_text()
+        .split("Upgrading from 0.4.x:", 1)[1]
+        .split("\n### ", 1)[0]
+        .split("\n## ", 1)[0]
+    )
     blocks = re.findall(
         r"^ *```sql\n(.*?)^ *```$",
         upgrading,

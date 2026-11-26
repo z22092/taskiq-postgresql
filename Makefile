@@ -3,12 +3,17 @@
 # Docker or Podman (see AGENTS.md).
 
 UV ?= uv
+# Where `make release` takes the new section's body from; see scripts/release.py.
+SOURCE ?= cliff
+# The release targets read these as shell variables ($$VERSION in a recipe), so
+# a value is never pasted into the recipe text and cannot add shell syntax to it.
+export VERSION SOURCE DATE ALLOW_MISMATCH
 
 .DEFAULT_GOAL := help
-.PHONY: help sync lint typecheck test test-lowest build audit pins
+.PHONY: help sync lint typecheck test test-lowest build audit pins changelog release release-notes
 
 help: ## List the targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "%-12s %s\n", $$1, $$2}'
+	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*## "} {printf "%-14s %s\n", $$1, $$2}'
 
 sync: ## Install the project, every driver extra and every group from uv.lock
 	$(UV) sync --locked --all-extras --all-groups
@@ -66,3 +71,18 @@ audit: ## Audit every locked dependency, hashes required (CI job: pip-audit)
 
 pins: ## Check that pins declared in more than one place agree
 	$(UV) run --no-sync python scripts/check_pins.py
+
+# The release targets run through `uv run --only-group release`, which puts the
+# pinned git-cliff on PATH for scripts/release.py. They write no git state: no
+# commit, branch, tag or push. Their variables travel in the environment and
+# the shell expands them inside double quotes, so make never pastes them into
+# the command; scripts/release.py then checks each one (it is the only
+# validation). Run `git fetch --tags` first: the script sees local tags only.
+changelog: ## Preview the next CHANGELOG section from the commits; writes nothing
+	$(UV) run --locked --only-group release git-cliff --unreleased --bump --strip all
+
+release: ## Add the CHANGELOG section: VERSION=X.Y.Z [SOURCE=unreleased] [DATE=YYYY-MM-DD] [ALLOW_MISMATCH=1]
+	$(UV) run --locked --only-group release python scripts/release.py prepare --version "$$VERSION" --source "$$SOURCE" $${DATE:+--date "$$DATE"} $${ALLOW_MISMATCH:+--allow-version-mismatch}
+
+release-notes: ## Print the CHANGELOG section of VERSION=X.Y.Z for the GitHub Release
+	@$(UV) run --locked --only-group release python scripts/release.py notes --version "$$VERSION"

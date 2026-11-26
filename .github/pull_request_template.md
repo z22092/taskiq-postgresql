@@ -11,10 +11,11 @@
 
 - [ ] `pre-commit run --all-files` passes
 - [ ] Tests cover the change (the `driver` fixture runs each one against all three drivers)
-- [ ] `CHANGELOG.md` has an entry under `## [Unreleased]`, or the change is not user-visible
+- [ ] The PR title is a Conventional Commit (it becomes the changelog entry)
 - [ ] README and docstrings are updated if behaviour or public arguments changed
 
 ## Breaking change
 
 <!-- Delete this section if there is none. Otherwise say what breaks, who is
-     affected and how to migrate; the CHANGELOG entry is marked **BREAKING:**. -->
+     affected and how to migrate, and mark the PR title with `!`; the release
+     PR turns this section into the "Upgrade notes" of the changelog. -->

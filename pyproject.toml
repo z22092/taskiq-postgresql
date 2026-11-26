@@ -127,6 +127,11 @@ lint = [
     "pre-commit==4.7.0; python_version >= \"3.11\"",
     "ty==0.0.99",
 ]
+# The wheel ships the git-cliff binary, so the release tooling needs no Rust
+# toolchain and the lock holds its hash like every other tool.
+release = [
+    "git-cliff==2.14.2",
+]
 
 [tool.uv]
 managed = true
