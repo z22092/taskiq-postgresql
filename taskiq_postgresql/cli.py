@@ -22,7 +22,6 @@ from typing import (
     Any,
     Callable,
     Final,
-    Literal,
     NamedTuple,
     Sequence,
 )
@@ -34,7 +33,7 @@ if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
     from types import ModuleType
 
-    from taskiq_postgresql.abc.driver import QueryDriver
+    from taskiq_postgresql.core.stores.schema import SchemaStore
     from taskiq_postgresql.migrations import (
         Component,
         FormatOptions,
@@ -571,74 +570,45 @@ def _connections(
     namespace: argparse.Namespace,
     parser: argparse.ArgumentParser,
     migrations: ModuleType,
-) -> dict[str, tuple[QueryDriver, list[TableSchema]]]:
+) -> dict[str, tuple[SchemaStore | None, list[TableSchema]]]:
     """Group the tables by the connection string their catalog is read with."""
+    from taskiq_postgresql.core.stores.schema import schema_store  # noqa: PLC0415
+
     if namespace.component is not None:
         schemas = _schemas(namespace, parser, migrations)
-        return {namespace.dsn: (_catalog_driver(namespace.dsn), schemas)}
-    grouped: dict[str, tuple[QueryDriver, list[TableSchema]]] = {}
+        return {namespace.dsn: (None, schemas)}
+    grouped: dict[str, tuple[SchemaStore | None, list[TableSchema]]] = {}
     for component in migrations.collect_components(
         *namespace.targets,
         app_dir=namespace.app_dir,
     ):
         dsn = namespace.dsn or component.dsn
-        _, schemas = grouped.setdefault(dsn, (component.driver, []))
+        _, schemas = grouped.setdefault(dsn, (schema_store(component), []))
         schemas.append(migrations.table_schema(component))
     return grouped
 
 
-def _catalog_driver(dsn: str) -> QueryDriver:
-    """Return a query driver that only reads the catalog of ``dsn``."""
-    from taskiq_postgresql.core.sql.catalog import (  # noqa: PLC0415
-        PrimaryKeyColumn,
-    )
-    from taskiq_postgresql.utils import get_db_driver  # noqa: PLC0415
-    from taskiq_postgresql.utils.libs_available import (  # noqa: PLC0415
-        is_asyncpg_available,
-        is_psqlpy_available,
-        is_psycopg_available,
-    )
-
-    # Without the application no component says which driver: the first one
-    # installed, else asyncpg, whose error then says what to install.
-    installed: tuple[tuple[Literal["asyncpg", "psqlpy", "psycopg"], bool], ...] = (
-        ("asyncpg", is_asyncpg_available()),
-        ("psycopg", is_psycopg_available()),
-        ("psqlpy", is_psqlpy_available()),
-    )
-    name = next((name for name, available in installed if available), "asyncpg")
-    # It reads no table of its own, so its table and columns never matter.
-    return get_db_driver(name)(dsn, "taskiq_catalog", [], PrimaryKeyColumn())
-
-
 async def _read(
-    connections: dict[str, tuple[QueryDriver, list[TableSchema]]],
+    connections: dict[str, tuple[SchemaStore | None, list[TableSchema]]],
     migrations: ModuleType,
 ) -> list[_Database]:
     return [
-        await _read_database(dsn, driver, schemas, migrations)
-        for dsn, (driver, schemas) in connections.items()
+        await _read_database(dsn, store, schemas, migrations)
+        for dsn, (store, schemas) in connections.items()
     ]
 
 
 async def _read_database(
     dsn: str,
-    driver: QueryDriver,
+    store: SchemaStore | None,
     schemas: list[TableSchema],
     migrations: ModuleType,
 ) -> _Database:
-    # One read: the catalog, and what the plan's header names. The catalog
-    # builds the query, from the same tables the catalog query reads.
-    from taskiq_postgresql.core.sql.catalog import database_read  # noqa: PLC0415
+    # One read: the catalog, and what the plan's header names.
+    from taskiq_postgresql.core.stores.schema import read_database  # noqa: PLC0415
 
-    driver.connection_string = dsn
     async with _connecting(dsn):
-        read = database_read(migrations.catalog_tables(schemas))
-        try:
-            row = await driver.fetch_row(read.text)
-        finally:
-            if getattr(driver, "pool", None) is not None:
-                await driver.on_shutdown()
+        row = await read_database(dsn, schemas, store)
         found: dict[str, Any] = row or {}
         state = migrations.catalog_state(found.get("catalog"))
     return _Database(
@@ -722,27 +692,22 @@ def _migrate(
         app_dir=namespace.app_dir,
     )
     asyncio.run(_apply(components))
-    names = ", ".join(component.driver.table_name for component in components)
+    from taskiq_postgresql.core.stores.schema import schema_store  # noqa: PLC0415
+
+    names = ", ".join(
+        schema_store(component).declaration.table.configured for component in components
+    )
     sys.stderr.write(f"{_PROG}: tables ready: {names}\n")
     return 0
 
 
 async def _apply(components: Sequence[Component]) -> None:
+    from taskiq_postgresql.core.stores.schema import schema_store  # noqa: PLC0415
+
     for component in components:
-        driver = component.driver
         dsn = component.dsn
-        driver.connection_string = dsn
-        run_migrations = driver.run_migrations
-        # The startup path runs its DDL only with the flag set; migrate runs it
-        # whatever the component says, then leaves the flag as it found it.
-        driver.run_migrations = True
         async with _connecting(dsn):
-            try:
-                await driver.on_startup()
-            finally:
-                driver.run_migrations = run_migrations
-                if getattr(driver, "pool", None) is not None:
-                    await driver.on_shutdown()
+            await schema_store(component).migrate(dsn)
 
 
 @asynccontextmanager

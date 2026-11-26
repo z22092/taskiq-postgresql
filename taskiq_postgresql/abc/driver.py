@@ -69,11 +69,11 @@ class QueryDriver(_ConnectionStringHolder, ABC):
     query_timeout: Optional[float] = None
     #: The component that owns the table, which the bundled components set at
     #: construction and again in ``startup()``: with it, ``on_startup()``
-    #: describes the table from this driver's own builders
-    #: (``taskiq_postgresql.migrations``) and compares the database with
-    #: that. ``None``, a driver no component owns, compares nothing: it
-    #: probes its relations with ``relations_exist_query`` when it migrates,
-    #: and checks nothing when it does not.
+    #: describes the table from this driver's declaration (its table, columns
+    #: and indexes, as the component handed them over) and compares the
+    #: database with that. ``None``, a driver no component owns, compares
+    #: nothing: it probes its relations with ``relations_exist_query`` when it
+    #: migrates, and checks nothing when it does not.
     component_kind: Optional["ComponentKind"] = None
 
     def __init__(
@@ -150,7 +150,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self,
         columns: Sequence[Column],
         values: Sequence[Any],
-        returning: Optional[Sequence[Column]],
+        returning: Optional[Sequence[Column]] = None,
     ) -> Any:
         """Insert a row into a table."""
 
@@ -161,7 +161,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         values: Sequence[Any],
         on_conflict_columns: Sequence[Column],
         on_conflict_update_columns: Sequence[Column],
-        returning: Optional[Sequence[Column]],
+        returning: Optional[Sequence[Column]] = None,
     ) -> Any:
         """Insert or update a row into a table."""
 
@@ -221,8 +221,10 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         """
         Check the table, or create and complete it when ``run_migrations`` is set.
 
-        Given ``component_kind``, it starts with one read-only catalog query
-        (``catalog_query``), compared with the table's description
+        A component calls it through its store, at startup. Given
+        ``component_kind``, it describes the table from the driver's
+        declaration and starts with one read-only catalog query
+        (``catalog_query``), compared with that description
         (``plan_migration``). Without it, it cannot describe the table: it
         then probes the table and its indexes with ``relations_exist_query``
         when ``run_migrations`` is set, as releases before that comparison

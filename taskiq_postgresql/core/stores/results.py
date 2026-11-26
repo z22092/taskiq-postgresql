@@ -65,7 +65,7 @@ class ResultStore:
         columns = self._table
         # Four arguments, as the backend always sent: the bundled drivers
         # default ``returning`` to none, though the abstract signature has none.
-        await self.driver.insert_or_update(  # ty: ignore[missing-argument]
+        await self.driver.insert_or_update(
             [columns.primary_key, columns.result],
             [task_id, data],
             [columns.primary_key],
