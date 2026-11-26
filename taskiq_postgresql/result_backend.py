@@ -4,7 +4,7 @@ from typing import Any, Final, Literal, Optional, TypeVar, Union
 
 from taskiq import AsyncResultBackend, TaskiqResult
 from taskiq.abc.serializer import TaskiqSerializer
-from taskiq.depends.progress_tracker import TaskProgress
+from taskiq.depends.progress_tracker import TaskProgress, TaskState
 from taskiq.serializers.pickle import PickleSerializer
 
 from taskiq_postgresql.abc.driver import QueryDriver
@@ -238,7 +238,13 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         data = await self._store.get_progress(task_id)
         if data is None:
             return None
-        return TaskProgress[Any].model_validate_json(data)
+        progress = TaskProgress[Any].model_validate_json(data)
+        # A known state is read back as `TaskState` with the oldest pydantic
+        # this package allows and as `str` with later ones; return `str` on
+        # every supported version. It still equals the `TaskState` member.
+        if isinstance(progress.state, TaskState):
+            return progress.model_copy(update={"state": progress.state.value})
+        return progress
 
     async def is_result_ready(self, task_id: Any) -> bool:
         """
