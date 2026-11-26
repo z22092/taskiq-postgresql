@@ -641,38 +641,20 @@ async def _read_database(
     schemas: list[TableSchema],
     migrations: ModuleType,
 ) -> _Database:
-    found: dict[str, Any] = {}
-
-    async def fetch_value(_catalog_query: str) -> Any:
-        # One read: the catalog, and what the plan's header names. The
-        # catalog builds it, from the same tables the catalog query reads.
-        from taskiq_postgresql.core.sql.catalog import (  # noqa: PLC0415
-            database_read,
-        )
-        from taskiq_postgresql.core.sql.identifier import (  # noqa: PLC0415
-            Identifier,
-        )
-
-        read = database_read(
-            [
-                (
-                    Identifier.parse(schema.name, what="table name", warn=False),
-                    [index.name for index in schema.indexes],
-                )
-                for schema in schemas
-            ],
-        )
-        row = await driver.fetch_row(read.text)
-        found.update(row or {})
-        return found.get("catalog")
+    # One read: the catalog, and what the plan's header names. The catalog
+    # builds the query, from the same tables the catalog query reads.
+    from taskiq_postgresql.core.sql.catalog import database_read  # noqa: PLC0415
 
     driver.connection_string = dsn
     async with _connecting(dsn):
+        read = database_read(migrations.catalog_tables(schemas))
         try:
-            state = await migrations.read_catalog(schemas, fetch_value)
+            row = await driver.fetch_row(read.text)
         finally:
             if getattr(driver, "pool", None) is not None:
                 await driver.on_shutdown()
+        found: dict[str, Any] = row or {}
+        state = migrations.catalog_state(found.get("catalog"))
     return _Database(
         name=str(found["database"]),
         search_path=str(found["search_path"]),

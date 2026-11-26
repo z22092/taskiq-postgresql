@@ -30,13 +30,22 @@ class ParamType(Enum):
 _PLACEHOLDER = re.compile(r"(?<![A-Za-z0-9_$])\$(\d+)")
 _VARCHAR = re.compile(r"VARCHAR(\(\d+\))?")
 
+# The spellings ``migrations`` knows for a column, and the integer types a
+# third-party driver's key column may use.
 _SQL_TYPES = {
     "SERIAL": ParamType.INT4,
+    "INTEGER": ParamType.INT4,
+    "INT": ParamType.INT4,
+    "INT4": ParamType.INT4,
+    "BIGSERIAL": ParamType.INT8,
+    "BIGINT": ParamType.INT8,
+    "INT8": ParamType.INT8,
     "UUID": ParamType.UUID,
     "TEXT": ParamType.TEXT,
     "BYTEA": ParamType.BYTEA,
     "JSONB": ParamType.JSONB,
     "TIMESTAMP WITH TIME ZONE": ParamType.TIMESTAMPTZ,
+    "TIMESTAMPTZ": ParamType.TIMESTAMPTZ,
 }
 
 

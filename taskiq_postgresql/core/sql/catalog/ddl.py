@@ -1,0 +1,286 @@
+"""The DDL the components run: tables, indexes, added columns and the probe."""
+
+from typing import NamedTuple, Optional, Sequence, Union
+
+from taskiq_postgresql.core.sql.catalog.base import QueryBase
+from taskiq_postgresql.core.sql.catalog.columns import Column
+from taskiq_postgresql.core.sql.identifier import (
+    Identifier,
+    check_table_names,
+    derived_names,
+)
+from taskiq_postgresql.core.sql.statement import ParamType, Script, Statement
+
+
+class CreateTableQuery(QueryBase):
+    """Query to create a table."""
+
+    def __init__(
+        self,
+        table_name: Union[str, Identifier],
+        columns: Sequence[Column],
+    ) -> None:
+        """Initialize the query."""
+        super().__init__(table_name)
+        self.columns = columns
+
+    def make_query(self) -> str:
+        """Return the query as a string."""
+        return (
+            f"CREATE TABLE IF NOT EXISTS {self.table_name} "
+            f"({', '.join(column.make_query() for column in self.columns)})"
+        )
+
+    def script(self) -> Script:
+        """Return the query as a script: it takes no parameters."""
+        return Script(self.make_query())
+
+
+def index_name(table_name: str, column: Column) -> str:
+    """Return the name of the index ``CreateIndexQuery`` creates on ``column``."""
+    return f"{table_name}_{column.name}_idx"
+
+
+class CreateIndexQuery(QueryBase):
+    """Query to create an index."""
+
+    def make_query(self, columns: Sequence[Column]) -> str:
+        """Return the query as a string."""
+        return "\n".join(
+            "CREATE INDEX IF NOT EXISTS "
+            f"{index_name(self.table_name, column)} "
+            f"ON {self.table_name} USING HASH ({column.name});"
+            for column in columns
+        )
+
+    def script(self, columns: Sequence[Column]) -> Script:
+        """Return the query as a script: it takes no parameters."""
+        return Script(self.make_query(columns))
+
+
+class AddedIndex(NamedTuple):
+    """A btree index that ``AddColumnsQuery`` creates after adding its columns."""
+
+    name: str
+    columns: Sequence[Column]
+
+
+class _NameInputs(NamedTuple):
+    index_names: list[str]
+    serial_column: Optional[str]
+
+
+def _name_inputs(
+    table: Identifier,
+    columns: Sequence[Column],
+    index_columns: Optional[Sequence[Column]],
+    added_indexes: Sequence[AddedIndex],
+) -> _NameInputs:
+    # The one place that reads a table's declaration into the inputs of the
+    # derived-name rules.
+    return _NameInputs(
+        index_names=[
+            *(index_name(table.configured, column) for column in index_columns or ()),
+            *(index.name for index in added_indexes),
+        ],
+        serial_column=next(
+            (column.name for column in columns if column.is_serial),
+            None,
+        ),
+    )
+
+
+def table_object_names(
+    table: Identifier,
+    *,
+    columns: Sequence[Column],
+    index_columns: Optional[Sequence[Column]],
+    added_indexes: Sequence[AddedIndex],
+) -> tuple[tuple[str, str], ...]:
+    """
+    Return the names PostgreSQL gives the objects of a declared table.
+
+    Args:
+        table: The checked table name.
+        columns: Every column ``CREATE TABLE`` declares.
+        index_columns: The columns ``CreateIndexQuery`` indexes.
+        added_indexes: The indexes ``AddColumnsQuery`` adds.
+
+    Returns:
+        ``(kind, name)`` pairs, as ``derived_names`` returns them.
+    """
+    inputs = _name_inputs(table, columns, index_columns, added_indexes)
+    return derived_names(
+        table,
+        index_names=inputs.index_names,
+        serial_column=inputs.serial_column,
+    )
+
+
+def check_table_objects(
+    table: Identifier,
+    *,
+    columns: Sequence[Column],
+    index_columns: Optional[Sequence[Column]],
+    added_indexes: Sequence[AddedIndex],
+) -> None:
+    """
+    Refuse a table name whose derived names collide.
+
+    The one place that turns a table's declaration into the inputs of that
+    check. A driver runs it when it is built and the migration description
+    runs it again when it is built, from the same lists, so a table that is
+    described but never run through a driver gets the same refusal.
+    ``CREATE INDEX IF NOT EXISTS`` skips an index whose cut name already
+    exists, so a collision would lose an index without an error.
+
+    Args:
+        table: The checked table name.
+        columns: Every column ``CREATE TABLE`` declares.
+        index_columns: The columns ``CreateIndexQuery`` indexes.
+        added_indexes: The indexes ``AddColumnsQuery`` adds.
+
+    Raises:
+        IdentifierError: Two of the names the table's objects get are equal.
+    """
+    inputs = _name_inputs(table, columns, index_columns, added_indexes)
+    check_table_names(
+        table,
+        index_names=inputs.index_names,
+        serial_column=inputs.serial_column,
+    )
+
+
+class AddColumnsQuery(QueryBase):
+    """Query adding columns, then indexes, to a table that may already exist."""
+
+    def make_query(
+        self,
+        columns: Sequence[Column],
+        indexes: Sequence[AddedIndex] = (),
+    ) -> str:
+        """Return the query as a string: one statement each, without parameters."""
+        statements = []
+        if columns:
+            add_columns = ",\n".join(
+                f"  ADD COLUMN IF NOT EXISTS {column.make_query()}"
+                for column in columns
+            )
+            statements.append(f"ALTER TABLE {self.table_name}\n{add_columns};")
+        for index in indexes:
+            indexed = ", ".join(column.name for column in index.columns)
+            statements.append(
+                f"CREATE INDEX IF NOT EXISTS {index.name}\n"
+                f"  ON {self.table_name} ({indexed});",
+            )
+        return "\n".join(statements)
+
+    def script(
+        self,
+        columns: Sequence[Column],
+        indexes: Sequence[AddedIndex] = (),
+    ) -> Script:
+        """Return the statements as a script: they take no parameters."""
+        return Script(self.make_query(columns, indexes))
+
+
+class DropNotNullQuery(QueryBase):
+    """Query making an existing column accept ``NULL``; a no-op when it already does."""
+
+    def make_query(self, column: str) -> str:
+        """Return the query as a string: one statement, without parameters."""
+        return f"ALTER TABLE {self.table_name} ALTER COLUMN {column} DROP NOT NULL;"
+
+    def script(self, column: str) -> Script:
+        """Return the statement as a script: it takes no parameters."""
+        return Script(self.make_query(column))
+
+
+def _probe_text(relation_count: int, column_count: int) -> str:
+    checks = [
+        f"to_regclass(${position}) IS NOT NULL"
+        for position in range(1, relation_count + 1)
+    ]
+    checks.extend(
+        "EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1)"  # noqa: S608
+        f" AND attname::text = ${position} AND NOT attisdropped)"
+        for position in range(
+            relation_count + 1,
+            relation_count + 1 + column_count,
+        )
+    )
+    return "SELECT " + " AND ".join(checks)
+
+
+class RelationsExistQuery(QueryBase):
+    """
+    Query telling whether a table and every index it gets all exist.
+
+    Given the columns and indexes ``AddColumnsQuery`` adds, it also tells
+    whether the table has them. A query driver no component owns
+    (``QueryDriver.component_kind`` is ``None``) cannot describe its table for
+    ``catalog_query``, so with ``run_migrations`` it runs this probe instead,
+    as every driver did before that comparison, and skips the migration lock
+    and the DDL when it answers true.
+    """
+
+    def relation_names(
+        self,
+        index_columns: Optional[Sequence[Column]],
+        *,
+        added_indexes: Sequence[AddedIndex] = (),
+    ) -> list[str]:
+        """Return the table name, then the name of each index on it."""
+        return [
+            self.table_name,
+            *(index_name(self.table_name, column) for column in index_columns or ()),
+            *(index.name for index in added_indexes),
+        ]
+
+    def params(
+        self,
+        index_columns: Optional[Sequence[Column]],
+        *,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
+    ) -> list[str]:
+        """Return the arguments of the query: relation names, then column names."""
+        return [
+            *self.relation_names(index_columns, added_indexes=added_indexes),
+            *(column.name for column in added_columns),
+        ]
+
+    def make_query(
+        self,
+        index_columns: Optional[Sequence[Column]],
+        *,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
+    ) -> str:
+        """Return the query as a string, one parameter per item of ``params``."""
+        relation_count = len(
+            self.relation_names(index_columns, added_indexes=added_indexes),
+        )
+        return _probe_text(relation_count, len(added_columns))
+
+    def statement(
+        self,
+        index_columns: Optional[Sequence[Column]],
+        *,
+        added_columns: Sequence[Column] = (),
+        added_indexes: Sequence[AddedIndex] = (),
+    ) -> Statement:
+        """Return the query typed: one text parameter per item of ``params``."""
+        relation_count = len(
+            self.relation_names(index_columns, added_indexes=added_indexes),
+        )
+        return Statement(
+            _probe_text(relation_count, len(added_columns)),
+            (ParamType.TEXT,) * (relation_count + len(added_columns)),
+            (("?column?", ParamType.BOOL),),
+        )
+
+
+def drop_table_script(table: Union[str, Identifier]) -> Script:
+    """Return the script that drops ``table`` if it exists."""
+    return Script(f"DROP TABLE IF EXISTS {QueryBase(table).table_name}")

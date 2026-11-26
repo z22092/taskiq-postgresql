@@ -17,7 +17,6 @@ from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
     Column,
-    exists_statement,
     listen_script,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
@@ -88,7 +87,7 @@ class PsqlpyDriver(QueryDriver):
     def __init__(
         self,
         connection_string: str,
-        table_name: str,
+        table_name: Union[str, Identifier],
         columns: Sequence[Column],
         primary_key: Column,
         created_at: Optional[Column] = None,
@@ -246,7 +245,7 @@ class PsqlpyDriver(QueryDriver):
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
             results = await connection.fetch(
-                exists_statement(self.table_name, self.primary_key).text,
+                self.exists_text,
                 encode_psqlpy_params([self.primary_key], [id]),
             )
             v = results.result()
@@ -310,16 +309,15 @@ class PsqlpyListenDriver(ListenDriver):
     def __init__(
         self,
         connection_string: str,
-        channel_name: str,
+        channel_name: Union[str, Identifier],
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the listen driver."""
-        channel = Identifier.parse(channel_name, what="channel name", warn=False)
-        super().__init__(connection_string, channel.name, **connection_kwargs)
+        super().__init__(connection_string, channel_name, **connection_kwargs)
         self.connection: Optional[ConnectionPool] = None
         self.listener: Optional[Listener] = None
         # The folded name, which add_callback() registers as well.
-        self._listen_statement = listen_script(channel).text
+        self._listen_statement = listen_script(self.channel).text
         # A payload, or the error that ended the listener.
         self._queue: AsyncQueue[Union[str, BaseException]] = AsyncQueue()
         self._reader: Optional[Task[None]] = None

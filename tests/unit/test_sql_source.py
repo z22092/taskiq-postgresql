@@ -16,7 +16,7 @@ import pytest
 
 PACKAGE = Path(__file__).resolve().parents[2] / "taskiq_postgresql"
 CORE_SQL = PACKAGE / "core" / "sql"
-CATALOG = CORE_SQL / "catalog.py"
+CATALOG = CORE_SQL / "catalog"
 
 SQL_COMMANDS = frozenset(
     {
@@ -168,7 +168,7 @@ def test_statement_and_script_are_constructed_only_in_core_sql() -> None:
 def test_noqa_s608_appears_only_in_the_catalog() -> None:
     hits: list[str] = []
     for path in _sources():
-        if path == CATALOG:
+        if path.is_relative_to(CATALOG):
             continue
         source = path.read_text(encoding="utf-8")
         for token in tokenize.generate_tokens(io.StringIO(source).readline):
@@ -189,6 +189,6 @@ def test_no_sql_text_is_built_outside_core_sql() -> None:
 
 def test_the_package_is_found() -> None:
     # A wrong root would make every rule above pass over zero files.
-    if not CATALOG.is_file():
+    if not CATALOG.is_dir():
         pytest.fail(f"catalog not found at {CATALOG}")
     assert _sources()

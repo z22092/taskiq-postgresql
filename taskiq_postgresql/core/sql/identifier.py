@@ -9,7 +9,7 @@ import re
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
 # PostgreSQL's NAMEDATALEN - 1.
 MAX_IDENTIFIER_BYTES = 63
@@ -263,9 +263,41 @@ class Identifier:
         return cls(configured=value, name=folded)
 
 
-def index_relation_name(table: Identifier, column: str) -> str:
-    """Return the name ``CREATE INDEX`` ends up with for ``column`` of ``table``."""
-    return truncate(f"{table.name}_{column}_idx")
+def as_identifier(value: Union[str, Identifier], *, what: str) -> Identifier:
+    """
+    Return ``value`` as an ``Identifier``, checking it when it is a string.
+
+    A string is checked without a warning: the component that took it from the
+    user has warned already, or the caller is not the user's code.
+
+    Args:
+        value: A configured name, or one that already passed the rule.
+        what: What the name is, for the error ("table name").
+
+    Returns:
+        ``value`` itself when it is an ``Identifier``, else the parsed name.
+
+    Raises:
+        TypeError: ``value`` is neither a ``str`` nor an ``Identifier``.
+        IdentifierError: ``value`` is a string the rule refuses.
+    """
+    if isinstance(value, Identifier):
+        return value
+    return Identifier.parse(value, what=what, warn=False)
+
+
+def relation_name(name: str) -> str:
+    """
+    Return the name PostgreSQL gives a relation written as ``name``, unquoted.
+
+    Args:
+        name: A table or index name as the package writes it, with the
+            configured case.
+
+    Returns:
+        ``name`` folded, then cut to 63 bytes.
+    """
+    return truncate(fold(name))
 
 
 def derived_names(
@@ -288,7 +320,7 @@ def derived_names(
         index and, with a ``SERIAL`` column, its sequence.
     """
     named: list[tuple[str, str]] = [("table", table.name)]
-    named.extend(("index", truncate(fold(name))) for name in index_names)
+    named.extend(("index", relation_name(name)) for name in index_names)
     named.append(("primary key", object_name(table.name, None, "pkey")))
     if serial_column is not None:
         named.append(

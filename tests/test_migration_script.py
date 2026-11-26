@@ -29,7 +29,7 @@ from taskiq.schedule_sources import LabelScheduleSource
 from taskiq_postgresql import migrations
 from taskiq_postgresql.abc.query import MIGRATION_LOCK_NAMESPACE, Column
 from taskiq_postgresql.broker import PostgresqlBroker
-from taskiq_postgresql.core.sql.catalog import migration_lock_script
+from taskiq_postgresql.core.sql.catalog import _sql_literal
 from taskiq_postgresql.migrations import (
     DEFAULT_LOCK_TIMEOUT,
     ColumnSchema,
@@ -1002,13 +1002,7 @@ async def test_an_escaped_table_name_hashes_to_the_runtime_lock_key(
     # from the name directly: the escaping still has to match the server.
     with pytest.raises(ValueError, match="is not a plain SQL identifier"):
         table_schema("broker", table_name=name)
-    lock_line = f"{migration_lock_script(name).text};"
-    rendered = re.fullmatch(
-        r"SELECT pg_advisory_xact_lock\(hashtext\('taskiq_postgresql'\), "
-        r"hashtext\((?P<literal>.+)\)\);",
-        lock_line,
-    )
-    assert rendered is not None
+    literal = _sql_literal(name)
 
     def check(literal: str) -> str:
         # Dollar quoting takes the name byte for byte: the value the runtime
@@ -1019,7 +1013,7 @@ async def test_an_escaped_table_name_hashes_to_the_runtime_lock_key(
             "RAISE EXCEPTION 'the lock key changed'; END IF; END $check$;"
         )
 
-    await run_script(empty_dsn, driver, check(rendered["literal"]))
+    await run_script(empty_dsn, driver, check(literal))
     # The check does fail on a literal that names another table.
     with pytest.raises(Exception, match="the lock key changed"):
         await run_script(empty_dsn, driver, check("'another table'"))

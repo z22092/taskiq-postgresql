@@ -232,7 +232,7 @@ def test_query_base_keeps_the_configured_name_and_the_identifier() -> None:
 
 
 def test_make_query_stays_untyped_for_a_third_party_column() -> None:
-    integer = Column("n", "INTEGER")
+    integer = Column("n", "NUMERIC")
 
     assert InsertQuery("jobs").make_query([integer]) == (
         "INSERT INTO jobs (n) VALUES ($1)"
@@ -254,11 +254,11 @@ def test_make_query_accepts_the_drivers_literal_column() -> None:
     )
 
 
-def test_exists_statement_is_the_text_the_drivers_build_today() -> None:
+def test_exists_query_statement_is_the_text_the_drivers_build_today() -> None:
 
     key = Column("id", "SERIAL")
 
-    statement = catalog.exists_statement("jobs", key)
+    statement = catalog.ExistsQuery("jobs").statement(key)
 
     assert statement.text == SelectQuery("jobs").make_query([Column("1", "")], [key])
     assert statement.text == "SELECT 1 FROM jobs WHERE id = $1"
@@ -284,7 +284,9 @@ def test_listen_script_names_the_folded_channel() -> None:
 
 def test_both_lock_forms_come_from_one_template() -> None:
 
-    script = catalog.migration_lock_script("Jobs_Mixed")
+    script = catalog.migration_lock_script(
+        Identifier.parse("Jobs_Mixed", what="table name", warn=False),
+    )
     statement = MigrationLockQuery("Jobs_Mixed").statement()
 
     assert script == Script(
@@ -322,7 +324,7 @@ def test_lock_timeout_scripts_keep_today_s_text() -> None:
 def test_drop_table_and_transaction_scripts() -> None:
 
     assert catalog.drop_table_script("jobs") == Script("DROP TABLE IF EXISTS jobs")
-    assert catalog.script_transaction(["SELECT 1"]) == ["BEGIN", "SELECT 1", "COMMIT"]
+    assert catalog.in_transaction(["SELECT 1"]) == ["BEGIN", "SELECT 1", "COMMIT"]
 
 
 @pytest.mark.parametrize(

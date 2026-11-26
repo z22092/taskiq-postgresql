@@ -46,6 +46,7 @@ from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     AddColumnsQuery,
     AddedIndex,
+    CatalogTable,
     ClaimColumns,
     Column,
     CreatedAtColumn,
@@ -54,12 +55,13 @@ from taskiq_postgresql.core.sql.catalog import (
     PrimaryKeyColumn,
     catalog_read,
     check_lock_timeout,
+    check_table_objects,
+    in_transaction,
     index_name,
     lock_timeout_scripts,
     migration_lock_script,
-    script_transaction,
 )
-from taskiq_postgresql.core.sql.identifier import Identifier, check_table_names, fold
+from taskiq_postgresql.core.sql.identifier import Identifier, as_identifier, fold
 
 if TYPE_CHECKING:
     from taskiq_postgresql.broker import PostgresqlBroker
@@ -103,11 +105,14 @@ __all__ = [
     "UnknownMigrationFormatError",
     "available_formats",
     "catalog_query",
+    "catalog_state",
+    "catalog_tables",
     "check_comment",
     "check_lock_timeout",
     "check_plain_identifier",
     "collect_components",
     "collect_schemas",
+    "keep_table_schema",
     "load_format",
     "migration_statements",
     "package_version",
@@ -451,6 +456,19 @@ class TableSchema:
                     )
 
     @property
+    def table(self) -> Identifier:
+        """
+        Return the table name as a checked ``Identifier``.
+
+        Not checked when the description is built, because the class is
+        public; checked, without a warning, each time a tool reads it here.
+
+        Raises:
+            IdentifierError: if the name is not one the rule accepts.
+        """
+        return Identifier.parse(self.name, what="table name", warn=False)
+
+    @property
     def primary_key(self) -> ColumnSchema:
         """
         Return the primary-key column.
@@ -675,7 +693,7 @@ def migration_statements(
     """
     tables = _checked_tables(schemas)
     return _script_statements(
-        [(table.name, _steps_through(table, through)) for table in tables],
+        [(identifier, _steps_through(table, through)) for table, identifier in tables],
         lock=lock,
     )
 
@@ -721,11 +739,13 @@ def step_statements(
     check_lock_timeout(lock_timeout)
     tables = _checked_tables(schemas)
     if step is None:
-        selected = [(table.name, _steps_through(table, through)) for table in tables]
+        selected = [
+            (identifier, _steps_through(table, through)) for table, identifier in tables
+        ]
     else:
         selected = [
-            (table.name, (found,))
-            for table in tables
+            (identifier, (found,))
+            for table, identifier in tables
             for found in table.steps
             if found.number == step
         ]
@@ -759,11 +779,15 @@ def scoped_lock_timeout(statements: Sequence[str], lock_timeout: int) -> list[st
         ValueError: if ``lock_timeout`` is not a whole number of seconds from
             0 to 2147483.
     """
-    bounded = _lock_timeout_first(statements, lock_timeout)
-    if not lock_timeout:
-        return bounded
     scripts = lock_timeout_scripts(lock_timeout)
-    return [scripts.save.text, *bounded, scripts.restore.text]
+    if not lock_timeout:
+        return list(statements)
+    return [
+        scripts.save.text,
+        scripts.set_local.text,
+        *statements,
+        scripts.restore.text,
+    ]
 
 
 # --- comparing a database with the description -------------------------------
@@ -1154,18 +1178,58 @@ def catalog_query(schemas: Iterable[TableSchema]) -> str:
         ValueError: if ``schemas`` is empty or a table name cannot be written
             in SQL.
     """
-    tables = list(schemas)
-    if not tables:
-        raise ValueError("a catalog query needs at least one table schema")
-    return catalog_read(
-        [
-            (
-                Identifier.parse(table.name, what="table name", warn=False),
-                [index.name for index in table.indexes],
-            )
-            for table in tables
-        ],
-    ).text
+    return catalog_read(catalog_tables(schemas)).text
+
+
+def catalog_tables(schemas: Iterable[TableSchema]) -> list[CatalogTable]:
+    """
+    Return the tables of ``schemas`` as the catalog reads them.
+
+    The one adapter from descriptions to what ``catalog_query`` and the
+    catalog's other reads take: each table's checked name, and the names of
+    the indexes it should have.
+
+    Args:
+        schemas: The tables.
+
+    Returns:
+        One ``(table, index names)`` pair per table.
+
+    Raises:
+        IdentifierError: if a table name cannot be written in SQL.
+    """
+    return [
+        (schema.table, [index.name for index in schema.indexes]) for schema in schemas
+    ]
+
+
+def catalog_state(value: Any) -> CatalogState:
+    """
+    Read the value the catalog query's ``catalog`` column holds.
+
+    For a caller that runs the query itself, such as one that reads more than
+    the catalog in the same round trip.
+
+    Args:
+        value: The first column of the first row ``catalog_query`` returns,
+            or ``None`` when it returned no row.
+
+    Returns:
+        What the database holds for the tables, for ``plan_migration``.
+
+    Raises:
+        ValueError: if the query came back without its row, or if its value is
+            not what ``catalog_query`` returns.
+    """
+    if value is None:
+        # The query always returns one row: whatever ran it lost the row.
+        raise ValueError("catalog_query returned no row, and it always returns one")
+    if not isinstance(value, str):
+        raise ValueError(
+            f"catalog_query returned {type(value).__name__}, not the JSON text "
+            "of its catalog column",
+        )
+    return CatalogState.from_json(value)
 
 
 async def read_catalog(
@@ -1189,16 +1253,7 @@ async def read_catalog(
             in SQL, if the query came back without its row, or if its value
             is not what ``catalog_query`` returns.
     """
-    value = await fetch_value(catalog_query(schemas))
-    if value is None:
-        # The query always returns one row: whatever ran it lost the row.
-        raise ValueError("catalog_query returned no row, and it always returns one")
-    if not isinstance(value, str):
-        raise ValueError(
-            f"catalog_query returned {type(value).__name__}, not the JSON text "
-            "of its catalog column",
-        )
-    return CatalogState.from_json(value)
+    return catalog_state(await fetch_value(catalog_query(schemas)))
 
 
 def plan_migration(
@@ -1633,27 +1688,30 @@ def _component_kind(kind: object) -> ComponentKind:
     )
 
 
-def _checked_tables(schemas: Iterable[TableSchema]) -> list[TableSchema]:
+def _checked_tables(
+    schemas: Iterable[TableSchema],
+) -> list[tuple[TableSchema, Identifier]]:
+    """Pair each table with its checked name, refusing one the rule refuses."""
     tables = list(schemas)
     if not tables:
         raise ValueError("a migration script needs at least one table schema")
-    for table in tables:
-        Identifier.parse(table.name, what="table name", warn=False)
-    return tables
+    return [(table, table.table) for table in tables]
 
 
 def _script_statements(
-    tables: Sequence[tuple[str, Sequence[MigrationStep]]],
+    tables: Sequence[tuple[Union[str, Identifier], Sequence[MigrationStep]]],
     *,
     lock: bool,
 ) -> list[str]:
     statements: list[str] = []
     if lock:
         # Sorted, so two scripts that lock the same tables take the locks in
-        # the same order and cannot deadlock each other.
+        # the same order and cannot deadlock each other. A name that is still
+        # a string (a rendered step carries one) is checked here.
+        checked = (as_identifier(table, what="table name") for table, _ in tables)
+        locked = {table.configured: table for table in checked}
         statements.extend(
-            migration_lock_script(name).text
-            for name in sorted({name for name, _ in tables})
+            migration_lock_script(locked[name]).text for name in sorted(locked)
         )
     statements.extend(
         statement
@@ -1687,7 +1745,7 @@ def _script_text(
     transaction: bool,
 ) -> str:
     if transaction:
-        statements = script_transaction(statements)
+        statements = in_transaction(statements)
     lines = [
         f"-- taskiq-postgresql {package_version()}",
         *header,
@@ -1697,11 +1755,12 @@ def _script_text(
 
 
 def _lock_timeout_first(statements: Sequence[str], lock_timeout: int) -> list[str]:
-    check_lock_timeout(lock_timeout)
+    # Validated by lock_timeout_scripts, which builds the lines once.
+    scripts = lock_timeout_scripts(lock_timeout)
     if not lock_timeout:
         return list(statements)
     # First, so that it also bounds the wait for the advisory lock.
-    return [lock_timeout_scripts(lock_timeout).set_local.text, *statements]
+    return [scripts.set_local.text, *statements]
 
 
 # The type format_type() reports for each TypeName. SERIAL is an integer
@@ -1917,7 +1976,6 @@ def _schema(
     added_indexes: Sequence[AddedIndex],
 ) -> TableSchema:
     name = create_table.table_name
-    table = Identifier.parse(name, what="table name", warn=False)
     created_indexes = tuple(
         IndexSchema(
             name=index_name(name, column),
@@ -1934,19 +1992,15 @@ def _schema(
         )
         for index in added_indexes
     )
-    # The derived names are checked here, once, from the same lists the steps
-    # are built from: CREATE INDEX IF NOT EXISTS skips a name that collides.
-    check_table_names(
-        table,
-        index_names=[index.name for index in (*created_indexes, *added)],
-        serial_column=next(
-            (
-                column.name
-                for column in create_table.columns
-                if column.type.upper() == "SERIAL"
-            ),
-            None,
-        ),
+    # The same check the driver ran when it was built, from the same lists the
+    # steps are built from, and run again on purpose: a description built
+    # without a driver (by kind, or from a script) must be refused the same
+    # way. CREATE INDEX IF NOT EXISTS skips a name that collides.
+    check_table_objects(
+        create_table.table,
+        columns=create_table.columns,
+        index_columns=index_columns,
+        added_indexes=added_indexes,
     )
     steps = [
         MigrationStep(
@@ -2070,7 +2124,7 @@ def _schema_of_kind(
     name = _default(component_class, "table_name") if table_name is None else table_name
     # Describing a table by kind is user configuration, so mixed case warns,
     # pointing at the caller of table_schema.
-    Identifier.parse(name, what="table name", stacklevel=4)
+    table = Identifier.parse(name, what="table name", stacklevel=4)
     if component_kind == "scheduler_source":
         if field_for_task_id is not None:
             raise ValueError(
@@ -2090,10 +2144,10 @@ def _schema_of_kind(
         )
     return _schema(
         component_kind,
-        CreateTableQuery(name, parts.columns),
-        CreateIndexQuery(name),
+        CreateTableQuery(table, parts.columns),
+        CreateIndexQuery(table),
         parts.index_columns,
-        add_columns=AddColumnsQuery(name),
+        add_columns=AddColumnsQuery(table),
         added_columns=parts.added_columns,
         added_indexes=parts.added_indexes,
     )
@@ -2180,25 +2234,48 @@ def _components_of(
     return components
 
 
+def keep_table_schema(kept: dict[str, TableSchema], schema: TableSchema) -> bool:
+    """
+    Keep the first description of each table; refuse a table described two ways.
+
+    The one rule for every place that collects descriptions (this module, the
+    SQLAlchemy and Alembic integrations). It keys by the folded name, because
+    PostgreSQL has one relation for ``Jobs`` and ``jobs`` and two spellings
+    would take two migration lock keys.
+
+    Args:
+        kept: The descriptions so far, by folded table name; updated in place.
+        schema: The description to add.
+
+    Returns:
+        ``True`` when the table is new, ``False`` when ``kept`` already holds
+        the same description.
+
+    Raises:
+        ValueError: if ``schema`` spells the table name differently from the
+            description kept, or describes it with different columns.
+    """
+    key = fold(schema.name)
+    is_new = key not in kept
+    first = kept.setdefault(key, schema)
+    if first.name != schema.name:
+        raise ValueError(
+            f"the table is configured as {first.name!r} and as "
+            f"{schema.name!r}, which PostgreSQL reads as one table: use "
+            "one spelling",
+        )
+    if first != schema:
+        raise ValueError(
+            f"the table {schema.name!r} is described twice, with different "
+            "columns: give each component a table of its own",
+        )
+    return is_new
+
+
 def _one_per_table(described: Iterable[tuple[_T, TableSchema]]) -> list[_T]:
     """Keep the first item of each table; refuse a table described two ways."""
-    found: dict[str, tuple[_T, TableSchema]] = {}
-    for item, schema in described:
-        # Keyed by the folded name: PostgreSQL has one relation for 'Jobs' and
-        # 'jobs', and two spellings would take two migration lock keys.
-        _, kept = found.setdefault(fold(schema.name), (item, schema))
-        if kept.name != schema.name:
-            raise ValueError(
-                f"the table is configured as {kept.name!r} and as "
-                f"{schema.name!r}, which PostgreSQL reads as one table: use "
-                "one spelling",
-            )
-        if kept != schema:
-            raise ValueError(
-                f"the table {schema.name!r} is described twice, with different "
-                "columns: give each component a table of its own",
-            )
-    return [item for item, _ in found.values()]
+    kept: dict[str, TableSchema] = {}
+    return [item for item, schema in described if keep_table_schema(kept, schema)]
 
 
 def _describe(target: object) -> str:

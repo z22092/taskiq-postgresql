@@ -106,6 +106,13 @@ def test_script_holds_text_and_is_frozen() -> None:
         ("JSONB", ParamType.JSONB),
         ("TIMESTAMP WITH TIME ZONE", ParamType.TIMESTAMPTZ),
         ("timestamp with time zone", ParamType.TIMESTAMPTZ),
+        ("TIMESTAMPTZ", ParamType.TIMESTAMPTZ),
+        ("INTEGER", ParamType.INT4),
+        ("INT", ParamType.INT4),
+        ("INT4", ParamType.INT4),
+        ("BIGINT", ParamType.INT8),
+        ("INT8", ParamType.INT8),
+        ("BIGSERIAL", ParamType.INT8),
     ],
 )
 def test_param_type_maps_the_component_types(
@@ -115,5 +122,5 @@ def test_param_type_maps_the_component_types(
 
 
 def test_param_type_refuses_an_unknown_type_naming_it() -> None:
-    with pytest.raises(ValueError, match="INTEGER"):
-        param_type("INTEGER")
+    with pytest.raises(ValueError, match="NUMERIC"):
+        param_type("NUMERIC")

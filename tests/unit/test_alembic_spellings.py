@@ -21,10 +21,10 @@ from taskiq_postgresql.migrations import table_schema
 pytestmark = pytest.mark.alembic
 
 
-def metadata_of(name: str) -> Any:
+def metadata_of(name: str, kind: Any = "broker") -> Any:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", DeprecationWarning)
-        return taskiq_metadata(table_schema("broker", table_name=name))
+        return taskiq_metadata(table_schema(kind, table_name=name))
 
 
 def context_of(*collections: Any) -> Any:
@@ -49,3 +49,10 @@ def test_one_spelling_in_two_collections_is_described_once() -> None:
     (schema,) = _described_tables(context)
 
     assert schema.name == "jobs"
+
+
+def test_one_table_described_with_different_columns_is_refused() -> None:
+    context = context_of(metadata_of("jobs"), metadata_of("jobs", "result_backend"))
+
+    with pytest.raises(ValueError, match="described twice, with different columns"):
+        _described_tables(context)

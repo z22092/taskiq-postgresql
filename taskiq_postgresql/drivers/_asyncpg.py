@@ -15,7 +15,6 @@ from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
     Column,
-    exists_statement,
     listen_script,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
@@ -38,7 +37,7 @@ class AsyncpgDriver(QueryDriver):
     def __init__(
         self,
         connection_string: str,
-        table_name: str,
+        table_name: Union[str, Identifier],
         columns: Sequence[Column],
         primary_key: Column,
         created_at: Optional[Column] = None,
@@ -195,7 +194,7 @@ class AsyncpgDriver(QueryDriver):
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
             return await connection.fetchval(
-                exists_statement(self.table_name, self.primary_key).text,
+                self.exists_text,
                 id,
             )
 
@@ -258,16 +257,15 @@ class AsyncpgListenDriver(ListenDriver):
     def __init__(
         self,
         connection_string: str,
-        channel_name: str,
+        channel_name: Union[str, Identifier],
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the listen driver."""
-        # The folded name: add_listener() quotes what it is given, so only the
-        # name PostgreSQL folds an unquoted LISTEN to receives the NOTIFY.
-        channel = Identifier.parse(channel_name, what="channel name", warn=False)
-        super().__init__(connection_string, channel.name, **connection_kwargs)
+        # The base class folds the name: add_listener() quotes what it is
+        # given, so only the folded one receives the NOTIFY.
+        super().__init__(connection_string, channel_name, **connection_kwargs)
         self.connection: Optional[Connection] = None
-        self._listen_statement = listen_script(channel).text
+        self._listen_statement = listen_script(self.channel).text
         # None: a connection closed, see _termination_handler.
         self._queue: AsyncQueue[Optional[str]] = AsyncQueue()
 

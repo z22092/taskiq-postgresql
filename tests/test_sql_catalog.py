@@ -20,22 +20,26 @@ from taskiq_postgresql.core.sql.catalog import (
     ClaimColumns,
     ClaimDueQuery,
     Column,
+    ExistsQuery,
     catalog_read,
+    check_table_objects,
     database_read,
     drop_table_script,
-    exists_statement,
-    index_name,
     notify_statement,
+    table_object_names,
 )
 from taskiq_postgresql.core.sql.identifier import (
     RESERVED_WORDS,
     Identifier,
     IdentifierError,
-    check_table_names,
     derived_names,
 )
 from taskiq_postgresql.core.sql.statement import ParamType, Statement
-from taskiq_postgresql.migrations import migration_statements, table_schema
+from taskiq_postgresql.migrations import (
+    catalog_tables,
+    migration_statements,
+    table_schema,
+)
 from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from tests.helpers import UNUSED_DSN
@@ -208,7 +212,7 @@ def _scheduler_source_cases() -> Cases:
 
 def _shared_cases() -> Cases:
     return {
-        "exists": lambda c: exists_statement(c.table_name, c.columns.primary_key),
+        "exists": lambda c: ExistsQuery(c.table_name).statement(c.columns.primary_key),
         "migration_lock": lambda c: c.driver.migration_lock_query.statement(),
         "relations_exist": lambda c: c.driver.relations_exist_query.statement(
             c.driver.index_columns,
@@ -223,12 +227,9 @@ def _shared_cases() -> Cases:
     }
 
 
-def _catalog_table(component: Component) -> tuple[Identifier, list[str]]:
-    schema = table_schema(component)
-    return (
-        Identifier.parse(schema.name, what="table name", warn=False),
-        [index.name for index in schema.indexes],
-    )
+def _catalog_table(component: Component) -> tuple[Identifier, Sequence[str]]:
+    (table,) = catalog_tables([table_schema(component)])
+    return table
 
 
 def _cases_of(variant: Variant) -> Cases:
@@ -370,23 +371,12 @@ class _RollbackError(Exception):
     """Ends a savepoint block without keeping what it did."""
 
 
-def _declared_indexes(component: Component) -> list[str]:
-    driver = component.driver
-    return [
-        *(
-            index_name(driver.table_name, column)
-            for column in driver.index_columns or ()
-        ),
-        *(index.name for index in driver.added_indexes),
-    ]
-
-
 def _serial_column(component: Component) -> Optional[str]:
     return next(
         (
             column.name
             for column in component.driver.create_table_query.columns
-            if column.type.upper() == "SERIAL"
+            if column.is_serial
         ),
         None,
     )
@@ -515,17 +505,21 @@ async def test_a_refused_length_collides_as_predicted(
     # off for the build only, to run the DDL it would otherwise stop.
     with monkeypatch.context() as unchecked:
         unchecked.setattr(
-            "taskiq_postgresql.abc.driver.check_table_names",
+            "taskiq_postgresql.abc.driver.check_table_objects",
             lambda *args, **kwargs: None,
         )
         component = family.build(table)
     driver = component.driver
-    declared = _declared_indexes(component)
     identifier = Identifier.parse(table, what="table name", warn=False)
-    serial = _serial_column(component)
+    declaration = {
+        "columns": driver.create_table_query.columns,
+        "index_columns": driver.index_columns,
+        "added_indexes": driver.added_indexes,
+    }
     with pytest.raises(IdentifierError, match="too long"):
-        check_table_names(identifier, index_names=declared, serial_column=serial)
-    names = derived_names(identifier, index_names=declared, serial_column=serial)
+        check_table_objects(identifier, **declaration)
+    names = table_object_names(identifier, **declaration)
+    declared = [name for what, name in names if what == "index"]
     await drop(connection, table)
     try:
         # What on_startup runs after the lock, without the check that refuses.

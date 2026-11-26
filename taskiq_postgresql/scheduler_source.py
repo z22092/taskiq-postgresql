@@ -186,7 +186,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
             TypeError: if ``dsn`` is ``None``, empty or blank.
         """
         # stacklevel 3: the warning points at the line that built the source.
-        Identifier.parse(table_name, what="table name", stacklevel=3)
+        table = Identifier.parse(table_name, what="table name", stacklevel=3)
         dsn = require_dsn(dsn, type(self).__name__)
         self._dsn: Final[Dsn] = dsn
         self.table_name: Final = table_name
@@ -196,7 +196,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
         self.broker = broker
         self.driver = get_db_driver(driver)(
             dsn_before_startup(dsn),
-            table_name,
+            table,
             columns=[
                 self.columns.task_name,
                 self.columns.schedule,

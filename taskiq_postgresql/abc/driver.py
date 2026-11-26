@@ -14,14 +14,15 @@ from taskiq_postgresql.core.sql.catalog import (
     CreateTableQuery,
     DeleteByDateQuery,
     DeleteQuery,
+    ExistsQuery,
     InsertOrUpdateQuery,
     InsertQuery,
     MigrationLockQuery,
     RelationsExistQuery,
     SelectQuery,
-    index_name,
+    check_table_objects,
 )
-from taskiq_postgresql.core.sql.identifier import Identifier, check_table_names
+from taskiq_postgresql.core.sql.identifier import Identifier, as_identifier
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 if TYPE_CHECKING:
@@ -77,7 +78,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
     def __init__(
         self,
         connection_string: str,
-        table_name: str,
+        table_name: Union[str, Identifier],
         columns: Sequence[Column],
         primary_key: Column,
         created_at: Optional[Column] = None,
@@ -94,12 +95,14 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         ``CREATE TABLE``: ``on_startup`` adds them last, so a table created by
         an older release gets them too.
         """
-        # A component warns about a mixed-case name where the user wrote it;
-        # here the name is only checked, so a driver built on its own, or by
-        # a third party, gets the same refusals without a second warning.
-        table = Identifier.parse(table_name, what="table name", warn=False)
+        # A component passes the Identifier it parsed, and warned about, where
+        # the user wrote the name. A string is only checked, so a driver built
+        # on its own, or by a third party, gets the same refusals without a
+        # second warning.
+        self.table: Identifier = as_identifier(table_name, what="table name")
         self.connection_string = connection_string
-        self.table_name = table_name
+        # The name as configured, which the SQL writes.
+        self.table_name = self.table.configured
         self.columns = columns
         self.primary_key = primary_key
         self.created_at = created_at or CreatedAtColumn()
@@ -107,43 +110,31 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self.added_columns = added_columns
         self.added_indexes = added_indexes
         self.connection_kwargs = connection_kwargs
-        # The same inputs as migrations._schema: CREATE INDEX IF NOT EXISTS
-        # skips an index whose cut name already exists, so a collision would
-        # lose an index without an error.
-        check_table_names(
-            table,
-            index_names=[
-                *(index_name(table_name, column) for column in index_columns or ()),
-                *(index.name for index in added_indexes),
-            ],
-            serial_column=next(
-                (
-                    column.name
-                    for column in (self.primary_key, *columns, self.created_at)
-                    if column.type.upper() == "SERIAL"
-                ),
-                None,
-            ),
+        check_table_objects(
+            self.table,
+            columns=[self.primary_key, *columns, self.created_at],
+            index_columns=index_columns,
+            added_indexes=added_indexes,
         )
 
         self.create_table_query = CreateTableQuery(
-            self.table_name,
+            self.table,
             [self.primary_key, *self.columns, self.created_at],
         )
-        self.create_index_query = CreateIndexQuery(self.table_name)
+        self.create_index_query = CreateIndexQuery(self.table)
         # The probe of a driver without component_kind, which cannot compare.
-        self.relations_exist_query = RelationsExistQuery(self.table_name)
-        self.migration_lock_query = MigrationLockQuery(self.table_name)
-        self.add_columns_query = AddColumnsQuery(self.table_name)
-        self.insert_query = InsertQuery(
-            self.table_name,
-        )
-        self.delete_query = DeleteQuery(self.table_name)
-        self.delete_by_date_query = DeleteByDateQuery(self.table_name)
-        self.select_query = SelectQuery(
-            self.table_name,
-        )
-        self.insert_or_update_query = InsertOrUpdateQuery(self.table_name)
+        self.relations_exist_query = RelationsExistQuery(self.table)
+        self.migration_lock_query = MigrationLockQuery(self.table)
+        self.add_columns_query = AddColumnsQuery(self.table)
+        self.insert_query = InsertQuery(self.table)
+        self.delete_query = DeleteQuery(self.table)
+        self.delete_by_date_query = DeleteByDateQuery(self.table)
+        self.select_query = SelectQuery(self.table)
+        self.insert_or_update_query = InsertOrUpdateQuery(self.table)
+        self.exists_query = ExistsQuery(self.table)
+        # The text, not the typed statement: the key column of a driver no
+        # component owns may be one no ParamType covers.
+        self.exists_text = self.exists_query.make_query(self.primary_key)
         self.run_migrations = run_migrations
 
     @abstractmethod
@@ -305,11 +296,27 @@ class ListenDriver(_ConnectionStringHolder, ABC):
     def __init__(
         self,
         connection_string: str,
-        channel_name: str,
+        channel_name: Union[str, Identifier],
         **connection_kwargs: Any,
     ) -> None:
-        """Initialize the broker driver."""
-        self.channel_name = channel_name
+        """
+        Initialize the broker driver.
+
+        Args:
+            connection_string: The DSN.
+            channel_name: The channel, as configured or already checked. A
+                string is checked here, without a warning (the broker warns
+                where the user wrote it).
+            **connection_kwargs: Passed on to the connection.
+
+        Raises:
+            IdentifierError: ``channel_name`` is a string the rule refuses.
+        """
+        self.channel: Identifier = as_identifier(channel_name, what="channel name")
+        # The folded name: asyncpg's add_listener() quotes what it is given, so
+        # only the name PostgreSQL folds an unquoted LISTEN to receives the
+        # NOTIFY.
+        self.channel_name = self.channel.name
         self.connection_string = connection_string
         self.connection_kwargs = connection_kwargs
 

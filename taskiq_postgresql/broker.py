@@ -40,7 +40,7 @@ from taskiq_postgresql.core.sql.catalog import (
     index_name,
     notify_statement,
 )
-from taskiq_postgresql.core.sql.identifier import Identifier
+from taskiq_postgresql.core.sql.identifier import Identifier, excerpt
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
@@ -58,8 +58,6 @@ _T = TypeVar("_T")
 
 logger = getLogger("taskiq.asyncpg_broker")
 
-# The most characters of an invalid NOTIFY payload that a log line shows.
-_MAX_LOGGED_PAYLOAD = 64
 # The ids a SERIAL primary key gives, the broker table's id column.
 _MIN_MESSAGE_ID = 1
 _MAX_MESSAGE_ID = 2_147_483_647
@@ -142,10 +140,7 @@ def _payload_excerpt(payload: str) -> str:
     """Return ``payload`` as a log line may carry it: quoted, cut if long."""
     # Any role with CONNECT can NOTIFY the channel, and a payload can hold
     # close to 8 KB, so a log line must not carry it whole.
-    excerpt = repr(payload[:_MAX_LOGGED_PAYLOAD])
-    if len(payload) > _MAX_LOGGED_PAYLOAD:
-        excerpt += f" (truncated, {len(payload)} characters)"
-    return excerpt
+    return excerpt(payload)
 
 
 async def _ack() -> None:
@@ -303,7 +298,7 @@ class PostgresqlBroker(AsyncBroker):
                 zero.
         """
         # stacklevel 3: the warning points at the line that built the broker.
-        Identifier.parse(table_name, what="table name", stacklevel=3)
+        table = Identifier.parse(table_name, what="table name", stacklevel=3)
         self._channel: Identifier = Identifier.parse(
             channel_name,
             what="channel name",
@@ -345,7 +340,7 @@ class PostgresqlBroker(AsyncBroker):
 
         self.driver = get_db_driver(driver)(
             connection_string=dsn_before_startup(dsn),
-            table_name=self.table_name,
+            table_name=table,
             columns=[
                 self.columns.task_id,
                 self.columns.task_name,
@@ -366,19 +361,19 @@ class PostgresqlBroker(AsyncBroker):
             **self.connection_kwargs,
         )
         returning = [self.columns.message]
-        self._claim_due_query = ClaimDueQuery(self.table_name).make_query(
+        self._claim_due_query = ClaimDueQuery(table).make_query(
             self.columns.primary_key,
             claim_columns,
             returning,
         )
-        self._claim_by_id_query = ClaimByIdQuery(self.table_name).make_query(
+        self._claim_by_id_query = ClaimByIdQuery(table).make_query(
             self.columns.primary_key,
             claim_columns,
             returning,
         )
         self.listen_driver: ListenDriver = get_db_listen_driver(driver)(
             connection_string=dsn_before_startup(dsn),
-            channel_name=self._channel.name,
+            channel_name=self._channel,
             **self.connection_kwargs,
         )
         self._configure_drivers()

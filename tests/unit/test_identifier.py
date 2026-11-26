@@ -7,7 +7,6 @@ are checked against what PostgreSQL's own parser and ``makeObjectName`` do.
 
 import warnings
 from pathlib import Path
-from typing import Optional
 
 import pytest
 
@@ -18,37 +17,31 @@ from taskiq_postgresql.core.sql.identifier import (
     check_table_names,
     excerpt,
     fold,
-    index_relation_name,
     object_name,
+    relation_name,
     truncate,
 )
+from taskiq_postgresql.migrations import table_schema
 
 MAX_BYTES = 63
 RESERVED_COUNT = 101  # categories R and T, PostgreSQL 17 and 18
 BROKER_NAME_BYTES = 62
 
-# Each component's index suffixes and serial column, as its steps create them.
-BROKER = (("id_idx", "not_before_idx"), "id")
-RESULT_BACKEND = (("task_id_idx",), None)
-SCHEDULER = (("id_idx", "task_name_idx"), None)
+BROKER = "broker"
+RESULT_BACKEND = "result_backend"
+SCHEDULER = "scheduler_source"
 
 
 def parse(value: object, *, what: str = "table name") -> Identifier:
     return Identifier.parse(value, what=what, warn=False)
 
 
-def check(
-    name: str,
-    component: tuple[tuple[str, ...], Optional[str]],
-) -> None:
-    suffixes, serial = component
-    table = parse(name)
-    # The package hands index names over with the configured case.
-    check_table_names(
-        table,
-        index_names=[f"{name}_{suffix}" for suffix in suffixes],
-        serial_column=serial,
-    )
+def check(name: str, kind: str) -> None:
+    # The description of the component's table runs the same check as its
+    # driver, on the columns and indexes the component declares.
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        table_schema(kind, table_name=name)
 
 
 def source_line(lineno: int) -> str:
@@ -272,12 +265,16 @@ def test_object_name_never_cuts_the_label() -> None:
     assert len(result) <= MAX_BYTES
 
 
-# index_relation_name
+# relation_name
 
 
-def test_index_relation_name_is_cut_like_the_parser_cuts() -> None:
-    assert index_relation_name(parse("jobs"), "id") == "jobs_id_idx"
-    assert index_relation_name(parse("a" * 61), "id") == "a" * 61 + "_i"
+def test_relation_name_is_cut_like_the_parser_cuts() -> None:
+    assert relation_name("jobs_id_idx") == "jobs_id_idx"
+    assert relation_name("a" * 61 + "_id_idx") == "a" * 61 + "_i"
+
+
+def test_relation_name_folds_before_it_cuts() -> None:
+    assert relation_name("Jobs_ID_idx") == "jobs_id_idx"
 
 
 # M3.derivados

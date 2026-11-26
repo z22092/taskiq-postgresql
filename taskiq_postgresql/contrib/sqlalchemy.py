@@ -40,17 +40,13 @@ except ImportError as error:
         "`pip install taskiq-postgresql[sqlalchemy]`.",
     ) from error
 
-from taskiq_postgresql.core.sql.identifier import (
-    Identifier,
-    fold,
-    object_name,
-    truncate,
-)
+from taskiq_postgresql.core.sql.identifier import object_name, relation_name
 from taskiq_postgresql.migrations import (
     ColumnSchema,
     TableSchema,
     TypeName,
     collect_schemas,
+    keep_table_schema,
 )
 
 if TYPE_CHECKING:
@@ -117,9 +113,9 @@ def add_taskiq_tables(
     tables: list[Table] = []
     described: dict[str, TableSchema] = {}
     for kept in metadata.info.get(METADATA_INFO_KEY, ()):
-        record_described(described, kept)
+        keep_table_schema(described, kept)
     for schema in _schemas(targets, app_dir):
-        record_described(described, schema)
+        keep_table_schema(described, schema)
         table = _add(metadata, schema)
         if all(table is not kept for kept in tables):
             tables.append(table)
@@ -160,29 +156,6 @@ def _schemas(targets: Sequence[object], app_dir: Optional[str]) -> list[TableSch
     return collect_schemas(*targets, app_dir=app_dir)
 
 
-def record_described(described: dict[str, TableSchema], schema: TableSchema) -> None:
-    """
-    Keep the first description of each table, keyed by the folded name.
-
-    PostgreSQL has one relation for ``Jobs`` and ``jobs``, so two spellings
-    would take two migration lock keys.
-
-    Args:
-        described: The descriptions so far, by folded table name.
-        schema: The description to add.
-
-    Raises:
-        ValueError: ``schema`` spells a table name differently from the one
-            kept.
-    """
-    kept = described.setdefault(fold(schema.name), schema)
-    if kept.name != schema.name:
-        raise ValueError(
-            f"the table is configured as {kept.name!r} and as {schema.name!r}, "
-            "which PostgreSQL reads as one table: use one spelling",
-        )
-
-
 def _add(metadata: MetaData, schema: TableSchema) -> Table:
     # Built apart first: Table() refuses a name the metadata already holds.
     candidate = _table(schema, MetaData(schema=metadata.schema))
@@ -198,7 +171,9 @@ def _add(metadata: MetaData, schema: TableSchema) -> Table:
 
 
 def _table(schema: TableSchema, metadata: MetaData) -> Table:
-    name = _table_name(schema.name)
+    # The name PostgreSQL keeps: SQLAlchemy quotes a name with a capital
+    # letter, so it gets the folded one.
+    name = schema.table.name
     return Table(
         name,
         metadata,
@@ -209,9 +184,11 @@ def _table(schema: TableSchema, metadata: MetaData) -> Table:
             schema.primary_key.name,
             name=object_name(name, None, "pkey"),
         ),
+        # A derived index name is up to 71 bytes, which PostgreSQL cuts to 63;
+        # SQLAlchemy refuses the longer one.
         *(
             Index(
-                _index_name(index.name), *index.columns, postgresql_using=index.method
+                relation_name(index.name), *index.columns, postgresql_using=index.method
             )
             for index in schema.indexes
         ),
@@ -239,18 +216,6 @@ def _column_type(column: ColumnSchema) -> TypeEngine[Any]:
             "taskiq_postgresql.contrib.sqlalchemy has no SQLAlchemy type for",
         )
     return make_type(column)
-
-
-def _table_name(name: str) -> str:
-    # The name PostgreSQL keeps: SQLAlchemy quotes a name with a capital
-    # letter, so it gets the folded one.
-    return Identifier.parse(name, what="table name", warn=False).name
-
-
-def _index_name(name: str) -> str:
-    # A derived index name is up to 71 bytes, which PostgreSQL cuts to 63;
-    # SQLAlchemy refuses the longer one.
-    return truncate(fold(name))
 
 
 def _ddl(table: Table) -> tuple[str, ...]:

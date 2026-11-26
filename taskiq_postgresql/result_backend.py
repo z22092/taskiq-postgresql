@@ -68,7 +68,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             TypeError: if ``dsn`` is ``None``, empty or blank.
         """
         # stacklevel 3: the warning points at the line that built the backend.
-        Identifier.parse(table_name, what="table name", stacklevel=3)
+        table = Identifier.parse(table_name, what="table name", stacklevel=3)
         dsn = require_dsn(dsn, type(self).__name__)
         self._dsn: Final[Dsn] = dsn
         self.keep_results: Final = keep_results
@@ -86,7 +86,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
 
         self.driver = get_db_driver(driver)(
             dsn_before_startup(dsn),
-            table_name,
+            table,
             columns=[
                 self.columns.result,
             ],
