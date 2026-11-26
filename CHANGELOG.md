@@ -286,8 +286,9 @@ Upgrading from 0.4.x:
 - A table or channel name with upper case letters is accepted and warns with a
   `DeprecationWarning` that names the folded form PostgreSQL uses. Configure
   that form. Python hides a `DeprecationWarning` raised outside `__main__` by
-  default; it shows under pytest or with `python -W default::DeprecationWarning`,
-  and `logging.captureWarnings(True)` then routes it to your logs. The `channel` column and the claim keep the
+  default; it shows under pytest or with
+  `python -W default::DeprecationWarning`, and `logging.captureWarnings(True)`
+  then routes it to your logs. The `channel` column and the claim keep the
   name as configured, so switching a channel to its folded spelling strands the
   rows stored under the old one (delayed messages, a backlog, a producer on the
   old setting during a rolling deploy): stop producers and workers, then drain

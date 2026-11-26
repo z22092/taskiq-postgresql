@@ -16,6 +16,7 @@ import re
 import secrets
 import string
 import sys
+import warnings
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
@@ -1017,3 +1018,36 @@ async def test_the_sql_literal_of_a_quoted_name_hashes_like_the_raw_value(
     # The check does fail on a literal that names another table.
     with pytest.raises(Exception, match="the lock key changed"):
         await run_script(empty_dsn, driver, check("'another table'"))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", ["Jobs_Mixed", "jobs$1"])
+async def test_a_rendered_lock_line_hashes_like_the_runtime_lock_key(
+    name: str,
+    driver: str,
+    empty_dsn: str,
+) -> None:
+    # End to end: the literal render_sql writes for an accepted name is the
+    # key run_migrations takes by bind, mixed case included (not folded).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        script = render_sql([table_schema("broker", table_name=name)])
+    (lock_line,) = lock_lines(script)
+    rendered = re.fullmatch(
+        r"SELECT pg_advisory_xact_lock\(hashtext\('taskiq_postgresql'\), "
+        r"hashtext\((?P<literal>.+)\)\);",
+        lock_line,
+    )
+    assert rendered is not None, lock_line
+
+    def check(literal: str) -> str:
+        return (
+            f"DO $check$ BEGIN IF hashtext({literal}) IS DISTINCT FROM "
+            f"hashtext($name${name}$name$) THEN "
+            "RAISE EXCEPTION 'the lock key changed'; END IF; END $check$;"
+        )
+
+    await run_script(empty_dsn, driver, check(rendered["literal"]))
+    # A folded literal is another key: the check tells them apart.
+    with pytest.raises(Exception, match="the lock key changed"):
+        await run_script(empty_dsn, driver, check(f"'{name.lower()}x'"))
