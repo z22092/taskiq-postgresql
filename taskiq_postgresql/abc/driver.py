@@ -181,7 +181,14 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         from_date: Union[datetime, date],
         to_date: Optional[Union[datetime, date]] = None,
     ) -> Any:
-        """Delete results by date."""
+        """
+        Delete results by date.
+
+        Args:
+            from_date: delete the results created at or after it.
+            to_date: delete only the results created at or before it; left out,
+                the results are deleted without an upper bound.
+        """
 
     @abstractmethod
     async def select(

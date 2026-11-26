@@ -16,6 +16,7 @@ from typing_extensions import Self
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.drivers._health import check_listen
+from taskiq_postgresql.drivers._params import date_bounds
 from taskiq_postgresql.drivers._schema import Session, start_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
@@ -254,8 +255,11 @@ class PsqlpyDriver(QueryDriver):
         """Delete a row from a table by date."""
         async with self, self.connection() as connection:
             results = await connection.execute(
-                self.delete_by_date_query.make_query(self.created_at),
-                (from_date, to_date),
+                self.delete_by_date_query.make_query(
+                    self.created_at,
+                    upper_bound=to_date is not None,
+                ),
+                tuple(date_bounds(from_date, to_date)),
             )
             return results.result(as_tuple=True)
 

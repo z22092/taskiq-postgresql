@@ -236,8 +236,11 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         """
         Delete results by date.
 
+        Both bounds are inclusive.
+
         Args:
-            from_date (datetime | date): Date from which to delete results.
-            to_date (datetime | date | None): Date to which to delete results.
+            from_date (datetime | date): Delete results created at or after it.
+            to_date (datetime | date | None): Delete only results created at or
+                before it. Left out, every result from ``from_date`` on goes.
         """
         await self.driver.delete_by_date(from_date, to_date)

@@ -346,6 +346,8 @@ Upgrading from 0.4.x:
 
 ### Fixed
 
+- `PostgresqlResultBackend.delete_by_date` without `to_date` deleted nothing;
+  it now deletes every result created at or after `from_date`.
 - A schedule stored with a `timedelta` `cron_offset` loads back as a
   `timedelta` on taskiq older than 0.13 too. It used to come back as its ISO
   8601 string (`"PT1H"`), which the scheduler took for a time zone name and

@@ -26,7 +26,7 @@ from typing_extensions import LiteralString, Self
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
 from taskiq_postgresql.abc.query import AddedIndex, Column
 from taskiq_postgresql.drivers._health import check_listen
-from taskiq_postgresql.drivers._params import encode_params
+from taskiq_postgresql.drivers._params import date_bounds, encode_params
 from taskiq_postgresql.drivers._schema import Session, start_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
@@ -350,11 +350,13 @@ class PsycopgDriver(QueryDriver):
         """Delete a row from a table by date."""
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
-                sql(self.delete_by_date_query.make_query(self.created_at)),
-                params=encode_params(
-                    [self.created_at, self.created_at],
-                    [from_date, to_date],
+                sql(
+                    self.delete_by_date_query.make_query(
+                        self.created_at,
+                        upper_bound=to_date is not None,
+                    ),
                 ),
+                params=date_bounds(from_date, to_date),
             )
 
             if cursor.rownumber is not None:
