@@ -665,3 +665,15 @@ def test_the_app_without_django_says_what_to_install(
 
     with pytest.raises(ImportError, match=r"pip install taskiq-postgresql\[django\]"):
         importlib.import_module(APP)
+
+
+def test_a_reserved_word_as_a_table_name_is_refused_by_the_setting() -> None:
+    from taskiq_postgresql.contrib.django.conf import (  # noqa: PLC0415
+        configured_schemas,
+    )
+
+    with (
+        configured([{"kind": "broker", "table_name": "order"}]),
+        pytest.raises(ImproperlyConfigured, match="reserved word"),
+    ):
+        configured_schemas()

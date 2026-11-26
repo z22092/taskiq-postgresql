@@ -59,7 +59,7 @@ from taskiq_postgresql.core.sql.catalog import (
     migration_lock_script,
     script_transaction,
 )
-from taskiq_postgresql.core.sql.identifier import Identifier
+from taskiq_postgresql.core.sql.identifier import Identifier, check_table_names, fold
 
 if TYPE_CHECKING:
     from taskiq_postgresql.broker import PostgresqlBroker
@@ -193,10 +193,6 @@ _TYPE_NAMES: Final[Mapping[str, TypeName]] = {
     "TIMESTAMPTZ": "timestamptz",
 }
 _SIZED_TYPE: Final = re.compile(r"(?P<name>VARCHAR)\((?P<length>[1-9][0-9]*)\)")
-# The SQL writes table and index names unquoted. A name made of these
-# characters stays one name; any other could name two tables, or end the
-# statement, where a migration file writes it.
-_PLAIN_IDENTIFIER: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_$]*")
 # PEP 263: on one of the first two lines of a Python file, a comment that
 # matches this declares the encoding Python decodes the whole file with.
 # Matched without regard to case, wider than Python's own pattern.
@@ -209,7 +205,9 @@ def check_plain_identifier(name: str) -> str:
     Refuse a table or index name that a migration file cannot write unquoted.
 
     The SQL names tables and indexes without quotes, so a name made of other
-    characters could name two tables, or end a statement.
+    characters could name two tables, or end a statement. The rule is the one
+    components apply to ``table_name`` (ADR 0008), except that mixed case is
+    neither folded nor warned about here.
 
     Args:
         name: The name.
@@ -219,13 +217,10 @@ def check_plain_identifier(name: str) -> str:
 
     Raises:
         ValueError: if ``name`` is not letters, digits, ``_`` and ``$``,
-            starting with a letter or ``_``.
+            starting with a letter or ``_``, is a reserved word or is over 63
+            bytes.
     """
-    if _PLAIN_IDENTIFIER.fullmatch(name) is None:
-        raise ValueError(
-            f"{name!r} is not a plain SQL identifier (letters, digits, _ and $, "
-            "not starting with a digit), and the SQL writes it unquoted",
-        )
+    Identifier.parse(name, what="name", warn=False)
     return name
 
 
@@ -1162,8 +1157,6 @@ def catalog_query(schemas: Iterable[TableSchema]) -> str:
     tables = list(schemas)
     if not tables:
         raise ValueError("a catalog query needs at least one table schema")
-    for table in tables:
-        _check_table_name(table.name)
     return catalog_read(
         [
             (
@@ -1352,7 +1345,7 @@ class RenderedStep:
 
     def __post_init__(self) -> None:
         """Refuse a table, kind or step number a comment line cannot hold."""
-        _check_table_name(self.table)
+        Identifier.parse(self.table, what="table name", warn=False)
         _component_kind(self.kind)
         # A bool is an int, and a step number of True means nothing.
         if type(self.number) is not int:
@@ -1630,16 +1623,6 @@ def _install_hint(entry_point: Any, error: ImportError) -> str:
     )
 
 
-def _check_table_name(name: str) -> None:
-    # The name appears in a header comment, which a line break would end, and
-    # a NUL cannot be sent to PostgreSQL at all.
-    if not name or any(character in name for character in "\0\r\n"):
-        raise ValueError(
-            f"table name {name!r} cannot be written in a SQL script: it is "
-            "empty or holds a line break or a NUL",
-        )
-
-
 def _component_kind(kind: object) -> ComponentKind:
     for known in COMPONENT_KINDS:
         if kind == known:
@@ -1655,7 +1638,7 @@ def _checked_tables(schemas: Iterable[TableSchema]) -> list[TableSchema]:
     if not tables:
         raise ValueError("a migration script needs at least one table schema")
     for table in tables:
-        _check_table_name(table.name)
+        Identifier.parse(table.name, what="table name", warn=False)
     return tables
 
 
@@ -1934,7 +1917,7 @@ def _schema(
     added_indexes: Sequence[AddedIndex],
 ) -> TableSchema:
     name = create_table.table_name
-    _check_table_name(name)
+    table = Identifier.parse(name, what="table name", warn=False)
     created_indexes = tuple(
         IndexSchema(
             name=index_name(name, column),
@@ -1942,6 +1925,28 @@ def _schema(
             method="hash",
         )
         for column in index_columns
+    )
+    added = tuple(
+        IndexSchema(
+            name=index.name,
+            columns=tuple(column.name for column in index.columns),
+            method="btree",
+        )
+        for index in added_indexes
+    )
+    # The derived names are checked here, once, from the same lists the steps
+    # are built from: CREATE INDEX IF NOT EXISTS skips a name that collides.
+    check_table_names(
+        table,
+        index_names=[index.name for index in (*created_indexes, *added)],
+        serial_column=next(
+            (
+                column.name
+                for column in create_table.columns
+                if column.type.upper() == "SERIAL"
+            ),
+            None,
+        ),
     )
     steps = [
         MigrationStep(
@@ -1961,14 +1966,6 @@ def _schema(
             ),
         ),
     ]
-    added = tuple(
-        IndexSchema(
-            name=index.name,
-            columns=tuple(column.name for column in index.columns),
-            method="btree",
-        )
-        for index in added_indexes
-    )
     if added_columns or added_indexes:
         # What the driver runs after the CREATEs, so a table an older release
         # created gets it too.
@@ -2071,6 +2068,9 @@ def _schema_of_kind(
         )
     component_class = _component_classes()[component_kind]
     name = _default(component_class, "table_name") if table_name is None else table_name
+    # Describing a table by kind is user configuration, so mixed case warns,
+    # pointing at the caller of table_schema.
+    Identifier.parse(name, what="table name", stacklevel=4)
     if component_kind == "scheduler_source":
         if field_for_task_id is not None:
             raise ValueError(
@@ -2184,7 +2184,15 @@ def _one_per_table(described: Iterable[tuple[_T, TableSchema]]) -> list[_T]:
     """Keep the first item of each table; refuse a table described two ways."""
     found: dict[str, tuple[_T, TableSchema]] = {}
     for item, schema in described:
-        _, kept = found.setdefault(schema.name, (item, schema))
+        # Keyed by the folded name: PostgreSQL has one relation for 'Jobs' and
+        # 'jobs', and two spellings would take two migration lock keys.
+        _, kept = found.setdefault(fold(schema.name), (item, schema))
+        if kept.name != schema.name:
+            raise ValueError(
+                f"the table is configured as {kept.name!r} and as "
+                f"{schema.name!r}, which PostgreSQL reads as one table: use "
+                "one spelling",
+            )
         if kept != schema:
             raise ValueError(
                 f"the table {schema.name!r} is described twice, with different "

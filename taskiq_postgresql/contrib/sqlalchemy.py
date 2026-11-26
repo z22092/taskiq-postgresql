@@ -40,11 +40,16 @@ except ImportError as error:
         "`pip install taskiq-postgresql[sqlalchemy]`.",
     ) from error
 
+from taskiq_postgresql.core.sql.identifier import (
+    Identifier,
+    fold,
+    object_name,
+    truncate,
+)
 from taskiq_postgresql.migrations import (
     ColumnSchema,
     TableSchema,
     TypeName,
-    check_plain_identifier,
     collect_schemas,
 )
 
@@ -70,11 +75,6 @@ _TYPES: Final[Mapping[TypeName, Callable[[ColumnSchema], TypeEngine[Any]]]] = {
     "jsonb": lambda _: postgresql.JSONB(),
     "timestamptz": lambda _: DateTime(timezone=True),
 }
-# The SQL names tables and indexes without quotes, which PostgreSQL folds to
-# lower case and cuts to 63 bytes; SQLAlchemy quotes a name with a capital
-# letter and refuses a longer one, so it gets the name PostgreSQL keeps.
-_MAX_NAME_LENGTH: Final = 63
-_PRIMARY_KEY_SUFFIX: Final = "_pkey"
 
 
 def add_taskiq_tables(
@@ -107,19 +107,20 @@ def add_taskiq_tables(
     Raises:
         TypeError: if no target is given.
         ValueError: if the metadata holds a different table under one of the
-            names, a table name is not a plain SQL identifier, or a target
+            names, a table name is not a plain SQL identifier, two targets
+            spell one table name differently ('Jobs' and 'jobs'), or a target
             cannot be described (see ``collect_schemas``).
         LookupError: if a target holds no component of this package.
         ImportError: if a path's module cannot be imported.
         AttributeError: if a path's module has no such object.
     """
     tables: list[Table] = []
-    described = {
-        schema.name: schema for schema in metadata.info.get(METADATA_INFO_KEY, ())
-    }
+    described: dict[str, TableSchema] = {}
+    for kept in metadata.info.get(METADATA_INFO_KEY, ()):
+        record_described(described, kept)
     for schema in _schemas(targets, app_dir):
+        record_described(described, schema)
         table = _add(metadata, schema)
-        described.setdefault(schema.name, schema)
         if all(table is not kept for kept in tables):
             tables.append(table)
     metadata.info[METADATA_INFO_KEY] = tuple(described.values())
@@ -159,6 +160,29 @@ def _schemas(targets: Sequence[object], app_dir: Optional[str]) -> list[TableSch
     return collect_schemas(*targets, app_dir=app_dir)
 
 
+def record_described(described: dict[str, TableSchema], schema: TableSchema) -> None:
+    """
+    Keep the first description of each table, keyed by the folded name.
+
+    PostgreSQL has one relation for ``Jobs`` and ``jobs``, so two spellings
+    would take two migration lock keys.
+
+    Args:
+        described: The descriptions so far, by folded table name.
+        schema: The description to add.
+
+    Raises:
+        ValueError: ``schema`` spells a table name differently from the one
+            kept.
+    """
+    kept = described.setdefault(fold(schema.name), schema)
+    if kept.name != schema.name:
+        raise ValueError(
+            f"the table is configured as {kept.name!r} and as {schema.name!r}, "
+            "which PostgreSQL reads as one table: use one spelling",
+        )
+
+
 def _add(metadata: MetaData, schema: TableSchema) -> Table:
     # Built apart first: Table() refuses a name the metadata already holds.
     candidate = _table(schema, MetaData(schema=metadata.schema))
@@ -174,7 +198,7 @@ def _add(metadata: MetaData, schema: TableSchema) -> Table:
 
 
 def _table(schema: TableSchema, metadata: MetaData) -> Table:
-    name = _name(schema.name)
+    name = _table_name(schema.name)
     return Table(
         name,
         metadata,
@@ -183,11 +207,12 @@ def _table(schema: TableSchema, metadata: MetaData) -> Table:
         # explicit name also keeps the metadata's naming convention off it.
         PrimaryKeyConstraint(
             schema.primary_key.name,
-            name=name[: _MAX_NAME_LENGTH - len(_PRIMARY_KEY_SUFFIX)]
-            + _PRIMARY_KEY_SUFFIX,
+            name=object_name(name, None, "pkey"),
         ),
         *(
-            Index(_name(index.name), *index.columns, postgresql_using=index.method)
+            Index(
+                _index_name(index.name), *index.columns, postgresql_using=index.method
+            )
             for index in schema.indexes
         ),
     )
@@ -216,8 +241,16 @@ def _column_type(column: ColumnSchema) -> TypeEngine[Any]:
     return make_type(column)
 
 
-def _name(name: str) -> str:
-    return check_plain_identifier(name).lower()[:_MAX_NAME_LENGTH]
+def _table_name(name: str) -> str:
+    # The name PostgreSQL keeps: SQLAlchemy quotes a name with a capital
+    # letter, so it gets the folded one.
+    return Identifier.parse(name, what="table name", warn=False).name
+
+
+def _index_name(name: str) -> str:
+    # A derived index name is up to 71 bytes, which PostgreSQL cuts to 63;
+    # SQLAlchemy refuses the longer one.
+    return truncate(fold(name))
 
 
 def _ddl(table: Table) -> tuple[str, ...]:

@@ -15,6 +15,7 @@ import random
 import string
 import subprocess
 import sys
+import warnings
 from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, get_args
 
@@ -493,3 +494,15 @@ def test_kinds_and_components_give_the_same_tables(driver: str) -> None:
         assert str(CreateTable(from_component).compile(dialect=dialect)) == str(
             CreateTable(from_kind).compile(dialect=dialect),
         )
+
+
+def test_add_taskiq_tables_refuses_two_spellings_of_one_table() -> None:
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        upper = table_schema("broker", table_name="Jobs")
+        lower = table_schema("broker", table_name="jobs")
+    metadata = MetaData()
+    add_taskiq_tables(metadata, upper)
+
+    with pytest.raises(ValueError, match=r"'Jobs'.*'jobs'"):
+        add_taskiq_tables(metadata, lower)
