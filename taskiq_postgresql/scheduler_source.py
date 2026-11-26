@@ -11,6 +11,7 @@ from pydantic import TypeAdapter, ValidationError
 from taskiq import ScheduledTask, ScheduleSource
 from taskiq.abc.broker import AsyncBroker
 
+from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     Column,
     CreatedAtColumn,
@@ -18,10 +19,12 @@ from taskiq_postgresql.core.sql.catalog import (
     UpdatedAtColumn,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
+from taskiq_postgresql.core.stores.declaration import TableDeclaration
+from taskiq_postgresql.core.stores.schedules import ScheduleStore
+from taskiq_postgresql.core.stores.schema import SchemaStore
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
-    get_db_driver,
     require_dsn,
     resolve_dsn,
 )
@@ -194,22 +197,42 @@ class PostgresqlSchedulerSource(ScheduleSource):
         self.columns = Table()
         self.startup_schedule = startup_schedule
         self.broker = broker
-        self.driver = get_db_driver(driver)(
-            dsn_before_startup(dsn),
-            table,
+        declaration = TableDeclaration(
+            table=table,
+            primary_key=self.columns.primary_key,
             columns=[
                 self.columns.task_name,
                 self.columns.schedule,
                 self.columns.updated_at,
             ],
-            primary_key=self.columns.primary_key,
             created_at=self.columns.created_at,
             index_columns=[self.columns.primary_key, self.columns.task_name],
-            run_migrations=run_migrations,
-            **connect_kwargs,
         )
-        # So that on_startup can describe the table and check it.
-        self.driver.component_kind = "scheduler_source"
+        self._store = ScheduleStore(
+            SchemaStore.build(
+                "scheduler_source",
+                declaration,
+                driver,
+                dsn_before_startup(dsn),
+                run_migrations=run_migrations,
+                **connect_kwargs,
+            ),
+            self.columns,
+        )
+
+    @property
+    def driver(self) -> QueryDriver:
+        """
+        The query driver of the table.
+
+        Assigning another one makes the source use it, which is how a driver of
+        your own replaces the bundled one.
+        """
+        return self._store.driver
+
+    @driver.setter
+    def driver(self, driver: QueryDriver) -> None:
+        self._store.driver = driver
 
     @property
     def dsn(self) -> str:
@@ -232,10 +255,9 @@ class PostgresqlSchedulerSource(ScheduleSource):
                 or one of its columns is missing; see
                 ``QueryDriver.on_startup``.
         """
-        self.driver.connection_string = self.dsn
-        # Again here, for a driver swapped in after the constructor.
-        self.driver.component_kind = "scheduler_source"
-        await self.driver.on_startup()
+        # Binds again here, for a driver swapped in after the constructor.
+        self._store.bind(self.dsn)
+        await self._store.start()
 
         if self.startup_schedule is not None and self.broker is not None:
             existing_schedules = {
@@ -270,7 +292,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
 
     async def shutdown(self) -> None:
         """Close the connection pool."""
-        await self.driver.on_shutdown()
+        await self._store.close()
 
     async def get_schedules(self) -> list[ScheduledTask]:
         """
@@ -279,9 +301,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
         A row that is not a valid ``ScheduledTask`` is logged and skipped, so
         one bad row does not stop every other schedule.
         """
-        schedule_rows = await self.driver.select(
-            [self.columns.primary_key, self.columns.schedule],
-        )
+        schedule_rows = await self._store.rows()
 
         schedules: list[ScheduledTask] = []
         for schedule_row in schedule_rows:
@@ -301,21 +321,15 @@ class PostgresqlSchedulerSource(ScheduleSource):
 
     async def add_schedule(self, schedule: ScheduledTask) -> None:
         """Add a schedule to the database."""
-        await self.driver.insert(
-            [self.columns.primary_key, self.columns.task_name, self.columns.schedule],
-            [
-                schedule.schedule_id,
-                schedule.task_name,
-                schedule.model_dump_json(),
-            ],
+        await self._store.add(
+            schedule.schedule_id,
+            schedule.task_name,
+            schedule.model_dump_json(),
         )
 
     async def delete_schedule(self, schedule_id: str) -> None:
         """Delete a schedule from the database."""
-        await self.driver.delete(
-            self.columns.primary_key,
-            schedule_id,
-        )
+        await self._store.delete(schedule_id)
 
     async def post_send(self, task: ScheduledTask) -> None:
         """Delete a task after it's completed."""
