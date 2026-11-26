@@ -37,9 +37,9 @@ class ResultStore(TableStore):
             data: The serialized result.
         """
         columns = self._table
-        # Four arguments, as the backend always sent: the bundled drivers
-        # default ``returning`` to none, though the abstract signature has none.
-        await self.driver.insert_or_update(
+        # Without ``returning``, as the backend has always called it and every
+        # bundled driver defaults it, though the abstract signature has none.
+        await self.driver.insert_or_update(  # ty: ignore[missing-argument]
             [columns.primary_key, columns.result],
             [task_id, data],
             [columns.primary_key],

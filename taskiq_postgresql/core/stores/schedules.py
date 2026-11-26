@@ -46,9 +46,9 @@ class ScheduleStore(TableStore):
             schedule_json: The schedule as JSON.
         """
         columns = self._table
-        # Two arguments, as the source always sent: the bundled drivers default
-        # ``returning`` to none, though the abstract signature has none.
-        await self.driver.insert(
+        # Without ``returning``, as the source has always called it and every
+        # bundled driver defaults it, though the abstract signature has none.
+        await self.driver.insert(  # ty: ignore[missing-argument]
             [columns.primary_key, columns.task_name, columns.schedule],
             [schedule_id, task_name, schedule_json],
         )

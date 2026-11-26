@@ -150,7 +150,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self,
         columns: Sequence[Column],
         values: Sequence[Any],
-        returning: Optional[Sequence[Column]] = None,
+        returning: Optional[Sequence[Column]],
     ) -> Any:
         """Insert a row into a table."""
 
@@ -161,7 +161,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         values: Sequence[Any],
         on_conflict_columns: Sequence[Column],
         on_conflict_update_columns: Sequence[Column],
-        returning: Optional[Sequence[Column]] = None,
+        returning: Optional[Sequence[Column]],
     ) -> Any:
         """Insert or update a row into a table."""
 
