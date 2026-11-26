@@ -16,6 +16,7 @@ import re
 import secrets
 import string
 import sys
+import warnings
 from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 from typing import Any, AsyncGenerator, Optional
@@ -29,6 +30,7 @@ from taskiq.schedule_sources import LabelScheduleSource
 from taskiq_postgresql import migrations
 from taskiq_postgresql.abc.query import MIGRATION_LOCK_NAMESPACE, Column
 from taskiq_postgresql.broker import PostgresqlBroker
+from taskiq_postgresql.core.sql.catalog.base import _sql_literal
 from taskiq_postgresql.migrations import (
     DEFAULT_LOCK_TIMEOUT,
     ColumnSchema,
@@ -545,26 +547,15 @@ def test_locks_are_taken_in_table_name_order() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "literal"),
-    [
-        ("o'brien", "'o''brien'"),
-        ("back\\slash", "E'back\\\\slash'"),
-        ("both'\\", "E'both''\\\\'"),
-    ],
+    "name",
+    ["o'brien", "back\\slash", "both'\\"],
     ids=["quote", "backslash", "both"],
 )
-def test_a_quote_or_backslash_in_the_table_name_is_escaped(
-    name: str,
-    literal: str,
-) -> None:
-    script = render_sql([table_schema("result_backend", table_name=name)])
-
-    assert lock_lines(script) == [
-        (
-            "SELECT pg_advisory_xact_lock(hashtext('taskiq_postgresql'), "
-            f"hashtext({literal}));"
-        ),
-    ]
+def test_a_quote_or_backslash_in_the_table_name_is_refused(name: str) -> None:
+    # The Identifier rule (ADR 0008) refuses these before any SQL is written;
+    # the escaping itself is pinned by tests/unit/test_catalog.py.
+    with pytest.raises(ValueError, match="is not a plain SQL identifier"):
+        table_schema("result_backend", table_name=name)
 
 
 @pytest.mark.parametrize(
@@ -1003,18 +994,16 @@ async def test_the_largest_lock_timeout_is_one_the_server_accepts(
     ["o'brien", "back\\slash", "both'\\"],
     ids=["quote", "backslash", "both"],
 )
-async def test_an_escaped_table_name_hashes_to_the_runtime_lock_key(
+async def test_the_sql_literal_of_a_quoted_name_hashes_like_the_raw_value(
     name: str,
     driver: str,
     empty_dsn: str,
 ) -> None:
-    (lock_line,) = lock_lines(render_sql([table_schema("broker", table_name=name)]))
-    rendered = re.fullmatch(
-        r"SELECT pg_advisory_xact_lock\(hashtext\('taskiq_postgresql'\), "
-        r"hashtext\((?P<literal>.+)\)\);",
-        lock_line,
-    )
-    assert rendered is not None
+    # No table can carry this name any more (ADR 0008), so the lock is built
+    # from the name directly: the escaping still has to match the server.
+    with pytest.raises(ValueError, match="is not a plain SQL identifier"):
+        table_schema("broker", table_name=name)
+    literal = _sql_literal(name)
 
     def check(literal: str) -> str:
         # Dollar quoting takes the name byte for byte: the value the runtime
@@ -1025,7 +1014,40 @@ async def test_an_escaped_table_name_hashes_to_the_runtime_lock_key(
             "RAISE EXCEPTION 'the lock key changed'; END IF; END $check$;"
         )
 
-    await run_script(empty_dsn, driver, check(rendered["literal"]))
+    await run_script(empty_dsn, driver, check(literal))
     # The check does fail on a literal that names another table.
     with pytest.raises(Exception, match="the lock key changed"):
         await run_script(empty_dsn, driver, check("'another table'"))
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("name", ["Jobs_Mixed", "jobs$1"])
+async def test_a_rendered_lock_line_hashes_like_the_runtime_lock_key(
+    name: str,
+    driver: str,
+    empty_dsn: str,
+) -> None:
+    # End to end: the literal render_sql writes for an accepted name is the
+    # key run_migrations takes by bind, mixed case included (not folded).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        script = render_sql([table_schema("broker", table_name=name)])
+    (lock_line,) = lock_lines(script)
+    rendered = re.fullmatch(
+        r"SELECT pg_advisory_xact_lock\(hashtext\('taskiq_postgresql'\), "
+        r"hashtext\((?P<literal>.+)\)\);",
+        lock_line,
+    )
+    assert rendered is not None, lock_line
+
+    def check(literal: str) -> str:
+        return (
+            f"DO $check$ BEGIN IF hashtext({literal}) IS DISTINCT FROM "
+            f"hashtext($name${name}$name$) THEN "
+            "RAISE EXCEPTION 'the lock key changed'; END IF; END $check$;"
+        )
+
+    await run_script(empty_dsn, driver, check(rendered["literal"]))
+    # A folded literal is another key: the check tells them apart.
+    with pytest.raises(Exception, match="the lock key changed"):
+        await run_script(empty_dsn, driver, check(f"'{name.lower()}x'"))

@@ -589,7 +589,9 @@ def _connections(
 
 def _catalog_driver(dsn: str) -> QueryDriver:
     """Return a query driver that only reads the catalog of ``dsn``."""
-    from taskiq_postgresql.abc.query import PrimaryKeyColumn  # noqa: PLC0415
+    from taskiq_postgresql.core.sql.catalog import (  # noqa: PLC0415
+        PrimaryKeyColumn,
+    )
     from taskiq_postgresql.utils import get_db_driver  # noqa: PLC0415
     from taskiq_postgresql.utils.libs_available import (  # noqa: PLC0415
         is_asyncpg_available,
@@ -625,25 +627,20 @@ async def _read_database(
     schemas: list[TableSchema],
     migrations: ModuleType,
 ) -> _Database:
-    found: dict[str, Any] = {}
-
-    async def fetch_value(query: str) -> Any:
-        # One SELECT: the catalog, and what the plan's header names.
-        row = await driver.fetch_row(
-            "SELECT current_database()::text AS database,"
-            " current_schemas(false)::text AS search_path,"
-            f" ({query}) AS catalog",
-        )
-        found.update(row or {})
-        return found.get("catalog")
+    # One read: the catalog, and what the plan's header names. The catalog
+    # builds the query, from the same tables the catalog query reads.
+    from taskiq_postgresql.core.sql.catalog import database_read  # noqa: PLC0415
 
     driver.connection_string = dsn
     async with _connecting(dsn):
+        read = database_read(migrations.catalog_tables(schemas))
         try:
-            state = await migrations.read_catalog(schemas, fetch_value)
+            row = await driver.fetch_row(read.text)
         finally:
             if getattr(driver, "pool", None) is not None:
                 await driver.on_shutdown()
+        found: dict[str, Any] = row or {}
+        state = migrations.catalog_state(found.get("catalog"))
     return _Database(
         name=str(found["database"]),
         search_path=str(found["search_path"]),

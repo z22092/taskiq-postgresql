@@ -25,7 +25,11 @@ from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString, Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
-from taskiq_postgresql.abc.query import AddedIndex, Column
+from taskiq_postgresql.core.sql.catalog import (
+    AddedIndex,
+    Column,
+)
+from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.drivers._schema import Session, start_table
@@ -35,7 +39,7 @@ from taskiq_postgresql.utils.dsn import UNREADABLE_DSN, is_ambiguous_uri
 
 def sql(query: str) -> LiteralString:
     """
-    Mark a query built by ``taskiq_postgresql.abc.query`` as trusted SQL.
+    Mark a query built by ``taskiq_postgresql.core.sql.catalog`` as trusted SQL.
 
     psycopg's annotations accept only literal strings, to keep data out of
     the query text. These queries are built from the table, column and channel
@@ -43,8 +47,7 @@ def sql(query: str) -> LiteralString:
     bind parameters.
 
     Args:
-        query: the SQL text, built by the query builders or by the broker's
-            own ``NOTIFY``.
+        query: the SQL text, built by the query builders.
 
     Returns:
         The same string, typed so the type checker accepts it.
@@ -172,7 +175,7 @@ class PsycopgDriver(QueryDriver):
     def __init__(
         self,
         connection_string: str,
-        table_name: str,
+        table_name: Union[str, Identifier],
         columns: Sequence[Column],
         primary_key: Column,
         created_at: Optional[Column] = None,
@@ -361,10 +364,7 @@ class PsycopgDriver(QueryDriver):
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
                 sql(
-                    self.select_query.make_query(
-                        [Column("1", "")],
-                        [self.primary_key],
-                    ),
+                    self.exists_query.make_query(self.primary_key),
                 ),
                 params=encode_params([self.primary_key], [id]),
             )
@@ -446,13 +446,13 @@ class PsycopgListenDriver(ListenDriver):
     def __init__(
         self,
         connection_string: str,
-        channel_name: str,
+        channel_name: Union[str, Identifier],
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the listen driver."""
         super().__init__(connection_string, channel_name, **connection_kwargs)
         self.connection: Optional[AsyncConnection[TupleRow]] = None
-        self._listen_statement = sql(f"LISTEN {channel_name}")
+        self._listen_statement = sql(self.listen_text)
 
     async def on_startup(self) -> None:
         """Connect and LISTEN on the channel."""

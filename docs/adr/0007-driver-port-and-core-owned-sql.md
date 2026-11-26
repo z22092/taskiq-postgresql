@@ -27,17 +27,20 @@ whatever its driver.
 | Codec (plugin, ADR 0010) | turn payload bytes into stored bytes and back | touch the database |
 
 `fetch_row` and `execute` leave the public API, and `NOTIFY` becomes
-`SELECT pg_notify($1, $2)`. Only the core builds a `Statement`; a test that
-reads the source keeps it so. That is hygiene; the security control is the
-identifier rule plus bind parameters.
+`SELECT FROM pg_notify($1, $2)`. `pg_notify` returns `void`, which psqlpy
+cannot decode, so the statement selects it as a table function and has no
+result column. A statement whose result is `void` declares zero columns. Only
+the core builds a `Statement`; a test that reads the source keeps it so. That
+is hygiene; the security control is the identifier rule plus bind parameters.
 
 The driver contract, `typing.Protocol`s valid at the Python 3.10 floor:
 
 ```python
 class ParamType(Enum):
-    TEXT, INT4, INT8, FLOAT8, JSONB, UUID, BYTEA, TIMESTAMPTZ
+    TEXT, INT4, INT8, FLOAT8, BOOL, JSONB, UUID, BYTEA, TIMESTAMPTZ
     INT4_ARRAY, UUID_ARRAY  # heartbeat and release of many rows (ADR 0009)
     TEXT_ARRAY  # `task_name = ANY($n)`, the adoption of `channel IS NULL` rows (ADR 0009)
+    # BOOL is the result of the relations probe (`RelationsExistQuery`)
 
 class Capabilities(NamedTuple):
     abort: bool  # can drop one connection without waiting for the server

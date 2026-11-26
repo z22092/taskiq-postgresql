@@ -1,7 +1,7 @@
 from typing import Any, Optional, Sequence
 from uuid import UUID
 
-from taskiq_postgresql.abc.query import Column
+from taskiq_postgresql.core.sql.catalog import Column
 from taskiq_postgresql.drivers._json import dumps
 
 

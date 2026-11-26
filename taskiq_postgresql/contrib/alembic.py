@@ -52,10 +52,11 @@ from sqlalchemy import MetaData, Table, text
 
 from taskiq_postgresql.contrib.sqlalchemy import (
     METADATA_INFO_KEY,
-    _name,
     _schemas,
     taskiq_metadata,
 )
+from taskiq_postgresql.core.sql.catalog import drop_table_script
+from taskiq_postgresql.core.sql.identifier import relation_name
 from taskiq_postgresql.migrations import (
     DEFAULT_LOCK_TIMEOUT,
     CatalogState,
@@ -68,6 +69,7 @@ from taskiq_postgresql.migrations import (
     TableSchema,
     catalog_query,
     check_lock_timeout,
+    keep_table_schema,
     package_version,
     plan_migration,
     render_steps,
@@ -356,7 +358,8 @@ def compare_taskiq_steps(
 
     Raises:
         ValueError: if the configured lock timeout is not a whole number of
-            seconds from 0 to 2147483.
+            seconds from 0 to 2147483, or the metadata describes one table
+            with two spellings of its name or with different columns.
     """
     dialect = autogen_context.dialect
     connection = autogen_context.connection
@@ -585,7 +588,7 @@ def alembic_format(
                 f"{key} must be letters, digits and _, got {value!r}",
             )
     if downgrade == "drop":
-        drops = [f"DROP TABLE IF EXISTS {schema.name}" for schema in reversed(schemas)]
+        drops = [drop_table_script(schema.name).text for schema in reversed(schemas)]
         downgrade_lines = [
             _execute_line("op.", statement)
             for statement in scoped_lock_timeout(drops, options.lock_timeout)
@@ -617,7 +620,7 @@ def _described_tables(autogen_context: AutogenContext) -> list[TableSchema]:
     described: dict[str, TableSchema] = {}
     for collection in collections:
         for schema in collection.info.get(METADATA_INFO_KEY, ()):
-            described.setdefault(schema.name, schema)
+            keep_table_schema(described, schema)
     return [
         schema
         for schema in described.values()
@@ -630,7 +633,7 @@ def _included(
     collections: Sequence[MetaData],
     schema: TableSchema,
 ) -> bool:
-    name = _name(schema.name)
+    name = schema.table.name
     if not autogen_context.run_name_filters(name, "table", {"schema_name": None}):
         return False
     for collection in collections:
@@ -643,19 +646,19 @@ def _included(
 def _drop_covered(upgrade_ops: ops.UpgradeOps, pending: Sequence[PendingStep]) -> None:
     # Alembic's own comparators ran first and proposed generic operations for
     # the objects the pending steps create; the steps replace exactly those.
-    created = {_name(item.table) for item in pending if item.table_missing}
+    created = {relation_name(item.table) for item in pending if item.table_missing}
     columns = {
-        (_name(item.table), column)
+        (relation_name(item.table), column)
         for item in pending
         for column in item.step.objects.columns
     }
     relaxed = {
-        (_name(item.table), column)
+        (relation_name(item.table), column)
         for item in pending
         for column in item.step.objects.nullable_columns
     }
     indexes = {
-        (_name(item.table), _name(index.name))
+        (relation_name(item.table), relation_name(index.name))
         for item in pending
         for index in item.step.objects.indexes
     }

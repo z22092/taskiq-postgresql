@@ -28,7 +28,7 @@ from typing import (
 from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessage
 
 from taskiq_postgresql.abc.driver import ListenDriver
-from taskiq_postgresql.abc.query import (
+from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
     ClaimByIdQuery,
     ClaimColumns,
@@ -38,7 +38,9 @@ from taskiq_postgresql.abc.query import (
     NotBeforeColumn,
     PrimaryKeyColumn,
     index_name,
+    notify_statement,
 )
+from taskiq_postgresql.core.sql.identifier import Identifier, excerpt
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
@@ -56,8 +58,6 @@ _T = TypeVar("_T")
 
 logger = getLogger("taskiq.asyncpg_broker")
 
-# The most characters of an invalid NOTIFY payload that a log line shows.
-_MAX_LOGGED_PAYLOAD = 64
 # The ids a SERIAL primary key gives, the broker table's id column.
 _MIN_MESSAGE_ID = 1
 _MAX_MESSAGE_ID = 2_147_483_647
@@ -134,16 +134,6 @@ def _parse_message_id(payload: str) -> Optional[int]:
     if not _MIN_MESSAGE_ID <= message_id <= _MAX_MESSAGE_ID:
         return None
     return message_id
-
-
-def _payload_excerpt(payload: str) -> str:
-    """Return ``payload`` as a log line may carry it: quoted, cut if long."""
-    # Any role with CONNECT can NOTIFY the channel, and a payload can hold
-    # close to 8 KB, so a log line must not carry it whole.
-    excerpt = repr(payload[:_MAX_LOGGED_PAYLOAD])
-    if len(payload) > _MAX_LOGGED_PAYLOAD:
-        excerpt += f" (truncated, {len(payload)} characters)"
-    return excerpt
 
 
 async def _ack() -> None:
@@ -300,6 +290,13 @@ class PostgresqlBroker(AsyncBroker):
                 ``query_timeout`` is not a finite number of seconds above \
                 zero.
         """
+        # stacklevel 3: the warning points at the line that built the broker.
+        table = Identifier.parse(table_name, what="table name", stacklevel=3)
+        self._channel: Identifier = Identifier.parse(
+            channel_name,
+            what="channel name",
+            stacklevel=3,
+        )
         dsn = require_dsn(dsn, type(self).__name__)
         self.poll_interval: float = _parse_seconds(poll_interval, "poll_interval")
         self.health_check_interval: float = _parse_seconds(
@@ -336,7 +333,7 @@ class PostgresqlBroker(AsyncBroker):
 
         self.driver = get_db_driver(driver)(
             connection_string=dsn_before_startup(dsn),
-            table_name=self.table_name,
+            table_name=table,
             columns=[
                 self.columns.task_id,
                 self.columns.task_name,
@@ -357,19 +354,19 @@ class PostgresqlBroker(AsyncBroker):
             **self.connection_kwargs,
         )
         returning = [self.columns.message]
-        self._claim_due_query = ClaimDueQuery(self.table_name).make_query(
+        self._claim_due_query = ClaimDueQuery(table).make_query(
             self.columns.primary_key,
             claim_columns,
             returning,
         )
-        self._claim_by_id_query = ClaimByIdQuery(self.table_name).make_query(
+        self._claim_by_id_query = ClaimByIdQuery(table).make_query(
             self.columns.primary_key,
             claim_columns,
             returning,
         )
         self.listen_driver: ListenDriver = get_db_listen_driver(driver)(
             connection_string=dsn_before_startup(dsn),
-            channel_name=self.channel_name,
+            channel_name=self._channel,
             **self.connection_kwargs,
         )
         self._configure_drivers()
@@ -500,7 +497,12 @@ class PostgresqlBroker(AsyncBroker):
     async def _send_notification(self, message_id: int) -> None:
         """Send a notification with the message ID as payload."""
         try:
-            await self.driver.execute(f"NOTIFY {self.channel_name}, '{message_id}'")
+            statement = notify_statement()
+            await self.driver.execute(
+                statement.text,
+                self._channel.name,
+                str(message_id),
+            )
         except Exception as error:
             # The row is committed and the sweep delivers it: raising would
             # make a caller that retries send the task twice.
@@ -615,9 +617,12 @@ class PostgresqlBroker(AsyncBroker):
             async for payload in self.listen_driver:
                 message_id = _parse_message_id(payload)
                 if message_id is None:
+                    # Any role with CONNECT can NOTIFY the channel, and a
+                    # payload can hold close to 8 KB: the log line must not
+                    # carry it whole.
                     logger.warning(
                         "Invalid NOTIFY payload %s on channel %s",
-                        _payload_excerpt(payload),
+                        excerpt(payload),
                         self.channel_name,
                     )
                 else:

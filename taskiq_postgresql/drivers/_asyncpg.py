@@ -12,7 +12,11 @@ from asyncpg import Connection, Pool, connect, create_pool
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
-from taskiq_postgresql.abc.query import AddedIndex, Column
+from taskiq_postgresql.core.sql.catalog import (
+    AddedIndex,
+    Column,
+)
+from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.drivers._schema import Session, start_table
@@ -33,7 +37,7 @@ class AsyncpgDriver(QueryDriver):
     def __init__(
         self,
         connection_string: str,
-        table_name: str,
+        table_name: Union[str, Identifier],
         columns: Sequence[Column],
         primary_key: Column,
         created_at: Optional[Column] = None,
@@ -204,10 +208,12 @@ class AsyncpgDriver(QueryDriver):
     async def exists(self, id: Any) -> bool:
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
-            return await connection.fetchval(
-                self.select_query.make_query([Column("1", "")], [self.primary_key]),
+            found = await connection.fetchval(
+                self.exists_query.make_query(self.primary_key),
                 id,
             )
+            # The query selects the constant 1, or no row at all.
+            return found is not None
 
     async def delete_by_date(
         self,
@@ -257,11 +263,6 @@ class AsyncpgDriver(QueryDriver):
             return await connection.fetch(query, *values)
 
 
-def _quote_ident(name: str) -> str:
-    """Quote ``name`` as asyncpg's add_listener() does, so LISTEN reads the same."""
-    return '"' + name.replace('"', '""') + '"'
-
-
 async def _terminate(connection: Connection) -> None:
     """Abort ``connection`` without waiting on a server that stopped answering."""
     connection.terminate()
@@ -273,13 +274,14 @@ class AsyncpgListenDriver(ListenDriver):
     def __init__(
         self,
         connection_string: str,
-        channel_name: str,
+        channel_name: Union[str, Identifier],
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the listen driver."""
+        # The base class folds the name: add_listener() quotes what it is
+        # given, so only the folded one receives the NOTIFY.
         super().__init__(connection_string, channel_name, **connection_kwargs)
         self.connection: Optional[Connection] = None
-        self._listen_statement = f"LISTEN {_quote_ident(channel_name)}"
         # None: a connection closed, see _termination_handler.
         self._queue: AsyncQueue[Optional[str]] = AsyncQueue()
 
@@ -384,7 +386,7 @@ class AsyncpgListenDriver(ListenDriver):
             except AsyncTimeoutError:
                 await check_listen(
                     connection.execute(
-                        self._listen_statement,
+                        self.listen_text,
                         timeout=self.query_timeout,
                     ),
                     partial(_terminate, connection),

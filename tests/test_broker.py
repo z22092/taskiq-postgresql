@@ -564,7 +564,7 @@ async def test_when_the_notify_fails_after_the_insert__then_kick_returns(
     notifies: list[str] = []
 
     async def execute_failing_notify(query: str, *values: object) -> object:
-        if query.startswith("NOTIFY"):
+        if "pg_notify" in query:
             notifies.append(query)
             msg = "simulated NOTIFY failure"
             raise ConnectionError(msg)
@@ -604,7 +604,7 @@ async def test_when_the_insert_fails__then_kick_raises_and_sends_nothing_more(
         return await real_insert(*args, **kwargs)  # type: ignore[arg-type]
 
     async def recording_execute(query: str, *values: object) -> object:
-        if query.startswith("NOTIFY"):
+        if "pg_notify" in query:
             notifies.append(query)
         return await real_execute(query, *values)
 

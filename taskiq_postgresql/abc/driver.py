@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Optional, Sequence, Union
 
 from typing_extensions import Self
 
-from taskiq_postgresql.abc.query import (
+from taskiq_postgresql.core.sql.catalog import (
     AddColumnsQuery,
     AddedIndex,
     Column,
@@ -14,12 +14,16 @@ from taskiq_postgresql.abc.query import (
     CreateTableQuery,
     DeleteByDateQuery,
     DeleteQuery,
+    ExistsQuery,
     InsertOrUpdateQuery,
     InsertQuery,
     MigrationLockQuery,
     RelationsExistQuery,
     SelectQuery,
+    check_table_objects,
+    listen_script,
 )
+from taskiq_postgresql.core.sql.identifier import Identifier, as_identifier
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 if TYPE_CHECKING:
@@ -75,7 +79,7 @@ class QueryDriver(_ConnectionStringHolder, ABC):
     def __init__(
         self,
         connection_string: str,
-        table_name: str,
+        table_name: Union[str, Identifier],
         columns: Sequence[Column],
         primary_key: Column,
         created_at: Optional[Column] = None,
@@ -92,8 +96,10 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         ``CREATE TABLE``: ``on_startup`` adds them last, so a table created by
         an older release gets them too.
         """
+        self.table: Identifier = as_identifier(table_name, what="table name")
         self.connection_string = connection_string
-        self.table_name = table_name
+        # The name as configured, which the SQL writes.
+        self.table_name = self.table.configured
         self.columns = columns
         self.primary_key = primary_key
         self.created_at = created_at or CreatedAtColumn()
@@ -101,25 +107,28 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self.added_columns = added_columns
         self.added_indexes = added_indexes
         self.connection_kwargs = connection_kwargs
+        check_table_objects(
+            self.table,
+            columns=[self.primary_key, *columns, self.created_at],
+            index_columns=index_columns,
+            added_indexes=added_indexes,
+        )
 
         self.create_table_query = CreateTableQuery(
-            self.table_name,
+            self.table,
             [self.primary_key, *self.columns, self.created_at],
         )
-        self.create_index_query = CreateIndexQuery(self.table_name)
+        self.create_index_query = CreateIndexQuery(self.table)
         # The probe of a driver without component_kind, which cannot compare.
-        self.relations_exist_query = RelationsExistQuery(self.table_name)
-        self.migration_lock_query = MigrationLockQuery(self.table_name)
-        self.add_columns_query = AddColumnsQuery(self.table_name)
-        self.insert_query = InsertQuery(
-            self.table_name,
-        )
-        self.delete_query = DeleteQuery(self.table_name)
-        self.delete_by_date_query = DeleteByDateQuery(self.table_name)
-        self.select_query = SelectQuery(
-            self.table_name,
-        )
-        self.insert_or_update_query = InsertOrUpdateQuery(self.table_name)
+        self.relations_exist_query = RelationsExistQuery(self.table)
+        self.migration_lock_query = MigrationLockQuery(self.table)
+        self.add_columns_query = AddColumnsQuery(self.table)
+        self.insert_query = InsertQuery(self.table)
+        self.delete_query = DeleteQuery(self.table)
+        self.delete_by_date_query = DeleteByDateQuery(self.table)
+        self.select_query = SelectQuery(self.table)
+        self.insert_or_update_query = InsertOrUpdateQuery(self.table)
+        self.exists_query = ExistsQuery(self.table)
         self.run_migrations = run_migrations
 
     @abstractmethod
@@ -281,11 +290,26 @@ class ListenDriver(_ConnectionStringHolder, ABC):
     def __init__(
         self,
         connection_string: str,
-        channel_name: str,
+        channel_name: Union[str, Identifier],
         **connection_kwargs: Any,
     ) -> None:
-        """Initialize the broker driver."""
-        self.channel_name = channel_name
+        """
+        Initialize the broker driver.
+
+        Args:
+            connection_string: The DSN.
+            channel_name: The channel, as configured or already checked. A
+                string is checked here, without a warning (the broker warns
+                where the user wrote it).
+            **connection_kwargs: Passed on to the connection.
+
+        Raises:
+            IdentifierError: ``channel_name`` is a string the rule refuses.
+        """
+        self.channel: Identifier = as_identifier(channel_name, what="channel name")
+        # The folded name, which is the one an unquoted LISTEN subscribes to.
+        self.channel_name = self.channel.name
+        self.listen_text = listen_script(self.channel).text
         self.connection_string = connection_string
         self.connection_kwargs = connection_kwargs
 

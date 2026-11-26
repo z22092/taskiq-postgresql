@@ -11,12 +11,13 @@ from pydantic import TypeAdapter, ValidationError
 from taskiq import ScheduledTask, ScheduleSource
 from taskiq.abc.broker import AsyncBroker
 
-from taskiq_postgresql.abc.query import (
+from taskiq_postgresql.core.sql.catalog import (
     Column,
     CreatedAtColumn,
     PrimaryKeyColumn,
     UpdatedAtColumn,
 )
+from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
@@ -184,6 +185,8 @@ class PostgresqlSchedulerSource(ScheduleSource):
         Raises:
             TypeError: if ``dsn`` is ``None``, empty or blank.
         """
+        # stacklevel 3: the warning points at the line that built the source.
+        table = Identifier.parse(table_name, what="table name", stacklevel=3)
         dsn = require_dsn(dsn, type(self).__name__)
         self._dsn: Final[Dsn] = dsn
         self.table_name: Final = table_name
@@ -193,7 +196,7 @@ class PostgresqlSchedulerSource(ScheduleSource):
         self.broker = broker
         self.driver = get_db_driver(driver)(
             dsn_before_startup(dsn),
-            table_name,
+            table,
             columns=[
                 self.columns.task_name,
                 self.columns.schedule,

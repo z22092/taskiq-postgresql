@@ -22,7 +22,8 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `taskiq_postgresql/broker.py` | Broker: INSERT, plus `NOTIFY` when due at once, on kick; `LISTEN` and a periodic sweep, each claiming with `DELETE ... RETURNING`, on listen; reopens a lost `LISTEN` connection |
 | `taskiq_postgresql/result_backend.py` | Result backend: upsert, select, delete of serialized results (pickle by default) |
 | `taskiq_postgresql/scheduler_source.py` | Schedule source: schedules stored as JSONB |
-| `taskiq_postgresql/abc/query.py` | SQL builders for the DDL and every row query |
+| `taskiq_postgresql/core/sql/` | The SQL core. `identifier.py`: `Identifier` (the rule for a table or channel name, with its fold and its warning), `derived_names` and `check_table_names` (the derived names of a table, and the refusal of a clash) and `RESERVED_WORDS`; `statement.py`: `Statement` and `Script` (SQL text with the `ParamType` of each bind and result column); `catalog/` (a package: `base.py`, `columns.py`, `ddl.py`, `rows.py`, `locks.py`, `introspection.py`): every DDL statement, row query, the `pg_notify` statement, the `LISTEN` script and the catalog read, as builders over checked names; `check_table_objects` is the derived-name check callers use (it reads a table's declaration into `check_table_names`) |
+| `taskiq_postgresql/abc/query.py` | Re-exports the catalog's builders, so third-party drivers that import it keep working |
 | `taskiq_postgresql/migrations.py` | The tables described as columns and indexes (`TableSchema`) and as the ordered statements `on_startup` runs (`MigrationStep`, whose `objects` name what each step creates), built from the drivers' own builders; `render_sql`, `migration_statements`, `step_statements` (steps inside a tool's own transaction, their lock waits bounded by `scoped_lock_timeout`) and the migration formats registered under the `taskiq_postgresql.migration_formats` entry-point group, with the pipeline the file formats share (`render_steps` lays out each step as a `RenderedStep` after `check_comment`, `check_plain_identifier` and the option check) and `collect_schemas` and `parse_target` for targets; the comparison engine: `catalog_query` (one read-only catalog query, which `read_catalog` runs and reads), `CatalogState`, `plan_migration` (a `MigrationPlan` of `PendingStep` and `SchemaProblem`) |
 | `taskiq_postgresql/contrib/sqlalchemy.py`, `contrib/sqlmodel.py` | Extras `sqlalchemy` and `sqlmodel`: `add_taskiq_tables` and `taskiq_metadata` build SQLAlchemy `Table` objects from `TableSchema` and record the descriptions under `MetaData.info[METADATA_INFO_KEY]` |
 | `taskiq_postgresql/contrib/alembic.py` | Extra `alembic`: the autogenerate comparator `compare_taskiq_steps` (registered on import) and its `TaskiqStepOp`/`TaskiqStepNoopOp`, `upgrade_taskiq_tables` for hand-written revisions, `exclude_taskiq_tables` and the `alembic` migration format (`alembic_format`); each step bounds its own lock waits (`LOCK_TIMEOUT_OPTION`) |
@@ -37,7 +38,8 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `tests/django_support.py` | Django for the tests: `settings.configure()` without pytest-django, the default database pointed at a test's own, `migrate` and the app's recorded migrations |
 | `tests/test_readme_examples.py` | Runs the README's examples and checks its tables |
 | `tests/test_listen_recovery.py`, `tests/silent_proxy.py` | Lost and silent connections (reopening `LISTEN`, bounded waits), through a TCP proxy that makes a connection go silent, refuse or drop |
-| `tests/unit/` | Tests that need no database (SQL text, parameter shaping, wiring) |
+| `tests/unit/` | Tests that need no database (SQL text, parameter shaping, wiring); `test_identifier.py`, `test_statement.py` and `test_catalog.py` cover the core/sql modules, `test_sql_source.py` fails on a `Statement` or `Script` built, or a string that starts with an upper-case SQL command word (`SELECT`, `CREATE`, `SET` ...), outside `core/sql/`, and a `# noqa: S608` written outside `core/sql/catalog/`; lower-case DML is ruff's S608, not that test's |
+| `tests/test_sql_catalog.py`, `tests/test_components_names.py` | The catalog's declared types and names against a real server; the name rule, the warning and the NOTIFY of a mixed-case channel through each component |
 | `tests/test_migration_plan.py`, `tests/golden/migration_steps.sql` | The comparison engine against real catalogs, and the released steps, which must never change |
 | `tests/relax_schema.py`, `tests/unit/test_migration_relax.py`, `tests/unit/test_alembic_relax.py` | Test-only tables whose steps relax `NOT NULL` (no released step does), and the engine's and the Alembic comparator's handling of them without a database |
 | `tests/test_startup_check.py`, `tests/test_cli_plan.py` | The table check of `startup()` without `run_migrations`, and `taskiq postgresql plan` and `check`, against real catalogs |
@@ -100,16 +102,16 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
 - **Driver parity.** A change to one driver lands in all three. Tests take the
   `driver` fixture (or the `broker`, `result_backend` and `scheduler_source`
   fixtures built on it) so they run once per driver.
-- **SQL.** DDL and row queries come from the builders in `abc/query.py`, and
-  their values travel as bind parameters (`$1`, `$2`, ...), never formatted
-  into the SQL text. The exceptions are `LISTEN` (channel name) and `NOTIFY`,
-  whose payload is the integer id the broker's own INSERT returned. Table,
-  column names come from configuration and are emitted unquoted. Channel
-  names are unquoted in `NOTIFY` and in psycopg's and psqlpy's `LISTEN`, but
-  asyncpg sends `LISTEN "<channel>"` quoted, so with a channel name that has
-  upper case letters an asyncpg worker gets no `NOTIFY` and delivers only
-  through the sweep, up to `poll_interval` seconds late (psqlpy and psycopg
-  get the `NOTIFY`): keep `channel_name` lower case.
+- **SQL.** All SQL text comes from the catalog in `core/sql/catalog/`
+  (`abc/query.py` only re-exports it); nothing else builds SQL with an
+  f-string, `+`, `%` or `.format`. Table and channel names are checked by the
+  `Identifier` rule when a component is built (ADR 0008), and values travel as
+  bind parameters (`$1`, `$2`, ...), never formatted into the SQL text. The
+  broker's NOTIFY is `SELECT FROM pg_notify($1, $2)` with the channel and the
+  id as binds. The only names written into runtime SQL text are the checked
+  table name, as configured, and the channel in `LISTEN`, folded to lower case
+  so all three drivers subscribe to the channel `pg_notify` sends to. Column
+  names come from configuration and are emitted unquoted.
 - **Schema.** Tables are created with `CREATE TABLE IF NOT EXISTS` when
   `run_migrations=True`, so existing deployments keep their tables. Columns
   added later (the broker's `channel` and `not_before` and their index) come
@@ -130,7 +132,7 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   a table or column is missing, or a column a step relaxes is still `NOT NULL`.
   Both log what no step fixes. A driver without `component_kind` keeps the
   `RelationsExistQuery` probe when it migrates. The migration's advisory lock
-  key (`MigrationLockQuery` in `abc/query.py`) is a contract between releases;
+  key (`MigrationLockQuery` in `core/sql/catalog/`) is a contract between releases;
   `tests/test_migrations.py::test_migration_lock_key_is_pinned` pins it.
 - **Types.** `ty` checks `taskiq_postgresql/` at the Python 3.10 floor and must
   stay clean. Fix the code; a `# ty: ignore[<rule>]` is allowed only with a

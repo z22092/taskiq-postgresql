@@ -43,6 +43,12 @@ releases.
   Callers outside the package, and `contrib/django/conf.py`, keep working; the
   names it refuses beyond today's rule (reserved key words, over 63 bytes) are
   a behaviour change, listed under Consequences.
+- A schema-qualified name (`app.jobs`) is refused: the dot is outside the
+  grammar. It never worked with `run_migrations`, because `CREATE INDEX`
+  cannot take a qualified index name. The way out is the role's `search_path`.
+- Two spellings of one relation among the targets a tool collects (`Jobs` and
+  `jobs`) are refused, naming both: PostgreSQL has one relation for them, but
+  the lock key hashes the name as configured, so they would take two keys.
 - A name with upper case letters is folded to lower case, the name PostgreSQL
   already uses for it, with a `DeprecationWarning`.
 - The folded name is at most 63 bytes; a longer one is refused instead of
@@ -84,6 +90,7 @@ releases.
     63 bytes, whose index names collide: one index is already missing today;
   - anything else that is not an identifier (a space, a quote, `;`), which
     today reaches the SQL text as is;
+  - a schema-qualified name, which works today only without `run_migrations`;
   - for callers of `check_plain_identifier`, a reserved key word or a name
     over 63 bytes, which it accepts today.
 - Migration path for such a table, given in the upgrade guide: with the
@@ -91,6 +98,11 @@ releases.
   accepts, configure that name, and run the migration, which creates the
   indexes under the derived names. The old index names are listed for
   dropping. The rename changes the lock key, hence the stopped workers.
+- A schema-qualified name has the same way out without a rename: put the
+  schema on the role's `search_path` (`ALTER ROLE ... SET search_path`) and
+  configure the name without it.
+- Two spellings of one table among the targets are refused, a change for the
+  rare setup that listed both.
 - Names between the two limits of the table keep working, with cut index
   names; mixed-case names keep working and warn.
 - Every accepted name gets the same lock key it has today.
