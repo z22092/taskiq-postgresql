@@ -193,6 +193,20 @@ def test_delete_by_date_binds_both_bounds() -> None:
     )
 
 
+def test_delete_by_date_without_an_upper_bound_binds_only_the_lower() -> None:
+    assert DeleteByDateQuery("results").make_query(
+        CreatedAtColumn(),
+        upper_bound=False,
+    ) == ("DELETE FROM results WHERE created_at >= $1")
+
+
+def test_delete_by_date_with_an_upper_bound_keeps_the_between_text() -> None:
+    assert DeleteByDateQuery("results").make_query(
+        CreatedAtColumn(),
+        upper_bound=True,
+    ) == ("DELETE FROM results WHERE created_at BETWEEN $1 AND $2")
+
+
 def test_select_without_filter() -> None:
     assert SelectQuery("schedules").make_query([Column("schedule", "JSONB")]) == (
         "SELECT schedule FROM schedules "
