@@ -35,7 +35,7 @@ class _Driver(QueryDriver):
     async def __aenter__(self) -> Any:
         return self
 
-    async def __aexit__(self, *exc_info: Any) -> None:
+    async def __aexit__(self, *exc_info: object) -> None:
         return None
 
     async def insert(self, *args: Any, **kwargs: Any) -> Any:

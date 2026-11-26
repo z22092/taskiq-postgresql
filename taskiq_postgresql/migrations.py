@@ -36,7 +36,6 @@ from typing import (
     Any,
     Final,
     Literal,
-    NamedTuple,
     Optional,
     TypeVar,
     Union,
@@ -64,6 +63,7 @@ from taskiq_postgresql.core.sql.catalog import (
     migration_lock_script,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier, as_identifier, fold
+from taskiq_postgresql.core.stores.declaration import TableDeclaration
 
 if TYPE_CHECKING:
     from taskiq_postgresql.broker import PostgresqlBroker
@@ -536,8 +536,12 @@ def table_schema(
                 "this query driver has no component_kind, so it cannot tell "
                 "which table it holds: describe the component that owns it",
             )
-        return _driver_schema(component.component_kind, component)
-    return _driver_schema(_kind_of(component), component.driver)
+        return declared_schema(
+            component.component_kind,
+            TableDeclaration.of_driver(component),
+        )
+    kind = _kind_of(component)
+    return declared_schema(kind, TableDeclaration.of_driver(component.driver))
 
 
 def collect_components(
@@ -2056,17 +2060,33 @@ def _schema(
     )
 
 
-def _driver_schema(kind: ComponentKind, driver: QueryDriver) -> TableSchema:
-    # From the builders the driver's on_startup runs, so a driver can describe
-    # its own table without the component around it.
+def declared_schema(kind: ComponentKind, declaration: TableDeclaration) -> TableSchema:
+    """
+    Describe a table from its declaration, with the catalog's own builders.
+
+    The one description of a table, whatever it comes from: a component, a
+    query driver or a kind. The builders and their arguments are the ones the
+    drivers run in ``on_startup``, so the steps are the statements it runs.
+
+    Args:
+        kind: The component that owns the table.
+        declaration: What the component hands its driver.
+
+    Returns:
+        The table's description.
+
+    Raises:
+        IdentifierError: if the declared names clash with each other.
+    """
+    table = declaration.table
     return _schema(
         kind,
-        driver.create_table_query,
-        driver.create_index_query,
-        driver.index_columns or (),
-        add_columns=driver.add_columns_query,
-        added_columns=driver.added_columns,
-        added_indexes=driver.added_indexes,
+        CreateTableQuery(table, declaration.table_columns),
+        CreateIndexQuery(table),
+        declaration.index_columns or (),
+        add_columns=AddColumnsQuery(table),
+        added_columns=declaration.added_columns,
+        added_indexes=declaration.added_indexes,
     )
 
 
@@ -2141,92 +2161,79 @@ def _schema_of_kind(
                 "the scheduler source has no task_id column; "
                 "field_for_task_id does not apply to it",
             )
-        parts = _scheduler_source_parts()
+        declaration = _scheduler_source_parts(table)
     else:
         task_id_type = field_for_task_id or _default(
             component_class,
             "field_for_task_id",
         )
-        parts = (
-            _broker_parts(name, task_id_type)
+        declaration = (
+            _broker_parts(table, task_id_type)
             if component_kind == "broker"
-            else _result_backend_parts(task_id_type)
+            else _result_backend_parts(table, task_id_type)
         )
-    return _schema(
-        component_kind,
-        CreateTableQuery(table, parts.columns),
-        CreateIndexQuery(table),
-        parts.index_columns,
-        add_columns=AddColumnsQuery(table),
-        added_columns=parts.added_columns,
-        added_indexes=parts.added_indexes,
-    )
+    return declared_schema(component_kind, declaration)
 
 
-class _TableParts(NamedTuple):
-    """What a component hands its driver, for a table described by kind."""
-
-    columns: list[Column]
-    index_columns: list[Column]
-    added_columns: Sequence[Column] = ()
-    added_indexes: Sequence[AddedIndex] = ()
-
-
-# Each builder below hands the driver what the component hands it: the
-# CREATE TABLE columns in its order (primary key, columns, created_at), the
-# hash-indexed columns, and the columns and indexes added after the CREATEs.
+# Each builder below hands over what the component hands its driver: the key,
+# the columns between it and created_at, the hash-indexed columns, and the
+# columns and indexes added after the CREATEs.
 # test_a_kind_describes_the_same_table_as_a_component pins them to it.
 
 
-def _broker_parts(table_name: str, task_id_type: str) -> _TableParts:
+def _broker_parts(table: Identifier, task_id_type: str) -> TableDeclaration:
     from taskiq_postgresql.broker import Table  # noqa: PLC0415
 
-    table = Table(task_id=Column(name="task_id", type_=task_id_type))
-    claim_columns = ClaimColumns(channel=table.channel, not_before=table.not_before)
-    return _TableParts(
+    columns = Table(task_id=Column(name="task_id", type_=task_id_type))
+    claim_columns = ClaimColumns(channel=columns.channel, not_before=columns.not_before)
+    return TableDeclaration(
+        table=table,
+        primary_key=columns.primary_key,
         columns=[
-            table.primary_key,
-            table.task_id,
-            table.task_name,
-            table.message,
-            table.labels,
-            table.created_at,
+            columns.task_id,
+            columns.task_name,
+            columns.message,
+            columns.labels,
         ],
-        index_columns=[table.primary_key],
+        created_at=columns.created_at,
+        index_columns=[columns.primary_key],
         added_columns=claim_columns,
         added_indexes=[
             AddedIndex(
-                name=index_name(table_name, table.not_before),
-                columns=[*claim_columns, table.primary_key],
+                name=index_name(table.configured, columns.not_before),
+                columns=[*claim_columns, columns.primary_key],
             ),
         ],
     )
 
 
-def _result_backend_parts(task_id_type: str) -> _TableParts:
+def _result_backend_parts(
+    table: Identifier,
+    task_id_type: str,
+) -> TableDeclaration:
     from taskiq_postgresql.result_backend import Table  # noqa: PLC0415
 
-    table = Table(primary_key=PrimaryKeyColumn(name="task_id", type_=task_id_type))
-    # The result backend leaves created_at to the driver's default.
-    return _TableParts(
-        columns=[table.primary_key, table.result, CreatedAtColumn()],
-        index_columns=[table.primary_key],
+    columns = Table(primary_key=PrimaryKeyColumn(name="task_id", type_=task_id_type))
+    return TableDeclaration(
+        table=table,
+        primary_key=columns.primary_key,
+        columns=[columns.result],
+        # The result backend leaves created_at to the driver's default.
+        created_at=CreatedAtColumn(),
+        index_columns=[columns.primary_key],
     )
 
 
-def _scheduler_source_parts() -> _TableParts:
+def _scheduler_source_parts(table: Identifier) -> TableDeclaration:
     from taskiq_postgresql.scheduler_source import Table  # noqa: PLC0415
 
-    table = Table()
-    return _TableParts(
-        columns=[
-            table.primary_key,
-            table.task_name,
-            table.schedule,
-            table.updated_at,
-            table.created_at,
-        ],
-        index_columns=[table.primary_key, table.task_name],
+    columns = Table()
+    return TableDeclaration(
+        table=table,
+        primary_key=columns.primary_key,
+        columns=[columns.task_name, columns.schedule, columns.updated_at],
+        created_at=columns.created_at,
+        index_columns=[columns.primary_key, columns.task_name],
     )
 
 
