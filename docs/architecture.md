@@ -302,7 +302,7 @@ All columns but the broker's `channel` are `NOT NULL`; `created_at`,
 | `PostgresqlResultBackend.set_result` | `InsertOrUpdateQuery` | `INSERT ... ON CONFLICT (task_id) DO UPDATE SET result = EXCLUDED.result` |
 | `is_result_ready` | `SelectQuery` | `SELECT 1 FROM ... WHERE task_id = $1` |
 | `get_result` | `SelectQuery`, then `DeleteQuery` unless `keep_results` | `SELECT result ... WHERE task_id = $1` |
-| `delete_by_date` | `DeleteByDateQuery` | `DELETE ... WHERE created_at BETWEEN $1 AND $2` |
+| `delete_by_date` | `DeleteByDateQuery` | `DELETE ... WHERE created_at >= $1 AND ($2::... IS NULL OR created_at <= $2)`, so a `NULL` `to_date` means no upper bound |
 | `PostgresqlSchedulerSource.get_schedules` | `SelectQuery` | `SELECT id, schedule FROM ...` |
 | `add_schedule` | `InsertQuery` | `INSERT (id, task_name, schedule) ...` |
 | `delete_schedule`, `post_send` (one-off schedules) | `DeleteQuery` | `DELETE ... WHERE id = $1` |

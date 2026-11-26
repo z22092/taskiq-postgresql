@@ -187,9 +187,10 @@ def test_claim_by_id_deletes_the_due_row_returning_columns() -> None:
     )
 
 
-def test_delete_by_date_binds_both_bounds() -> None:
+def test_delete_by_date_treats_a_null_upper_bound_as_none() -> None:
     assert DeleteByDateQuery("results").make_query(CreatedAtColumn()) == (
-        "DELETE FROM results WHERE created_at BETWEEN $1 AND $2"
+        "DELETE FROM results WHERE created_at >= $1 "
+        "AND ($2::TIMESTAMP WITH TIME ZONE IS NULL OR created_at <= $2)"
     )
 
 

@@ -351,15 +351,31 @@ class ClaimByIdQuery(QueryBase):
 
 
 class DeleteByDateQuery(QueryBase):
-    """Query to delete a row from a table by date."""
+    """
+    Query deleting the rows whose ``column`` is ``$1`` or later.
+
+    Rows later than ``$2`` are kept, unless ``$2`` is NULL: then there is no
+    upper bound.
+    """
 
     def __init__(self, table_name: str) -> None:
         """Initialize the query."""
         super().__init__(table_name)
 
     def make_query(self, column: Column) -> str:
-        """Return the query as a string."""
-        return f"DELETE FROM {self.table_name} WHERE {column.name} BETWEEN $1 AND $2"  # noqa: S608
+        """
+        Return the query as a string.
+
+        Returns:
+            The query, with both bounds inclusive. ``$2`` is tested for NULL
+            on its own: ``BETWEEN $1 AND NULL`` is never true and would delete
+            nothing. Its cast gives the server its type when it is NULL.
+        """
+        return (
+            f"DELETE FROM {self.table_name} "  # noqa: S608
+            f"WHERE {column.name} >= $1 "
+            f"AND ($2::{column.type} IS NULL OR {column.name} <= $2)"
+        )
 
 
 class SelectQuery(QueryBase):
