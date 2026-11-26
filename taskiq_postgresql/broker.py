@@ -41,7 +41,7 @@ from taskiq_postgresql.core.sql.catalog import (
 from taskiq_postgresql.core.sql.identifier import Identifier, excerpt
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
 from taskiq_postgresql.core.stores.messages import MessageStore
-from taskiq_postgresql.core.stores.schema import SchemaStore
+from taskiq_postgresql.core.stores.schema import SchemaStore, build_driver
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
@@ -52,8 +52,6 @@ from taskiq_postgresql.utils import (
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator, Coroutine
-
-    from taskiq_postgresql.abc.driver import QueryDriver
 
 
 _T = TypeVar("_T")
@@ -352,15 +350,16 @@ class PostgresqlBroker(AsyncBroker):
                 ),
             ],
         )
+        self.driver = build_driver(
+            "broker",
+            declaration,
+            driver,
+            dsn_before_startup(dsn),
+            run_migrations=run_migrations,
+            **self.connection_kwargs,
+        )
         self._store = MessageStore(
-            SchemaStore.build(
-                "broker",
-                declaration,
-                driver,
-                dsn_before_startup(dsn),
-                run_migrations=run_migrations,
-                **self.connection_kwargs,
-            ),
+            SchemaStore("broker", declaration, lambda: self.driver),
             self.columns,
         )
         # The text of the claims, which tests and tools read.
@@ -372,20 +371,6 @@ class PostgresqlBroker(AsyncBroker):
             **self.connection_kwargs,
         )
         self._configure_drivers()
-
-    @property
-    def driver(self) -> QueryDriver:
-        """
-        The query driver of the table.
-
-        Assigning another one makes the broker use it, which is how a driver of
-        your own replaces the bundled one.
-        """
-        return self._store.driver
-
-    @driver.setter
-    def driver(self, driver: QueryDriver) -> None:
-        self._store.driver = driver
 
     def _configure_drivers(self) -> None:
         """Hand the recovery settings, and the kind of the table, to the drivers."""

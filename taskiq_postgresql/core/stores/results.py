@@ -35,12 +35,8 @@ class ResultStore:
 
     @property
     def driver(self) -> QueryDriver:
-        """The query driver in use; assigning one makes the store use it."""
+        """The query driver in use."""
         return self.schema.driver
-
-    @driver.setter
-    def driver(self, driver: QueryDriver) -> None:
-        self.schema.driver = driver
 
     def bind(self, dsn: str) -> None:
         """Point the driver at ``dsn`` and tell it the backend owns the table."""

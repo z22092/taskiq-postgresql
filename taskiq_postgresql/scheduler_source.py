@@ -11,7 +11,6 @@ from pydantic import TypeAdapter, ValidationError
 from taskiq import ScheduledTask, ScheduleSource
 from taskiq.abc.broker import AsyncBroker
 
-from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     Column,
     CreatedAtColumn,
@@ -21,7 +20,7 @@ from taskiq_postgresql.core.sql.catalog import (
 from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
 from taskiq_postgresql.core.stores.schedules import ScheduleStore
-from taskiq_postgresql.core.stores.schema import SchemaStore
+from taskiq_postgresql.core.stores.schema import SchemaStore, build_driver
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
@@ -208,31 +207,18 @@ class PostgresqlSchedulerSource(ScheduleSource):
             created_at=self.columns.created_at,
             index_columns=[self.columns.primary_key, self.columns.task_name],
         )
+        self.driver = build_driver(
+            "scheduler_source",
+            declaration,
+            driver,
+            dsn_before_startup(dsn),
+            run_migrations=run_migrations,
+            **connect_kwargs,
+        )
         self._store = ScheduleStore(
-            SchemaStore.build(
-                "scheduler_source",
-                declaration,
-                driver,
-                dsn_before_startup(dsn),
-                run_migrations=run_migrations,
-                **connect_kwargs,
-            ),
+            SchemaStore("scheduler_source", declaration, lambda: self.driver),
             self.columns,
         )
-
-    @property
-    def driver(self) -> QueryDriver:
-        """
-        The query driver of the table.
-
-        Assigning another one makes the source use it, which is how a driver of
-        your own replaces the bundled one.
-        """
-        return self._store.driver
-
-    @driver.setter
-    def driver(self, driver: QueryDriver) -> None:
-        self._store.driver = driver
 
     @property
     def dsn(self) -> str:

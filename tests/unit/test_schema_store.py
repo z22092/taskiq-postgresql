@@ -8,7 +8,7 @@ here needs a database.
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from typing import Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
 
 import pytest
 from typing_extensions import override
@@ -27,10 +27,14 @@ from taskiq_postgresql.core.stores import schema as schema_module
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
 from taskiq_postgresql.core.stores.schema import (
     SchemaStore,
+    build_driver,
     read_database,
     schema_store,
 )
 from taskiq_postgresql.core.stores.startup import Session, start_table
+
+if TYPE_CHECKING:
+    from taskiq_postgresql.migrations import ComponentKind
 
 DSN = "postgresql://postgres@localhost:5432/postgres"
 OTHER_DSN = "postgresql://postgres@localhost:5432/other"
@@ -118,11 +122,15 @@ class PooledDriver(FakeDriver):
     pool = object()
 
 
+def _store_over(kind: ComponentKind, driver: QueryDriver) -> SchemaStore:
+    return SchemaStore(kind, TableDeclaration.of_driver(driver), lambda: driver)
+
+
 @pytest.mark.anyio
 async def test_migrate_turns_the_flag_on_only_while_it_starts() -> None:
     driver = FakeDriver(run_migrations=False)
 
-    await SchemaStore("broker", driver).migrate(OTHER_DSN)
+    await _store_over("broker", driver).migrate(OTHER_DSN)
 
     assert driver.seen_at_startup == (True, OTHER_DSN, None)
     assert driver.run_migrations is False
@@ -137,7 +145,7 @@ async def test_migrate_restores_the_flag_when_the_startup_fails() -> None:
     driver.startup_error = RuntimeError("boom")
 
     with pytest.raises(RuntimeError, match="boom"):
-        await SchemaStore("broker", driver).migrate(OTHER_DSN)
+        await _store_over("broker", driver).migrate(OTHER_DSN)
 
     assert driver.run_migrations is True
     assert driver.calls == ["on_startup"]
@@ -147,7 +155,7 @@ async def test_migrate_restores_the_flag_when_the_startup_fails() -> None:
 async def test_migrate_closes_the_pool_it_left_open() -> None:
     driver = PooledDriver()
 
-    await SchemaStore("broker", driver).migrate(OTHER_DSN)
+    await _store_over("broker", driver).migrate(OTHER_DSN)
 
     assert driver.calls == ["on_startup", "on_shutdown"]
 
@@ -158,7 +166,7 @@ async def test_migrate_closes_the_pool_when_the_startup_fails() -> None:
     driver.startup_error = RuntimeError("boom")
 
     with pytest.raises(RuntimeError, match="boom"):
-        await SchemaStore("broker", driver).migrate(OTHER_DSN)
+        await _store_over("broker", driver).migrate(OTHER_DSN)
 
     assert driver.run_migrations is True
     assert driver.calls == ["on_startup", "on_shutdown"]
@@ -167,7 +175,7 @@ async def test_migrate_closes_the_pool_when_the_startup_fails() -> None:
 def test_bind_sets_the_dsn_and_the_kind() -> None:
     driver = FakeDriver()
 
-    SchemaStore("result_backend", driver).bind(OTHER_DSN)
+    _store_over("result_backend", driver).bind(OTHER_DSN)
 
     assert driver.connection_string == OTHER_DSN
     assert driver.component_kind == "result_backend"
@@ -176,7 +184,7 @@ def test_bind_sets_the_dsn_and_the_kind() -> None:
 @pytest.mark.anyio
 async def test_start_and_close_call_the_driver() -> None:
     driver = FakeDriver()
-    store = SchemaStore("scheduler_source", driver)
+    store = _store_over("scheduler_source", driver)
 
     await store.start()
     await store.close()
@@ -186,19 +194,29 @@ async def test_start_and_close_call_the_driver() -> None:
 
 def test_the_declaration_follows_a_driver_that_was_swapped() -> None:
     first, second = FakeDriver("first_notes"), FakeDriver("second_notes")
-    store = SchemaStore("broker", first)
+    held: list[QueryDriver] = [first]
+    store = SchemaStore("broker", TableDeclaration.of_driver(first), lambda: held[0])
 
     assert store.declaration.table is first.table
 
-    store.driver = second
+    held[0] = second
 
     assert store.declaration.table is second.table
     assert store.schema.name == "second_notes"
 
 
+def test_the_declaration_is_the_given_one_while_the_driver_stays() -> None:
+    driver = FakeDriver()
+    declaration = TableDeclaration.of_driver(driver)
+
+    store = SchemaStore("broker", declaration, lambda: driver)
+
+    assert store.declaration is declaration
+
+
 def test_the_schema_is_the_declared_one() -> None:
     driver = FakeDriver()
-    store = SchemaStore("result_backend", driver)
+    store = _store_over("result_backend", driver)
 
     assert store.schema == migrations.declared_schema(
         "result_backend",
@@ -206,7 +224,7 @@ def test_the_schema_is_the_declared_one() -> None:
     )
 
 
-def test_build_makes_the_driver_the_declaration_describes() -> None:
+def test_build_driver_makes_the_driver_the_declaration_describes() -> None:
     key = PrimaryKeyColumn(name="id", type_="SERIAL")
     body = Column("body", "TEXT")
     created_at = CreatedAtColumn()
@@ -222,7 +240,7 @@ def test_build_makes_the_driver_the_declaration_describes() -> None:
         added_indexes=[index],
     )
 
-    store = SchemaStore.build(
+    driver = build_driver(
         "broker",
         declaration,
         "asyncpg",
@@ -230,14 +248,12 @@ def test_build_makes_the_driver_the_declaration_describes() -> None:
         run_migrations=True,
     )
 
-    driver = store.driver
     assert driver.connection_string == DSN
     assert driver.component_kind == "broker"
     assert driver.run_migrations is True
     assert TableDeclaration.of_driver(driver) == declaration
     assert driver.primary_key is key
     assert driver.created_at is created_at
-    assert store.kind == "broker"
 
 
 class _Connection:
@@ -352,7 +368,7 @@ async def test_read_database_with_a_store_reads_on_its_driver_and_closes_the_poo
     driver.row = {"database": "db", "search_path": "public", "catalog": None}
     schemas = [migrations.table_schema("result_backend")]
 
-    row = await read_database(OTHER_DSN, schemas, SchemaStore("broker", driver))
+    row = await read_database(OTHER_DSN, schemas, _store_over("broker", driver))
 
     assert row == driver.row
     assert driver.connection_string == OTHER_DSN
@@ -389,7 +405,7 @@ async def test_read_database_leaves_a_pool_that_never_opened() -> None:
     await read_database(
         OTHER_DSN,
         [migrations.table_schema("broker")],
-        SchemaStore("broker", driver),
+        _store_over("broker", driver),
     )
 
     assert driver.calls == []

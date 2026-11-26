@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import warnings
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import pytest
 from taskiq import BrokerMessage
@@ -27,6 +27,7 @@ from taskiq_postgresql.core.sql.catalog import (
     notify_statement,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
+from taskiq_postgresql.core.stores.declaration import TableDeclaration
 from taskiq_postgresql.core.stores.messages import MessageStore
 from taskiq_postgresql.core.stores.results import ResultStore
 from taskiq_postgresql.core.stores.schedules import ScheduleStore
@@ -34,6 +35,9 @@ from taskiq_postgresql.core.stores.schema import SchemaStore
 from taskiq_postgresql.exceptions import ResultIsMissingError
 from taskiq_postgresql.result_backend import Table as ResultTable
 from taskiq_postgresql.scheduler_source import Table as ScheduleTable
+
+if TYPE_CHECKING:
+    from taskiq_postgresql.migrations import ComponentKind
 
 DSN = "postgresql://postgres@localhost:5432/postgres"
 OTHER_DSN = "postgresql://postgres@localhost:5432/other"
@@ -122,10 +126,18 @@ class RecordingDriver(QueryDriver):
         self.calls.append(("on_shutdown", ()))
 
 
-def _message_store() -> tuple[MessageStore, RecordingDriver, MessageTable]:
+def _schema_store(kind: ComponentKind, held: list[RecordingDriver]) -> SchemaStore:
+    """Return a store over ``held[0]``, which a test replaces to swap the driver."""
+    return SchemaStore(kind, TableDeclaration.of_driver(held[0]), lambda: held[0])
+
+
+def _message_store(
+    held: Optional[list[RecordingDriver]] = None,
+) -> tuple[MessageStore, RecordingDriver, MessageTable]:
     columns = MessageTable(task_id=Column(name="task_id", type_="Uuid"))
-    driver = RecordingDriver()
-    return MessageStore(SchemaStore("broker", driver), columns), driver, columns
+    driver = RecordingDriver() if held is None else held[0]
+    held = [driver] if held is None else held
+    return MessageStore(_schema_store("broker", held), columns), driver, columns
 
 
 @pytest.mark.anyio
@@ -231,21 +243,25 @@ async def test_a_message_store_binds_starts_and_closes_its_schema_store() -> Non
 
 
 def test_a_message_store_follows_a_driver_that_was_swapped() -> None:
-    store, driver, _ = _message_store()
+    held = [RecordingDriver()]
+    store, driver, _ = _message_store(held)
     other = RecordingDriver("other_messages")
 
     assert store.driver is driver
 
-    store.driver = other
+    held[0] = other
 
     assert store.driver is other
     assert store.schema.driver is other
 
 
-def _result_store() -> tuple[ResultStore, RecordingDriver, ResultTable]:
+def _result_store(
+    held: Optional[list[RecordingDriver]] = None,
+) -> tuple[ResultStore, RecordingDriver, ResultTable]:
     columns = ResultTable(primary_key=PrimaryKeyColumn(name="task_id", type_="Uuid"))
-    driver = RecordingDriver("taskiq_results")
-    return ResultStore(SchemaStore("result_backend", driver), columns), driver, columns
+    driver = RecordingDriver("taskiq_results") if held is None else held[0]
+    held = [driver] if held is None else held
+    return ResultStore(_schema_store("result_backend", held), columns), driver, columns
 
 
 @pytest.mark.anyio
@@ -337,22 +353,26 @@ async def test_a_result_store_binds_starts_and_closes_its_schema_store() -> None
 
 
 def test_a_result_store_follows_a_driver_that_was_swapped() -> None:
-    store, driver, _ = _result_store()
+    held = [RecordingDriver()]
+    store, driver, _ = _result_store(held)
     other = RecordingDriver("other_results")
 
     assert store.driver is driver
 
-    store.driver = other
+    held[0] = other
 
     assert store.driver is other
     assert store.schema.driver is other
 
 
-def _schedule_store() -> tuple[ScheduleStore, RecordingDriver, ScheduleTable]:
+def _schedule_store(
+    held: Optional[list[RecordingDriver]] = None,
+) -> tuple[ScheduleStore, RecordingDriver, ScheduleTable]:
     columns = ScheduleTable()
-    driver = RecordingDriver("taskiq_schedulers")
+    driver = RecordingDriver("taskiq_schedulers") if held is None else held[0]
+    held = [driver] if held is None else held
     return (
-        ScheduleStore(SchemaStore("scheduler_source", driver), columns),
+        ScheduleStore(_schema_store("scheduler_source", held), columns),
         driver,
         columns,
     )
@@ -409,12 +429,13 @@ async def test_a_schedule_store_binds_starts_and_closes_its_schema_store() -> No
 
 
 def test_a_schedule_store_follows_a_driver_that_was_swapped() -> None:
-    store, driver, _ = _schedule_store()
+    held = [RecordingDriver()]
+    store, driver, _ = _schedule_store(held)
     other = RecordingDriver("other_schedulers")
 
     assert store.driver is driver
 
-    store.driver = other
+    held[0] = other
 
     assert store.driver is other
     assert store.schema.driver is other

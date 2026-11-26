@@ -13,8 +13,8 @@ migration code or a driver.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, Literal, Optional
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Optional, Union
 
 from taskiq_postgresql.core.sql.catalog import PrimaryKeyColumn, database_read
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
@@ -22,7 +22,51 @@ from taskiq_postgresql.utils import get_db_driver
 
 if TYPE_CHECKING:
     from taskiq_postgresql.abc.driver import QueryDriver
+    from taskiq_postgresql.drivers import AsyncpgDriver, PsqlpyDriver, PsycopgDriver
     from taskiq_postgresql.migrations import ComponentKind, TableSchema
+
+
+def build_driver(
+    kind: ComponentKind,
+    declaration: TableDeclaration,
+    driver_name: Literal["asyncpg", "psqlpy", "psycopg"],
+    dsn: str,
+    /,
+    *,
+    run_migrations: bool,
+    **connect_kwargs: Any,
+) -> Union[AsyncpgDriver, PsqlpyDriver, PsycopgDriver]:
+    """
+    Build the query driver of a component from its declaration.
+
+    The first four arguments are positional only, so that a connection option
+    of the user's cannot collide with them.
+
+    Args:
+        kind: The component that owns the table.
+        declaration: What the component hands its driver.
+        driver_name: The bundled driver to build.
+        dsn: The connection string.
+        run_migrations: Whether the driver creates what the table lacks.
+        **connect_kwargs: Connection options of the driver.
+
+    Returns:
+        The driver, which knows the component that owns its table.
+    """
+    driver = get_db_driver(driver_name)(
+        dsn,
+        declaration.table,
+        columns=declaration.columns,
+        primary_key=declaration.primary_key,
+        created_at=declaration.created_at,
+        index_columns=declaration.index_columns,
+        run_migrations=run_migrations,
+        added_columns=declaration.added_columns,
+        added_indexes=declaration.added_indexes,
+        **connect_kwargs,
+    )
+    driver.component_kind = kind
+    return driver
 
 
 class SchemaStore:
@@ -31,63 +75,41 @@ class SchemaStore:
 
     Attributes:
         kind: The component that owns the table.
-        driver: The query driver in use; a component that is given another one
-            hands it here, so the store follows it.
     """
 
-    def __init__(self, kind: ComponentKind, driver: QueryDriver) -> None:
-        """Hold ``driver`` for the table of a component of ``kind``."""
-        self.kind = kind
-        self.driver = driver
-
-    @property
-    def declaration(self) -> TableDeclaration:
-        """The table as the current driver declares it, read at each use."""
-        return TableDeclaration.of_driver(self.driver)
-
-    @classmethod
-    def build(
-        cls,
+    def __init__(
+        self,
         kind: ComponentKind,
         declaration: TableDeclaration,
-        driver_name: Literal["asyncpg", "psqlpy", "psycopg"],
-        dsn: str,
-        /,
-        *,
-        run_migrations: bool,
-        **connect_kwargs: Any,
-    ) -> SchemaStore:
+        driver_of: Callable[[], QueryDriver],
+    ) -> None:
         """
-        Build the driver of a component from its declaration.
-
-        The first four arguments are positional only, so that a connection
-        option of the user's cannot collide with them.
+        Keep the declaration of the table of a component of ``kind``.
 
         Args:
             kind: The component that owns the table.
-            declaration: What the component hands its driver.
-            driver_name: The bundled driver to build.
-            dsn: The connection string.
-            run_migrations: Whether the driver creates what the table lacks.
-            **connect_kwargs: Connection options of the driver.
-
-        Returns:
-            The store of the new driver.
+            declaration: What the component handed its driver.
+            driver_of: Returns the driver in use, which is read at each use so
+                that a driver a component is given instead is the one used.
         """
-        driver = get_db_driver(driver_name)(
-            dsn,
-            declaration.table,
-            columns=declaration.columns,
-            primary_key=declaration.primary_key,
-            created_at=declaration.created_at,
-            index_columns=declaration.index_columns,
-            run_migrations=run_migrations,
-            added_columns=declaration.added_columns,
-            added_indexes=declaration.added_indexes,
-            **connect_kwargs,
-        )
-        driver.component_kind = kind
-        return cls(kind, driver)
+        self.kind = kind
+        self._declared = declaration
+        self._driver_of = driver_of
+        self._declared_for = driver_of()
+
+    @property
+    def driver(self) -> QueryDriver:
+        """The query driver in use."""
+        return self._driver_of()
+
+    @property
+    def declaration(self) -> TableDeclaration:
+        """The table as the component declared it, for the driver it built."""
+        driver = self.driver
+        if driver is self._declared_for:
+            return self._declared
+        # A driver assigned in place of it declares the table it creates.
+        return TableDeclaration.of_driver(driver)
 
     @property
     def schema(self) -> TableSchema:

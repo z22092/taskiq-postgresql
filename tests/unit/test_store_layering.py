@@ -3,8 +3,10 @@
 A component talks to the database through its store, and the CLI and
 ``migrations.py`` go through the core. These tests read the sources with
 ``ast`` and fail on any access to an attribute named ``driver`` outside the
-``driver`` property of the three component classes, which stays readable and
-assignable. ``listen_driver`` is another attribute name and is not covered.
+``__init__`` of the three component classes, where there are exactly two: the
+assignment of the driver they build, which stays an attribute anyone may
+patch or replace, and the read inside the function handed to the schema store.
+``listen_driver`` is another attribute name and is not covered.
 """
 
 from __future__ import annotations
@@ -15,45 +17,70 @@ from pathlib import Path
 import pytest
 
 PACKAGE = Path(__file__).resolve().parents[2] / "taskiq_postgresql"
-SOURCES = (
-    "broker.py",
-    "result_backend.py",
-    "scheduler_source.py",
-    "cli.py",
-    "migrations.py",
-)
+COMPONENT_SOURCES = ("broker.py", "result_backend.py", "scheduler_source.py")
+SOURCES = (*COMPONENT_SOURCES, "cli.py", "migrations.py")
 COMPONENT_CLASSES = frozenset(
     {"PostgresqlBroker", "PostgresqlResultBackend", "PostgresqlSchedulerSource"},
 )
 CLI_FORBIDDEN_NAMES = frozenset({"QueryDriver", "get_db_driver"})
 
 
-def _driver_accesses(path: Path) -> list[int]:
-    """Line numbers of ``<expr>.driver`` outside a component's ``driver`` property."""
-    tree = ast.parse(path.read_text(encoding="utf-8"))
-    allowed: set[int] = set()
-    for node in ast.walk(tree):
-        if not (isinstance(node, ast.ClassDef) and node.name in COMPONENT_CLASSES):
-            continue
-        for member in node.body:
-            if isinstance(member, ast.FunctionDef) and member.name == "driver":
-                allowed.update(id(child) for child in ast.walk(member))
-    return sorted(
-        node.lineno
+def _driver_attributes(tree: ast.AST) -> list[ast.Attribute]:
+    return [
+        node
         for node in ast.walk(tree)
-        if isinstance(node, ast.Attribute)
-        and node.attr == "driver"
-        and id(node) not in allowed
+        if isinstance(node, ast.Attribute) and node.attr == "driver"
+    ]
+
+
+def _component_inits(tree: ast.AST) -> list[ast.FunctionDef]:
+    return [
+        member
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ClassDef) and node.name in COMPONENT_CLASSES
+        for member in node.body
+        if isinstance(member, ast.FunctionDef) and member.name == "__init__"
+    ]
+
+
+def _outside_the_init(path: Path) -> list[int]:
+    """Line numbers of ``<expr>.driver`` outside a component's ``__init__``."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    allowed = {id(child) for init in _component_inits(tree) for child in ast.walk(init)}
+    return sorted(
+        node.lineno for node in _driver_attributes(tree) if id(node) not in allowed
     )
 
 
 @pytest.mark.parametrize("name", SOURCES)
-def test_nothing_reads_the_query_driver_outside_the_store(name: str) -> None:
-    lines = _driver_accesses(PACKAGE / name)
+def test_nothing_reads_the_query_driver_outside_the_init(name: str) -> None:
+    lines = _outside_the_init(PACKAGE / name)
     assert not lines, (
         f"{name} reaches the query driver at "
         + ", ".join(f"taskiq_postgresql/{name}:{line}" for line in lines)
         + "; go through the store"
+    )
+
+
+@pytest.mark.parametrize("name", COMPONENT_SOURCES)
+def test_the_init_assigns_the_driver_and_hands_the_store_a_function_for_it(
+    name: str,
+) -> None:
+    tree = ast.parse((PACKAGE / name).read_text(encoding="utf-8"))
+    (init,) = _component_inits(tree)
+    in_a_function = {
+        id(child)
+        for lambda_ in ast.walk(init)
+        if isinstance(lambda_, ast.Lambda)
+        for child in ast.walk(lambda_)
+    }
+    accesses = [
+        (isinstance(node.ctx, ast.Store), id(node) in in_a_function)
+        for node in _driver_attributes(init)
+    ]
+    assert sorted(accesses) == [(False, True), (True, False)], (
+        f"{name}: __init__ must assign self.driver once and read it once, "
+        "in the function given to the schema store"
     )
 
 

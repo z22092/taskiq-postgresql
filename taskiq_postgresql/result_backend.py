@@ -15,7 +15,7 @@ from taskiq_postgresql.core.sql.catalog import (
 from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
 from taskiq_postgresql.core.stores.results import ResultStore
-from taskiq_postgresql.core.stores.schema import SchemaStore
+from taskiq_postgresql.core.stores.schema import SchemaStore, build_driver
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
@@ -98,31 +98,18 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             created_at=CreatedAtColumn(),
             index_columns=[self.columns.primary_key],
         )
+        self.driver = build_driver(
+            "result_backend",
+            declaration,
+            driver,
+            dsn_before_startup(dsn),
+            run_migrations=run_migrations,
+            **connect_kwargs,
+        )
         self._store = ResultStore(
-            SchemaStore.build(
-                "result_backend",
-                declaration,
-                driver,
-                dsn_before_startup(dsn),
-                run_migrations=run_migrations,
-                **connect_kwargs,
-            ),
+            SchemaStore("result_backend", declaration, lambda: self.driver),
             self.columns,
         )
-
-    @property
-    def driver(self) -> QueryDriver:
-        """
-        The query driver of the table.
-
-        Assigning another one makes the backend use it, which is how a driver
-        of your own replaces the bundled one.
-        """
-        return self._store.driver
-
-    @driver.setter
-    def driver(self, driver: QueryDriver) -> None:
-        self._store.driver = driver
 
     @property
     def dsn(self) -> str:
