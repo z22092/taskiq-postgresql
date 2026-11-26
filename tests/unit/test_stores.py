@@ -14,7 +14,6 @@ from typing import Any, Optional
 
 import pytest
 from taskiq import BrokerMessage
-from taskiq_postgresql.core.stores.schedules import ScheduleStore
 from typing_extensions import override
 
 from taskiq_postgresql.abc.driver import QueryDriver
@@ -30,6 +29,7 @@ from taskiq_postgresql.core.sql.catalog import (
 from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.core.stores.messages import MessageStore
 from taskiq_postgresql.core.stores.results import ResultStore
+from taskiq_postgresql.core.stores.schedules import ScheduleStore
 from taskiq_postgresql.core.stores.schema import SchemaStore
 from taskiq_postgresql.exceptions import ResultIsMissingError
 from taskiq_postgresql.result_backend import Table as ResultTable
