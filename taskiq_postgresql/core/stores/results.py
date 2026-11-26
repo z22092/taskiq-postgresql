@@ -54,9 +54,10 @@ class ResultStore(TableStore):
             task_id: The id of the task.
 
         Returns:
-            Whether there is a row for the task.
+            Whether there is a row for the task with a result in it: a row that
+            holds only progress is not a result yet.
         """
-        return await self.driver.exists(task_id)
+        return await self.driver.exists(task_id, not_null=[self._table.result])
 
     async def get(self, task_id: Any) -> Any:
         """
@@ -69,13 +70,15 @@ class ResultStore(TableStore):
             The serialized result.
 
         Raises:
-            ResultIsMissingError: if no result is stored for the task.
+            ResultIsMissingError: if no result is stored for the task, also
+                when its row holds only progress.
         """
         columns = self._table
         rows = await self.driver.select(
             [columns.result],
             [columns.primary_key],
             [task_id],
+            not_null=[columns.result],
         )
         if len(rows) == 0:
             raise ResultIsMissingError(
@@ -83,9 +86,53 @@ class ResultStore(TableStore):
             )
         return next(iter(rows))["result"]
 
+    async def set_progress(self, task_id: Any, data: bytes) -> None:
+        """
+        Store the serialized progress of a task, replacing an earlier one.
+
+        Only the ``progress`` column is written, so the result of the same
+        task, if one is stored, stays as it is; ``set`` leaves the progress
+        alone the same way.
+
+        Args:
+            task_id: The id of the task.
+            data: The serialized progress.
+        """
+        columns = self._table
+        # Without ``returning``, as ``set`` calls it: see the comment there.
+        await self.driver.insert_or_update(  # ty: ignore[missing-argument]
+            [columns.primary_key, columns.progress],
+            [task_id, data],
+            [columns.primary_key],
+            [columns.progress],
+        )
+
+    async def get_progress(self, task_id: Any) -> Optional[bytes]:
+        """
+        Return the serialized progress of a task.
+
+        Args:
+            task_id: The id of the task.
+
+        Returns:
+            The serialized progress, or ``None`` when the task has no row or
+            its row holds no progress.
+        """
+        columns = self._table
+        rows = await self.driver.select(
+            [columns.progress],
+            [columns.primary_key],
+            [task_id],
+        )
+        if len(rows) == 0:
+            return None
+        found = next(iter(rows))["progress"]
+        # Not every driver returns BYTEA as bytes; the caller parses bytes.
+        return None if found is None else bytes(found)
+
     async def delete(self, task_id: Any) -> None:
         """
-        Delete the result of a task.
+        Delete the row of a task: its result and its progress.
 
         Args:
             task_id: The id of the task.

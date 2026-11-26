@@ -235,14 +235,30 @@ class SelectQuery(QueryBase):
         self,
         columns: Sequence[Column],
         where_columns: Optional[Sequence[Column]] = None,
+        not_null: Sequence[Column] = (),
     ) -> str:
-        """Return the query as a string."""
+        """
+        Return the query as a string.
+
+        Args:
+            columns: The columns to select.
+            where_columns: The columns compared with ``$1``, ``$2``, ...
+            not_null: Columns that must not be ``NULL``: a row where one is
+                is left out, as if it were absent.
+        """
+        conditions = [
+            *(
+                f"{column.name} = ${i}"
+                for i, column in enumerate(where_columns or (), start=1)
+            ),
+            *(f"{column.name} IS NOT NULL" for column in not_null),
+        ]
         return (
             f"SELECT {', '.join(column.name for column in columns)} "  # noqa: S608
             f"FROM {self.table_name} "
             + (
-                f"WHERE {' AND '.join(f'{column.name} = ${i}' for i, column in enumerate(where_columns, start=1))}"  # noqa: E501
-                if where_columns is not None
+                f"WHERE {' AND '.join(conditions)}"
+                if where_columns is not None or not_null
                 else ""
             )
         )
@@ -251,10 +267,11 @@ class SelectQuery(QueryBase):
         self,
         columns: Sequence[Column],
         where_columns: Optional[Sequence[Column]] = None,
+        not_null: Sequence[Column] = (),
     ) -> Statement:
         """Return the query typed: one parameter per ``where_columns`` item."""
         return Statement(
-            self.make_query(columns, where_columns),
+            self.make_query(columns, where_columns, not_null),
             tuple(column.bind_type for column in where_columns or ()),
             _returning(columns),
         )
@@ -263,19 +280,26 @@ class SelectQuery(QueryBase):
 class ExistsQuery(QueryBase):
     """Query telling whether a row with the key ``$1`` exists."""
 
-    def make_query(self, key: Column) -> str:
+    def make_query(self, key: Column, not_null: Sequence[Column] = ()) -> str:
         """
         Return the query as a string.
 
         The text does not type the key, so a third-party driver whose key
         column no ``ParamType`` covers keeps working.
-        """
-        return f"SELECT 1 FROM {self.table_name} WHERE {key.name} = $1"  # noqa: S608
 
-    def statement(self, key: Column) -> Statement:
+        Args:
+            key: The key column, compared with ``$1``.
+            not_null: Columns that must not be ``NULL`` for the row to count.
+        """
+        return (
+            f"SELECT 1 FROM {self.table_name} WHERE {key.name} = $1"  # noqa: S608
+            + "".join(f" AND {column.name} IS NOT NULL" for column in not_null)
+        )
+
+    def statement(self, key: Column, not_null: Sequence[Column] = ()) -> Statement:
         """Return the query typed; the one column it returns is the constant ``1``."""
         return Statement(
-            self.make_query(key),
+            self.make_query(key, not_null),
             (key.bind_type,),
             (("?column?", ParamType.INT4),),
         )

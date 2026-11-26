@@ -1,4 +1,4 @@
-"""Step 2: the broker table's ``channel`` and ``not_before`` and their index."""
+"""Step 2 of the broker table: its ``channel`` and ``not_before`` and their index."""
 
 from django.db import migrations
 
@@ -9,8 +9,9 @@ class Migration(migrations.Migration):
     """
     Add the claim columns to the broker tables, a 0.4.x one included.
 
-    Only the broker table has a step 2: the other tables are left alone.
+    Only the broker tables are touched: step 2 of the result backend's table is
+    another step, which migration 0003 runs.
     """
 
     dependencies = (("taskiq_postgresql", "0001_initial"),)
-    operations = (RunTaskiqStep(2),)
+    operations = (RunTaskiqStep(2, kind="broker"),)

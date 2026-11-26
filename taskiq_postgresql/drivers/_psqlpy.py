@@ -255,22 +255,27 @@ class PsqlpyDriver(QueryDriver):
         columns: Sequence[Column],
         where_columns: Optional[Sequence[Column]] = None,
         where_values: Optional[Sequence[Any]] = None,
+        not_null: Sequence[Column] = (),
     ) -> list[dict[str, Any]]:
         """Select a row from a table."""
         parameters = encode_psqlpy_params(where_columns or (), where_values)
         async with self, self.connection() as connection:
             rows = await connection.execute(
-                querystring=self.select_query.make_query(columns, where_columns),
+                querystring=self.select_query.make_query(
+                    columns,
+                    where_columns,
+                    not_null,
+                ),
                 parameters=parameters,
             )
 
             return rows.result()
 
-    async def exists(self, id: Any) -> bool:
+    async def exists(self, id: Any, not_null: Sequence[Column] = ()) -> bool:
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
             results = await connection.fetch(
-                self.exists_query.make_query(self.primary_key),
+                self.exists_query.make_query(self.primary_key, not_null),
                 encode_psqlpy_params([self.primary_key], [id]),
             )
             v = results.result()

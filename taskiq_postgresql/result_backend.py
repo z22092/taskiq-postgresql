@@ -4,12 +4,14 @@ from typing import Any, Final, Literal, Optional, TypeVar, Union
 
 from taskiq import AsyncResultBackend, TaskiqResult
 from taskiq.abc.serializer import TaskiqSerializer
+from taskiq.depends.progress_tracker import TaskProgress
 from taskiq.serializers.pickle import PickleSerializer
 
 from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
     Column,
     CreatedAtColumn,
+    DeclaredStep,
     PrimaryKeyColumn,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
@@ -35,6 +37,22 @@ class Table:
         name="result",
         type_="BYTEA",
     )
+    progress: Column = Column(  # noqa: RUF009
+        name="progress",
+        type_="BYTEA",
+        nullable=True,
+    )
+
+
+# Step 2 of the results table, the one definition: the backend declares it and
+# ``migrations`` describes the same step for a kind. ``result`` stops being
+# NOT NULL so that a row can hold progress before it holds a result.
+RESULTS_STEPS: Final = (
+    DeclaredStep(
+        added_columns=[Table.progress],
+        nullable_columns=(Table.result.name,),
+    ),
+)
 
 
 class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
@@ -51,6 +69,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         serializer: Optional[TaskiqSerializer] = None,
         driver: Literal["asyncpg", "psqlpy", "psycopg"] = "asyncpg",
         run_migrations: bool = False,
+        store_progress: bool = True,
         **connect_kwargs: Any,
     ) -> None:
         """
@@ -67,6 +86,12 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             driver: driver to use.
             run_migrations: create the table and its index on startup; without
                 it, startup() only checks that they exist.
+            store_progress: whether ``set_progress`` writes the progress of a
+                task, as JSON, in the ``progress`` column of its result row.
+                ``False`` makes it do nothing; ``get_progress`` and the table
+                do not depend on it. Pass ``False`` while a process that reads
+                results still runs a release without progress: it would
+                take a row that holds only progress for a result.
             connect_kwargs: additional arguments for nats `ConnectionPool` class.
 
         Raises:
@@ -77,6 +102,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         dsn = require_dsn(dsn, type(self).__name__)
         self._dsn: Final[Dsn] = dsn
         self.keep_results: Final = keep_results
+        self.store_progress: Final = store_progress
         self.table_name: Final = table_name
         self.field_for_task_id: Final = field_for_task_id
         self.serializer: Final = serializer or PickleSerializer()
@@ -97,6 +123,7 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             ],
             created_at=CreatedAtColumn(),
             index_columns=[self.columns.primary_key],
+            steps=RESULTS_STEPS,
         )
         self.driver = build_driver(
             "result_backend",
@@ -165,9 +192,59 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         """
         await self._store.set(task_id, self.serializer.dumpb(result))
 
+    async def set_progress(
+        self,
+        task_id: Any,
+        progress: TaskProgress[Any],
+    ) -> None:
+        """
+        Store the progress of a task in its result row.
+
+        The progress is JSON, whatever ``serializer`` is: the column is read
+        back by this backend only, and JSON needs no ``pickle.loads`` of what
+        a database holds. A row that has no result yet is created. It does
+        nothing when ``store_progress`` is ``False``.
+
+        Args:
+            task_id: ID of the task.
+            progress: The progress; its ``meta`` must be JSON serializable.
+
+        Raises:
+            ValueError: if ``progress`` cannot be written as JSON. Nothing is
+                written.
+        """
+        if not self.store_progress:
+            return
+        await self._store.set_progress(
+            task_id,
+            progress.model_dump_json().encode("utf-8"),
+        )
+
+    async def get_progress(self, task_id: Any) -> Optional[TaskProgress[Any]]:
+        """
+        Return the progress of a task.
+
+        Args:
+            task_id: ID of the task.
+
+        Returns:
+            The progress, or ``None`` when the task has no row or its row
+            holds no progress.
+
+        Raises:
+            ValueError: if the column holds something that is not progress
+                written as JSON.
+        """
+        data = await self._store.get_progress(task_id)
+        if data is None:
+            return None
+        return TaskProgress[Any].model_validate_json(data)
+
     async def is_result_ready(self, task_id: Any) -> bool:
         """
         Returns whether the result is ready.
+
+        A task whose row holds only progress is not ready.
 
         Args:
             task_id (Any): ID of the task.
@@ -194,7 +271,9 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
             TaskiqResult.
 
         Raises:
-            ResultIsMissingError: if there is no result when trying to get it.
+            ResultIsMissingError: if there is no result when trying to get it,
+                also when the task's row holds only progress. That row is not
+                deleted, even with ``keep_results=False``.
         """
         result_in_bytes = await self._store.get(task_id)
 

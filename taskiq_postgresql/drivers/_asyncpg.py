@@ -193,11 +193,12 @@ class AsyncpgDriver(QueryDriver):
         columns: Sequence[Column],
         where_columns: Optional[Sequence[Column]] = None,
         where_values: Optional[Sequence[Any]] = None,
+        not_null: Sequence[Column] = (),
     ) -> list[dict[str, Any]]:
         """Select a row from a table."""
         async with self, self.connection() as connection:
             rows = await connection.fetch(
-                self.select_query.make_query(columns, where_columns),
+                self.select_query.make_query(columns, where_columns, not_null),
                 *encode_params(where_columns, where_values or ()),
             )
 
@@ -205,11 +206,11 @@ class AsyncpgDriver(QueryDriver):
                 {column.name: row[column.name] for column in columns} for row in rows
             ]
 
-    async def exists(self, id: Any) -> bool:
+    async def exists(self, id: Any, not_null: Sequence[Column] = ()) -> bool:
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
             found = await connection.fetchval(
-                self.exists_query.make_query(self.primary_key),
+                self.exists_query.make_query(self.primary_key, not_null),
                 id,
             )
             # The query selects the constant 1, or no row at all.

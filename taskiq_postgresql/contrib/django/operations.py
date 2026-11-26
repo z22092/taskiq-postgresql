@@ -1,15 +1,18 @@
 """
 The operation the Django app's migrations hold: one migration step.
 
-Migration ``0001`` runs step 1 of every configured table, ``0002`` step 2,
-and so on: a release that adds a step adds the migration that runs it. The
-operation reads the settings when ``migrate`` applies it, so the migrations
-are the same for every project.
+Migration ``0001`` runs step 1 of every configured table. A later step has a
+number of its own for each kind of table (the broker's step 2 and the result
+backend's step 2 are different steps), so each later migration runs one step
+of one kind: ``0002`` the broker's step 2, ``0003`` the result backend's step
+2. A release that adds a step adds the migration that runs it. The operation
+reads the settings when ``migrate`` applies it, so the migrations are the
+same for every project.
 """
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from django.db import NotSupportedError, router
 from django.db.migrations.operations.base import Operation, OperationCategory
@@ -19,18 +22,18 @@ from taskiq_postgresql.contrib.django.conf import (
     configured_lock_timeout,
     configured_schemas,
 )
-from taskiq_postgresql.migrations import step_statements
+from taskiq_postgresql.migrations import ComponentKind, step_statements
 
 __all__ = ["RunTaskiqStep"]
 
 
 class RunTaskiqStep(Operation):
     """
-    Run one migration step of every table ``TASKIQ_POSTGRESQL_TARGETS`` names.
+    Run one migration step of the tables ``TASKIQ_POSTGRESQL_TARGETS`` names.
 
     When ``migrate`` applies the migration, the operation describes the
     tables the settings name and runs the step's statements for each table
-    that has the step, one statement at a time, in the migration's
+    of its kind that has the step, one statement at a time, in the migration's
     transaction. They are the statements ``run_migrations=True`` runs: the
     advisory lock it takes comes first, so workers that start meanwhile wait
     for the migration, and every statement only adds what is missing, or
@@ -53,14 +56,20 @@ class RunTaskiqStep(Operation):
 
     Args:
         number: The step it runs.
+        kind: Only the tables of this component (``broker``,
+            ``result_backend`` or ``scheduler_source``), because a step number
+            means one thing for the broker table and another for the result
+            backend's. ``None``, step 1 of every kind, runs it for every
+            table.
     """
 
     reduces_to_sql = True
     reversible = True
     category = OperationCategory.SQL
 
-    def __init__(self, number: int) -> None:
+    def __init__(self, number: int, kind: Optional[ComponentKind] = None) -> None:
         self.number = number
+        self.kind = kind
 
     def state_forwards(self, app_label: str, state: Any) -> None:
         """Change nothing: the tables are not Django models."""
@@ -100,6 +109,7 @@ class RunTaskiqStep(Operation):
         statements = step_statements(
             configured_schemas(),
             step=self.number,
+            kind=self.kind,
             lock_timeout=configured_lock_timeout(),
         )
         for statement in statements:
@@ -123,7 +133,8 @@ class RunTaskiqStep(Operation):
         Returns:
             The description.
         """
+        tables = "tables" if self.kind is None else f"{self.kind} tables"
         return (
-            f"Run step {self.number} of the taskiq-postgresql tables "
+            f"Run step {self.number} of the taskiq-postgresql {tables} "
             f"{TARGETS_SETTING} names"
         )

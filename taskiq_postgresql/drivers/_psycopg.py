@@ -346,12 +346,13 @@ class PsycopgDriver(QueryDriver):
         columns: Sequence[Column],
         where_columns: Optional[Sequence[Column]] = None,
         where_values: Optional[Sequence[Any]] = None,
+        not_null: Sequence[Column] = (),
     ) -> list[dict[str, Any]]:
         """Select a row from a table."""
         async with self, self.connection() as connection:
             cursor = connection.cursor(row_factory=dict_row)
             cursor: AsyncCursor[DictRow] = await cursor.execute(
-                sql(self.select_query.make_query(columns, where_columns)),
+                sql(self.select_query.make_query(columns, where_columns, not_null)),
                 params=encode_params(where_columns, where_values),
             )
 
@@ -359,12 +360,12 @@ class PsycopgDriver(QueryDriver):
                 return await cursor.fetchall()
             return []
 
-    async def exists(self, id: Any) -> bool:
+    async def exists(self, id: Any, not_null: Sequence[Column] = ()) -> bool:
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
             cursor: AsyncCursor[TupleRow] = await connection.execute(
                 sql(
-                    self.exists_query.make_query(self.primary_key),
+                    self.exists_query.make_query(self.primary_key, not_null),
                 ),
                 params=encode_params([self.primary_key], [id]),
             )
