@@ -23,7 +23,7 @@ from taskiq_postgresql.utils import get_db_driver
 if TYPE_CHECKING:
     from taskiq_postgresql.abc.driver import QueryDriver
     from taskiq_postgresql.drivers import AsyncpgDriver, PsqlpyDriver, PsycopgDriver
-    from taskiq_postgresql.migrations import ComponentKind, TableSchema
+    from taskiq_postgresql.migrations import Component, ComponentKind, TableSchema
 
 
 def build_driver(
@@ -184,7 +184,7 @@ class TableStore:
         await self.schema.close()
 
 
-def schema_store(component: Any) -> SchemaStore:
+def schema_store(component: Component) -> SchemaStore:
     """
     Return the schema store of a component.
 

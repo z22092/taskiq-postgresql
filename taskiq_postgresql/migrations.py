@@ -541,10 +541,10 @@ def table_schema(
             TableDeclaration.of_driver(component),
         )
     # The kind first, so that what is not a component is refused here.
-    _kind_of(component)
+    kind = _kind_of(component)
     from taskiq_postgresql.core.stores.schema import schema_store  # noqa: PLC0415
 
-    return schema_store(component).schema
+    return declared_schema(kind, schema_store(component).declaration)
 
 
 def collect_components(
