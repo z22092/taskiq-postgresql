@@ -518,6 +518,18 @@ Upgrading from 0.4.x:
   machine can read a command line, so give `--dsn` a connection string
   without the password, and the password through a password file or
   `PGPASSWORD`, which asyncpg and psycopg read and psqlpy does not.
+- The asyncpg, psqlpy and psycopg drivers, the query and the listen side of
+  each, no longer log or raise part of a connection string they cannot read.
+  The parsers quote part of such a string, password included: the drivers
+  raised it, and psycopg's connection pool logged it on every retry until its
+  timeout. Every driver now fails at once with `DatabaseConnectionError` and
+  a fixed message that says how to quote or percent-encode the password. A
+  `postgresql://` or `postgres://` URL (the scheme in any case) that libpq and
+  asyncpg would misread is refused the same way, by all three drivers: more
+  than one unencoded `@` in its authority, an unencoded `@` in its path (such
+  as a password with a `/`), or a port that is not all digits; an `@` in the
+  query stays accepted. An error that is not about the string, such as
+  asyncpg's `min_size` greater than `max_size`, keeps its own message.
 
 Earlier versions are not described in this file; see the
 [GitHub releases page](https://github.com/z22092/taskiq-postgresql/releases) and

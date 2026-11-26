@@ -10,6 +10,7 @@ from typing import Any, AsyncGenerator, Optional, Sequence, Union
 from uuid import UUID
 
 from psqlpy import Connection, ConnectionPool, Listener, Transaction
+from psqlpy.exceptions import ConnectionPoolBuildError
 from psqlpy.extra_types import JSONB
 from typing_extensions import Self
 
@@ -22,6 +23,17 @@ from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.drivers._schema import Session, start_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+from taskiq_postgresql.utils.dsn import UNREADABLE_DSN, is_ambiguous_uri
+
+
+def is_dsn_parse_error(error: ConnectionPoolBuildError) -> bool:
+    """
+    Tell whether ``error`` is psqlpy failing to parse the connection string.
+
+    Only that error quotes part of the string; the others (a pool that cannot
+    be built from valid settings) keep their own message.
+    """
+    return "Cannot parse configuration from dsn string" in str(error)
 
 
 def encode_psqlpy_params(
@@ -139,12 +151,26 @@ class PsqlpyDriver(QueryDriver):
 
     async def __aenter__(self) -> Self:
         """Enter the context manager."""
-        if self.pool is None:
+        # Raised here, where only `self` is a local: a frame that held the
+        # string would hand it to an error tracker that captures locals.
+        if self.pool is None and not self._open_pool():
+            raise DatabaseConnectionError(UNREADABLE_DSN)
+        return self
+
+    def _open_pool(self) -> bool:
+        """Create the pool; ``False`` when psqlpy cannot read the string."""
+        if is_ambiguous_uri(self.connection_string):
+            return False
+        try:
             self.pool = ConnectionPool(
                 self.connection_string,
                 **self.connection_kwargs,
             )
-        return self
+        except ConnectionPoolBuildError as error:
+            if not is_dsn_parse_error(error):
+                raise
+            return False
+        return True
 
     async def __aexit__(
         self,
@@ -323,11 +349,11 @@ class PsqlpyListenDriver(ListenDriver):
         """Open a pool and its listener, and start reading the listener."""
         # A new queue, so nothing from a previous connection is read again.
         self._queue = AsyncQueue()
+        pool = self._open_pool()
+        if pool is None:
+            # Raised here, not in _open_pool: see PsqlpyDriver.__aenter__.
+            raise DatabaseConnectionError(UNREADABLE_DSN)
         try:
-            pool = self.connection = ConnectionPool(
-                self.connection_string,
-                **self.connection_kwargs,
-            )
             listener = self.listener = pool.listener()
             await listener.add_callback(self.channel_name, _ignore_notify)
             await listener.startup()
@@ -341,6 +367,23 @@ class PsqlpyListenDriver(ListenDriver):
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
         self._reader = create_task(self._read(listener, self._queue))
+
+    def _open_pool(self) -> Optional[ConnectionPool]:
+        """Create the pool; ``None`` when psqlpy cannot read the string."""
+        if is_ambiguous_uri(self.connection_string):
+            return None
+        try:
+            pool = self.connection = ConnectionPool(
+                self.connection_string,
+                **self.connection_kwargs,
+            )
+        except ConnectionPoolBuildError as error:
+            if is_dsn_parse_error(error):
+                return None
+            raise DatabaseConnectionError(str(error)) from error
+        except Exception as error:
+            raise DatabaseConnectionError(str(error)) from error
+        return pool
 
     @staticmethod
     async def _read(

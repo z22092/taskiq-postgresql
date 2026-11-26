@@ -21,6 +21,7 @@ from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.drivers._schema import Session, start_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+from taskiq_postgresql.utils.dsn import UNREADABLE_DSN, is_ambiguous_uri
 
 logger = logging.getLogger(__name__)
 
@@ -90,15 +91,30 @@ class AsyncpgDriver(QueryDriver):
 
     async def __aenter__(self) -> Self:
         """Enter the context manager."""
+        # Raised here, where only `self` is a local: a frame that held the
+        # string would hand it to an error tracker that captures locals.
+        if self.pool is None and not await self._open_pool():
+            raise DatabaseConnectionError(UNREADABLE_DSN)
+        return self
+
+    async def _open_pool(self) -> bool:
+        """
+        Create the pool; ``False`` for a URI asyncpg would misread.
+
+        asyncpg's own ``ValueError`` for a bad port quotes part of the string,
+        and a host name made of the rest of a password reaches the resolver's
+        error, so the shared check runs first and refuses both.
+        """
+        if is_ambiguous_uri(self.connection_string):
+            return False
         try:
-            if self.pool is None:
-                self.pool = await create_pool(
-                    self.connection_string,
-                    **self.connection_kwargs,
-                )
-            return self
+            self.pool = await create_pool(
+                self.connection_string,
+                **self.connection_kwargs,
+            )
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
+        return True
 
     async def __aexit__(
         self,
@@ -271,11 +287,11 @@ class AsyncpgListenDriver(ListenDriver):
 
     async def on_startup(self) -> None:
         """On startup."""
+        connection = await self._connect()
+        if connection is None:
+            # Raised here, not in _connect: see AsyncpgDriver.__aenter__.
+            raise DatabaseConnectionError(UNREADABLE_DSN)
         try:
-            connection = self.connection = await connect(
-                self.connection_string,
-                **self.connection_kwargs,
-            )
             await connection.add_listener(
                 self.channel_name,
                 self._notification_handler,
@@ -283,6 +299,19 @@ class AsyncpgListenDriver(ListenDriver):
             connection.add_termination_listener(self._termination_handler)
         except Exception as error:
             raise DatabaseConnectionError(str(error)) from error
+
+    async def _connect(self) -> Optional[Connection]:
+        """Connect; ``None`` for a URI asyncpg would misread."""
+        if is_ambiguous_uri(self.connection_string):
+            return None
+        try:
+            connection = self.connection = await connect(
+                self.connection_string,
+                **self.connection_kwargs,
+            )
+        except Exception as error:
+            raise DatabaseConnectionError(str(error)) from error
+        return connection
 
     async def on_shutdown(self) -> None:
         """

@@ -19,6 +19,7 @@ from typing import (
 
 from psycopg import AsyncConnection, AsyncCursor, AsyncRawCursor
 from psycopg import Error as PsycopgError
+from psycopg.conninfo import conninfo_to_dict
 from psycopg.rows import DictRow, TupleRow, dict_row
 from psycopg_pool import AsyncConnectionPool
 from typing_extensions import LiteralString, Self
@@ -33,6 +34,7 @@ from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.drivers._schema import Session, start_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
+from taskiq_postgresql.utils.dsn import UNREADABLE_DSN, is_ambiguous_uri
 
 
 def sql(query: str) -> LiteralString:
@@ -54,6 +56,33 @@ def sql(query: str) -> LiteralString:
 
 
 _T = TypeVar("_T")
+
+
+def _is_readable(connection_string: str) -> bool:
+    """
+    Tell whether libpq can read ``connection_string``, saying nothing of why not.
+
+    libpq quotes part of the string it cannot parse, password included, and
+    psycopg_pool logs that message from its workers on every retry. Parsing
+    first, before any pool or connection exists, keeps it out of the log and
+    out of the exception chain. A ``%e9`` in a URI passes libpq and fails
+    psycopg's own decoding with a ``UnicodeDecodeError``, a ``ValueError``.
+
+    Args:
+        connection_string: the connection string the driver will connect with.
+
+    Returns:
+        ``False`` when the string cannot be parsed, or is a URI that libpq
+        would read differently from what was written.
+    """
+    if is_ambiguous_uri(connection_string):
+        return False
+    try:
+        conninfo_to_dict(connection_string)
+    except (PsycopgError, ValueError):
+        return False
+    return True
+
 
 # Seconds a wait woken up by shutting its socket down gets to end.
 _WAKE_UP_WITHIN = 1.0
@@ -205,6 +234,10 @@ class PsycopgDriver(QueryDriver):
     async def __aenter__(self) -> Self:
         """Enter the context manager."""
         if self.pool is None:
+            # Raised here, where only `self` is a local: a frame that held the
+            # string would hand it to an error tracker that captures locals.
+            if not _is_readable(self.connection_string):
+                raise DatabaseConnectionError(UNREADABLE_DSN)
             self.pool = AsyncConnectionPool(
                 self.connection_string,
                 kwargs={
@@ -423,6 +456,9 @@ class PsycopgListenDriver(ListenDriver):
 
     async def on_startup(self) -> None:
         """Connect and LISTEN on the channel."""
+        # Raised here, not in the check: see PsycopgDriver.__aenter__.
+        if not _is_readable(self.connection_string):
+            raise DatabaseConnectionError(UNREADABLE_DSN)
         try:
             connection = self.connection = await AsyncConnection.connect(
                 self.connection_string,
