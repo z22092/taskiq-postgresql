@@ -164,3 +164,27 @@ def test_the_broker_hands_a_claim_only_ids_its_table_can_hold(
 ) -> None:
     # The broker's id column is a SERIAL: 1 to 2147483647.
     assert _parse_message_id(payload) == message_id
+
+
+# Names every rule on identifiers keeps, so a deployment on them never needs to
+# rename a table. 48 bytes leaves room for the longest derived index name
+# (``_not_before_idx``) inside the 63 bytes PostgreSQL keeps of a name.
+KEPT_TABLE_NAMES = [
+    pytest.param("jobs$1", id="dollar"),
+    pytest.param("t" * 48, id="long_lower_case"),
+]
+
+
+@pytest.mark.parametrize("table_name", KEPT_TABLE_NAMES)
+@pytest.mark.parametrize(
+    "component",
+    [PostgresqlBroker, PostgresqlResultBackend, PostgresqlSchedulerSource],
+)
+def test_construction_accepts_the_table_names_deployments_rely_on(
+    component: Component,
+    table_name: str,
+    driver: str,
+) -> None:
+    built: Any = component(dsn=DSN, table_name=table_name, driver=driver)
+
+    assert built.table_name == table_name
