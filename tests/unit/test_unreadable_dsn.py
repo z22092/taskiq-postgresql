@@ -18,10 +18,19 @@ import pytest
 
 from taskiq_postgresql.abc.query import Column, PrimaryKeyColumn
 from taskiq_postgresql.exceptions import DatabaseConnectionError
-from taskiq_postgresql.utils.dsn import UNREADABLE_DSN, has_ambiguous_userinfo
 from tests.helpers import word
 
 Halves = tuple[str, str]
+
+
+def dsn_module() -> ModuleType:
+    """
+    The module this change adds names to, imported when a test runs.
+
+    Imported on call, so that against code without the change each test fails
+    on its own instead of the whole module failing to be collected.
+    """
+    return importlib.import_module("taskiq_postgresql.utils.dsn")
 
 
 def unquoted_space(a: str, b: str) -> str:
@@ -54,6 +63,43 @@ def two_ats(a: str, b: str) -> str:
     return f"postgresql://u:{a}@{b}@localhost/d"
 
 
+def upper_scheme_two_ats(a: str, b: str) -> str:
+    """The same URI as ``two_ats``, with the scheme in upper case."""
+    return f"POSTGRESQL://u:{a}@{b}@localhost/d"
+
+
+def slash_then_at(a: str, b: str) -> str:
+    """A password holding ``/``: the first half is read as the port."""
+    return f"postgresql://u:{a}/{b}@h/db"
+
+
+def upper_scheme_slash_then_at(a: str, b: str) -> str:
+    """The same URI as ``slash_then_at``, with a mixed-case scheme."""
+    return f"Postgres://u:{a}/{b}@h/db"
+
+
+def non_digit_port(a: str, b: str) -> str:
+    """A URI whose port is not made of digits."""
+    return f"postgresql://u@h:{a}{b}/d"
+
+
+def non_digit_port_among_hosts(a: str, b: str) -> str:
+    """A multi-host URI whose second port is not made of digits."""
+    return f"postgresql://u@h1:5432,h2:{a}{b}/d"
+
+
+# What the shared check refuses, whichever driver reads the string.
+SHARED = [
+    two_ats,
+    unencoded_slash,
+    slash_then_at,
+    upper_scheme_two_ats,
+    upper_scheme_slash_then_at,
+    non_digit_port,
+    non_digit_port_among_hosts,
+]
+
+
 def build_query(driver_class: Any, dsn: str) -> Any:
     """A query driver for ``dsn``; nothing connects until it is entered."""
     key = PrimaryKeyColumn()
@@ -75,20 +121,18 @@ SIDES = [
     ("psqlpy", "PsqlpyListenDriver", build_listen, "on_startup", "listen"),
 ]
 
-# What each parser refuses: asyncpg reads URLs only and does not decode a
-# percent escape strictly; psqlpy reads a URL's password up to the last "@"
-# and keeps a "/" in it, so only the strings it refuses are listed.
+# What each parser refuses on top of the shared check: asyncpg reads URLs
+# only and does not decode a percent escape strictly.
 UNREADABLE = {
-    "asyncpg": [unquoted_space, option_name, unencoded_slash, two_ats],
+    "asyncpg": [*SHARED],
     "psycopg": [
         unquoted_space,
         option_name,
         bad_percent_escape,
         percent_e9,
-        unencoded_slash,
-        two_ats,
+        *SHARED,
     ],
-    "psqlpy": [unquoted_space, option_name, two_ats],
+    "psqlpy": [unquoted_space, option_name, *SHARED],
 }
 
 READABLE = {
@@ -96,7 +140,9 @@ READABLE = {
     "multi-host-ports": "postgresql://u@h1:5432,h2:5433/d",
     "ipv6": "postgresql://u@[::1]:5432/d",
     "socket": "postgresql://u@%2Fvar%2Frun%2Fpostgresql/d",
-    "at-in-the-query": "postgresql://u@h/d?options=a@b",
+    "empty-port": "postgresql://u@h:/d",
+    # A query value may hold an "@", such as an e-mail in application_name.
+    "at-in-the-query": "postgresql://u@h/d?application_name=a@b",
 }
 KEY_VALUE = {
     "key-value": "host=localhost port=5432 dbname=d user=u",
@@ -166,7 +212,7 @@ async def test_when_the_string_cannot_be_read__then_the_error_is_fixed_and_empty
         await getattr(driver, method)()
 
     error = raised.value
-    assert UNREADABLE_DSN in str(error)
+    assert dsn_module().UNREADABLE_DSN in str(error)
     assert error.__cause__ is None
     assert error.__context__ is None
     assert_nothing_leaked(error, caplog, halves)
@@ -212,13 +258,13 @@ async def test_when_the_string_is_valid__then_the_query_drivers_build_their_pool
 
 
 @pytest.mark.parametrize("name", READABLE)
-def test_when_the_uri_is_valid__then_it_is_not_ambiguous(name: str) -> None:
-    assert not has_ambiguous_userinfo(READABLE[name])
+def test_when_the_uri_is_valid__then_it_is_not_refused(name: str) -> None:
+    assert not dsn_module().is_ambiguous_uri(READABLE[name])
 
 
 @pytest.mark.parametrize("name", KEY_VALUE)
 def test_a_key_value_string_is_never_ambiguous(name: str) -> None:
-    assert not has_ambiguous_userinfo(KEY_VALUE[name])
+    assert not dsn_module().is_ambiguous_uri(KEY_VALUE[name])
 
 
 @pytest.mark.parametrize("scheme", ["postgresql", "postgres"])
@@ -227,4 +273,47 @@ def test_when_the_authority_holds_two_ats__then_the_uri_is_ambiguous(
     scheme: str,
     userinfo: str,
 ) -> None:
-    assert has_ambiguous_userinfo(f"{scheme}://{userinfo}@h/d")
+    assert dsn_module().is_ambiguous_uri(f"{scheme}://{userinfo}@h/d")
+
+
+@pytest.mark.parametrize("scheme", ["POSTGRESQL", "Postgres"])
+def test_the_scheme_is_matched_in_any_case(scheme: str) -> None:
+    assert dsn_module().is_ambiguous_uri(f"{scheme}://u:x@y@h/d")
+
+
+@pytest.mark.parametrize("make_dsn", SHARED)
+def test_when_a_uri_is_ambiguous__then_the_shared_check_refuses_it(
+    make_dsn: Callable[[str, str], str],
+) -> None:
+    assert dsn_module().is_ambiguous_uri(make_dsn(word(), word()))
+
+
+@pytest.mark.anyio
+async def test_when_a_connection_option_is_wrong__then_its_own_error_is_kept() -> None:
+    # min_size > max_size fails inside asyncpg before it connects, and is not
+    # about the string, so it must not read as an unreadable one.
+    driver = build_query(
+        import_driver("asyncpg").AsyncpgDriver,
+        "postgresql://u@localhost/d",
+    )
+    driver.connection_kwargs.update(min_size=5, max_size=1)
+
+    with pytest.raises(DatabaseConnectionError) as raised:
+        await driver.__aenter__()
+
+    assert "min_size is greater than max_size" in str(raised.value)
+    assert dsn_module().UNREADABLE_DSN not in str(raised.value)
+
+
+@pytest.mark.anyio
+async def test_when_psqlpy_rejects_a_setting__then_its_own_error_is_kept() -> None:
+    driver = build_query(
+        import_driver("psqlpy").PsqlpyDriver,
+        "postgresql://u@localhost/d",
+    )
+    driver.connection_kwargs.update(max_db_pool_size=0)
+
+    with pytest.raises(Exception, match="Maximum database pool size") as raised:
+        await driver.__aenter__()
+
+    assert dsn_module().UNREADABLE_DSN not in str(raised.value)
