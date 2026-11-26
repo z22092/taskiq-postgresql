@@ -236,7 +236,9 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         """
         Delete results by date.
 
-        Both bounds are inclusive.
+        Both bounds are inclusive. Prefer time-zone-aware datetimes: a ``date``
+        counts as midnight at the start of that day, in a time zone that depends
+        on the driver, so ``to_date`` as a ``date`` keeps that day's results.
 
         Args:
             from_date (datetime | date): Delete results created at or after it.

@@ -184,6 +184,10 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         """
         Delete results by date.
 
+        Both bounds are inclusive. Prefer time-zone-aware datetimes: a ``date``
+        counts as midnight at the start of that day, in a time zone that depends
+        on the driver, so ``to_date`` as a ``date`` keeps that day's results.
+
         Args:
             from_date: delete the results created at or after it.
             to_date: delete only the results created at or before it; left out,

@@ -1,29 +1,8 @@
-from datetime import date, datetime
-from typing import Any, Optional, Sequence, Union
+from typing import Any, Optional, Sequence
 from uuid import UUID
 
 from taskiq_postgresql.abc.query import Column
 from taskiq_postgresql.drivers._json import dumps
-
-
-def date_bounds(
-    from_date: Union[datetime, date],
-    to_date: Optional[Union[datetime, date]],
-) -> list[Union[datetime, date]]:
-    """
-    Return the bind parameters of ``DeleteByDateQuery``.
-
-    Args:
-        from_date: the inclusive lower bound.
-        to_date: the inclusive upper bound, or ``None`` for none.
-
-    Returns:
-        One value without an upper bound, two with it, matching the query text
-        built with ``upper_bound=to_date is not None``.
-    """
-    if to_date is None:
-        return [from_date]
-    return [from_date, to_date]
 
 
 def encode_params(
