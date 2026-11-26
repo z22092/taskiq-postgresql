@@ -76,3 +76,26 @@ second time.
   change leaves `_schema` as it is: the tests describe their own tables.
 - `taskiq postgresql check --json` reports `not_null_columns` for each pending
   step, and `check` exits 3 while a column is still `NOT NULL`.
+
+## Update (2026-11-26)
+
+The first real use of the kind of step: step 2 of the result backend's table
+adds the `progress` column and makes `result` nullable. It is the first step
+that changes a column instead of only adding, so the rule above applies to a
+real table now, with the upgrade note it called for ("update every process
+that reads results first, then the workers", in the changelog). The original
+text stays as written; three of its statements moved with the code:
+
+- `DropNotNullQuery` is built in `taskiq_postgresql/core/sql/catalog/ddl.py`;
+  `taskiq_postgresql/abc/query.py` only re-exports it.
+- The relaxed column is carried by the table's declaration, not by
+  `_TableParts`: `TableDeclaration.steps` is an ordered list of
+  `DeclaredStep`, and a step's `nullable_columns` names the columns it relaxes.
+  `migrations._schema` makes them nullable in the final description only, so
+  step 1's `CREATE TABLE`, which `tests/golden/migration_steps.sql` pins, still
+  writes `result BYTEA NOT NULL`.
+- `run_migrations=True` runs each step through `_migrate` in
+  `core/stores/startup.py`, which builds a step's statements with the same
+  catalog function (`declared_step_statements`) that `migrations._schema` uses
+  for the description, instead of the drivers' `on_startup` running builders of
+  their own.

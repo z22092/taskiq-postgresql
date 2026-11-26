@@ -191,7 +191,8 @@ once, at startup, for all three components and all drivers; if it returns
 | `field_for_task_id` | `"VarChar"`, `"Text"` or `"Uuid"` | `"Uuid"` | SQL type of the `task_id` column. |
 | `serializer` | `TaskiqSerializer` or `None` | `None` | Result serializer; `None` means `PickleSerializer()`; see the note below before changing it. |
 | `driver` | `"asyncpg"`, `"psqlpy"` or `"psycopg"` | `"asyncpg"` | Database driver. |
-| `run_migrations` | `bool` | `False` | Create the table and index on startup. Off, startup only checks them; see [Check at startup](#check-at-startup). |
+| `run_migrations` | `bool` | `False` | Create the table and index on startup, and add the `progress` column and make `result` accept `NULL`. Off, startup only checks them; see [Check at startup](#check-at-startup). |
+| `store_progress` | `bool` | `True` | When `False`, `set_progress` writes nothing; reading progress and the table do not change. See [Task progress](#task-progress). |
 | `**connect_kwargs` | `Any` | none | Keyword arguments for the driver's connection pool. |
 
 Results are stored with pickle, and unpickling can run code. Treat the results
@@ -203,6 +204,62 @@ results table.
 Leave `serializer` unset. A result is a `TaskiqResult` object, and taskiq's
 `JSONSerializer` and `MSGPackSerializer` raise `TypeError` when asked to store
 one, so they cannot replace pickle here.
+
+### Task progress
+
+The result backend stores the progress that taskiq's `ProgressTracker` reports,
+in the `progress` column of the task's result row, so a client can read how far
+a task is while it runs:
+
+```python
+import os
+
+from taskiq import TaskiqDepends
+from taskiq.depends.progress_tracker import ProgressTracker, TaskState
+
+from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
+
+dsn = os.environ["POSTGRESQL_URL"]
+broker = PostgresqlBroker(dsn=dsn).with_result_backend(
+    PostgresqlResultBackend(dsn=dsn),
+)
+
+
+# A task asks for the tracker as a dependency; decorate it with @broker.task.
+async def import_rows(tracker: ProgressTracker[dict] = TaskiqDepends()) -> None:
+    await tracker.set_progress(TaskState.STARTED, {"done": 0})
+    await tracker.set_progress(TaskState.STARTED, {"done": 50})
+
+
+async def watch(task_id: str) -> None:
+    progress = await broker.result_backend.get_progress(task_id)
+    if progress is not None:
+        print(progress.state, progress.meta)
+```
+
+- Progress is JSON, whatever `serializer` is set, and `meta` must be JSON
+  serializable: `set_progress` raises `ValueError`, and writes nothing, when it
+  is not. A database never holds a pickle that a reader unpickles for it here.
+- `get_progress` returns `None` for a task with no row or no progress. A later
+  report replaces the earlier one.
+- A row may hold progress, a result or both, each written on its own: a result
+  never erases the progress, and the progress never erases a result. Only a row
+  with a result is a ready result. `is_result_ready` is `False` and
+  `get_result` raises `ResultIsMissingError` for a row that holds only
+  progress, and with `keep_results=False` the read leaves that row alone.
+  Reading a real result with `keep_results=False` deletes the row, progress
+  included.
+- `store_progress=False` makes `set_progress` do nothing. Reading, and the
+  table with its `progress` column, do not depend on it.
+
+Storing progress changes the results table (see
+[Database schema](#database-schema)), and a reader that does not know about
+progress takes a row that holds only progress for a ready result and fails.
+Upgrade every process that reads results (`wait_result`, `get_result`,
+`is_result_ready`) before any worker stores progress: first the SQL or one start
+with `run_migrations=True`, then the readers, then the workers, with
+`store_progress=False` on the workers' backend until every reader is upgraded.
+The changelog's "Upgrading from 0.4.x" has the whole list.
 
 ### PostgresqlSchedulerSource
 
@@ -447,7 +504,18 @@ CREATE TABLE IF NOT EXISTS taskiq_results (
     created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS taskiq_results_task_id_idx ON taskiq_results USING HASH (task_id);
+ALTER TABLE taskiq_results
+  ADD COLUMN IF NOT EXISTS progress BYTEA;
+ALTER TABLE taskiq_results ALTER COLUMN result DROP NOT NULL;
 ```
+
+`progress` holds the task's progress as JSON ([Task progress](#task-progress)),
+and `result` accepts `NULL` because a row can hold progress before it holds the
+result; a row with `result IS NULL` is not a ready result. Like the broker's
+columns, `progress` is added by `ALTER TABLE`, so a new table and one created
+by 0.4.x end up the same. `DROP NOT NULL` is the one statement of the package
+that changes a column instead of adding one, and it takes an
+`ACCESS EXCLUSIVE` lock on the table for a moment.
 
 The scheduler source (`taskiq_schedulers`):
 
@@ -477,6 +545,10 @@ and `USAGE` on its `taskiq_messages_id_seq` sequence. A worker needs `SELECT`,
 `UPDATE` and `DELETE` on the broker's table: `UPDATE` because the sweep locks
 the row it claims with `FOR UPDATE SKIP LOCKED`. A worker that also sends
 tasks, for example through `SmartRetryMiddleware`, needs both sets.
+
+A role that uses the result backend needs `SELECT`, `INSERT` and `UPDATE` on its
+table, and `DELETE` with `keep_results=False`. Storing progress needs nothing
+more than storing a result: both are one upsert, on different columns.
 
 ## Migrations
 
@@ -520,9 +592,10 @@ Only the script goes to standard output; messages go to standard error. The
 script starts with a comment that names the package version and the tables,
 then runs in one transaction: it sets a lock timeout for that transaction,
 takes, per table, the advisory lock `run_migrations=True` takes, then creates
-each table and index with `IF NOT EXISTS` and adds the broker's `channel` and
+each table and index with `IF NOT EXISTS`, adds the broker's `channel` and
 `not_before` columns and their index the same way, which also upgrades a
-broker table created by 0.4.x. The statements are the ones in
+broker table created by 0.4.x, and adds the results table's `progress` column
+and lets its `result` accept `NULL`. The statements are the ones in
 [Database schema](#database-schema), with your table names and
 `field_for_task_id`.
 
@@ -676,6 +749,10 @@ that 0.4.x created:
 ```text
 taskiq_messages is not ready and run_migrations is off: step 2 has not run (missing columns: channel, not_before; missing indexes: taskiq_messages_not_before_idx). Create what is missing with `taskiq postgresql migrate <module>:<object>`, with the SQL `taskiq postgresql plan <module>:<object>` prints, or with an Alembic revision (`alembic revision --autogenerate`); or start once with run_migrations=True.
 ```
+
+The same holds for a results table created before progress: its step 2 adds
+`progress` and relaxes `result`, so with `run_migrations=False` the backend
+refuses to start on it, whatever `store_progress` says, until the step has run.
 
 A missing index, or an index no step can fix (an invalid one, or one whose
 name another table took), logs a warning instead: the component works, if more
@@ -1186,6 +1263,11 @@ It is the only upgrade guide.
   created by 0.4.x and lacks the new columns. Start once with
   `run_migrations=True`, or run the SQL in "Upgrading from 0.4.x" of the
   changelog.
+- `ResultGetError` from `wait_result` or `get_result` for a task that reports
+  progress: a process that reads results still runs a release without progress,
+  which takes a row that holds only progress for a ready result. Update every
+  reader, and pass `store_progress=False` to the workers' backend until then
+  ([Task progress](#task-progress)).
 - `Fatal Python error: PyGILState_Release` when a process that used psqlpy
   exits: psqlpy occasionally aborts the interpreter at exit, after the work is
   done, which turns the exit code into an abort. It happens with psqlpy alone,

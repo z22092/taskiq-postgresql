@@ -20,19 +20,19 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | Path | What it holds |
 |---|---|
 | `taskiq_postgresql/broker.py` | Broker: INSERT, plus `NOTIFY` when due at once, on kick; `LISTEN` and a periodic sweep, each claiming with `DELETE ... RETURNING`, on listen; reopens a lost `LISTEN` connection |
-| `taskiq_postgresql/result_backend.py` | Result backend: upsert, select, delete of serialized results (pickle by default) |
+| `taskiq_postgresql/result_backend.py` | Result backend: upsert, select, delete of serialized results (pickle by default), and set and get of task progress (JSON, in its own column of the result row) |
 | `taskiq_postgresql/scheduler_source.py` | Schedule source: schedules stored as JSONB |
-| `taskiq_postgresql/core/sql/` | The SQL core. `identifier.py`: `Identifier` (the rule for a table or channel name, with its fold and its warning), `derived_names` and `check_table_names` (the derived names of a table, and the refusal of a clash) and `RESERVED_WORDS`; `statement.py`: `Statement` and `Script` (SQL text with the `ParamType` of each bind and result column); `catalog/` (a package: `base.py`, `columns.py`, `ddl.py`, `rows.py`, `locks.py`, `introspection.py`): every DDL statement, row query, the `pg_notify` statement, the `LISTEN` script and the catalog read, as builders over checked names; `check_table_objects` is the derived-name check callers use (it reads a table's declaration into `check_table_names`) |
+| `taskiq_postgresql/core/sql/` | The SQL core. `identifier.py`: `Identifier` (the rule for a table or channel name, with its fold and its warning), `derived_names` and `check_table_names` (the derived names of a table, and the refusal of a clash) and `RESERVED_WORDS`; `statement.py`: `Statement` and `Script` (SQL text with the `ParamType` of each bind and result column); `catalog/` (a package: `base.py`, `columns.py`, `ddl.py` (with `DeclaredStep`, one migration step after `CREATE TABLE`, and the one function that turns it into statements), `rows.py`, `locks.py`, `introspection.py`): every DDL statement, row query, the `pg_notify` statement, the `LISTEN` script and the catalog read, as builders over checked names; `check_table_objects` is the derived-name check callers use (it reads a table's declaration into `check_table_names`) |
 | `taskiq_postgresql/abc/query.py` | Re-exports the catalog's builders, so third-party drivers that import it keep working |
 | `taskiq_postgresql/migrations.py` | The tables described as columns and indexes (`TableSchema`) and as the ordered statements `on_startup` runs (`MigrationStep`, whose `objects` name what each step creates), built from a `TableDeclaration` by `declared_schema` and the catalog's builders; `render_sql`, `migration_statements`, `step_statements` (steps inside a tool's own transaction, their lock waits bounded by `scoped_lock_timeout`) and the migration formats registered under the `taskiq_postgresql.migration_formats` entry-point group, with the pipeline the file formats share (`render_steps` lays out each step as a `RenderedStep` after `check_comment`, `check_plain_identifier` and the option check) and `collect_schemas` and `parse_target` for targets; the comparison engine: `catalog_query` (one read-only catalog query, which `read_catalog` runs and reads), `CatalogState`, `plan_migration` (a `MigrationPlan` of `PendingStep` and `SchemaProblem`) |
 | `taskiq_postgresql/contrib/sqlalchemy.py`, `contrib/sqlmodel.py` | Extras `sqlalchemy` and `sqlmodel`: `add_taskiq_tables` and `taskiq_metadata` build SQLAlchemy `Table` objects from `TableSchema` and record the descriptions under `MetaData.info[METADATA_INFO_KEY]` |
 | `taskiq_postgresql/contrib/alembic.py` | Extra `alembic`: the autogenerate comparator `compare_taskiq_steps` (registered on import) and its `TaskiqStepOp`/`TaskiqStepNoopOp`, `upgrade_taskiq_tables` for hand-written revisions, `exclude_taskiq_tables` and the `alembic` migration format (`alembic_format`); each step bounds its own lock waits (`LOCK_TIMEOUT_OPTION`) |
-| `taskiq_postgresql/contrib/django/` | Extra `django`: the app `taskiq_postgresql.contrib.django` (label `taskiq_postgresql`, no models) whose `migrations/` hold one `RunTaskiqStep` per migration step (`operations.py`), the settings `TASKIQ_POSTGRESQL_TARGETS` and `TASKIQ_POSTGRESQL_LOCK_TIMEOUT` and their system check (`conf.py`); a new step needs a new migration file |
+| `taskiq_postgresql/contrib/django/` | Extra `django`: the app `taskiq_postgresql.contrib.django` (label `taskiq_postgresql`, no models) whose `migrations/` hold one `RunTaskiqStep` per migration step (`operations.py`), the settings `TASKIQ_POSTGRESQL_TARGETS` and `TASKIQ_POSTGRESQL_LOCK_TIMEOUT` and their system check (`conf.py`); a new step needs a new migration file, one per step and kind (`RunTaskiqStep(number, kind=...)`: step 2 of the broker and step 2 of the result backend are two steps) |
 | `taskiq_postgresql/contrib/django_format.py` | The `django` migration format (`django_format`), which imports no Django, so `generate --format django` needs no extra |
 | `taskiq_postgresql/cli.py` | `taskiq postgresql generate` (prints a migration script), `migrate` (creates the tables once), `plan` (prints the SQL one database still lacks) and `check` (reports it, exit 3 or 4), a `taskiq_cli` entry point |
 | `taskiq_postgresql/abc/driver.py` | `QueryDriver` and `ListenDriver` interfaces |
 | `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces; `_params.py` (bind parameters), `_health.py` (the `LISTEN` health check) are shared; each driver's `on_startup` runs `start_driver` from `core/stores/startup.py` on its own `Session` |
-| `taskiq_postgresql/core/stores/` | The layer between a component and its driver: a component calls only its store, and the store calls the `QueryDriver`. `declaration.py`: `TableDeclaration` (what a component hands its driver, and `of_driver` to read it back); `schema.py`: `build_driver`, `SchemaStore` (binds, starts, migrates and closes the driver; `TableStore` is the base the three data stores share; `schema_store` is how the CLI and `migrations.py` reach it) and `read_database`; `startup.py`: `start_table`, `start_driver` and `Session` (the one `on_startup` flow, the only core module the drivers import); `messages.py`: `MessageStore` (insert, NOTIFY, the two claims); `results.py`: `ResultStore` (set, exists, get, delete, delete by date); `schedules.py`: `ScheduleStore` (rows, add, delete). No module there imports a driver or `migrations` at module level |
+| `taskiq_postgresql/core/stores/` | The layer between a component and its driver: a component calls only its store, and the store calls the `QueryDriver`. `declaration.py`: `TableDeclaration` (what a component hands its driver, with the steps after `CREATE TABLE` as an ordered list, `steps`, and `of_driver` to read it back); `schema.py`: `build_driver`, `SchemaStore` (binds, starts, migrates and closes the driver; `TableStore` is the base the three data stores share; `schema_store` is how the CLI and `migrations.py` reach it) and `read_database`; `startup.py`: `start_table`, `start_driver` and `Session` (the one `on_startup` flow, the only core module the drivers import); `messages.py`: `MessageStore` (insert, NOTIFY, the two claims); `results.py`: `ResultStore` (set, exists, get, set and get progress, delete, delete by date); `schedules.py`: `ScheduleStore` (rows, add, delete). No module there imports a driver or `migrations` at module level |
 | `taskiq_postgresql/utils/` | Driver lookup by name, DSN helpers, optional-import checks |
 | `tests/` | Integration tests against a real PostgreSQL |
 | `tests/conftest.py`, `tests/helpers.py` | Fixtures (`postgresql_dsn`, drivers, teardown, `django_configured` and `django_db`, which import Django only when a test asks) and shared helpers: teardown, scratch databases, DSN and port utilities, the 0.4.x broker table, the expected bounded statements, catalogs and plans |
@@ -42,7 +42,9 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `tests/unit/` | Tests that need no database (SQL text, parameter shaping, wiring); `test_identifier.py`, `test_statement.py` and `test_catalog.py` cover the core/sql modules, `test_sql_source.py` fails on a `Statement` or `Script` built, or a string that starts with an upper-case SQL command word (`SELECT`, `CREATE`, `SET` ...), outside `core/sql/`, and a `# noqa: S608` written outside `core/sql/catalog/`; lower-case DML is ruff's S608, not that test's; `test_component_driver_calls.py` pins the driver calls each component makes (a recording driver), and `test_store_layering.py` fails when a component, `cli.py` or `migrations.py` reaches `.driver` outside the components' `driver` property |
 | `tests/test_sql_catalog.py`, `tests/test_components_names.py` | The catalog's declared types and names against a real server; the name rule, the warning and the NOTIFY of a mixed-case channel through each component |
 | `tests/test_migration_plan.py`, `tests/golden/migration_steps.sql` | The comparison engine against real catalogs, and the released steps, which must never change |
-| `tests/relax_schema.py`, `tests/unit/test_migration_relax.py`, `tests/unit/test_alembic_relax.py` | Test-only tables whose steps relax `NOT NULL` (no released step does), and the engine's and the Alembic comparator's handling of them without a database |
+| `tests/relax_schema.py`, `tests/unit/test_migration_relax.py`, `tests/unit/test_alembic_relax.py` | Test-only tables whose steps relax `NOT NULL` (the result backend's step 2 is the one real step that does), and the engine's and the Alembic comparator's handling of them without a database |
+| `tests/test_result_progress.py`, `tests/test_result_progress_migration.py` | Task progress in the result row on each driver (round trip, per-column upserts, a progress-only row, `keep_results`, JSON on disk), and step 2 of the results table on a table made by step 1 (startup, the step run twice, the check without `run_migrations`) |
+| `tests/unit/test_step_statements_kind.py` | `step_statements(kind=...)`, which the Django migrations use to run step 2 of one kind of table |
 | `tests/test_startup_check.py`, `tests/test_cli_plan.py` | The table check of `startup()` without `run_migrations`, and `taskiq postgresql plan` and `check`, against real catalogs |
 | `tests/test_contrib_*.py` | The SQLAlchemy, SQLModel, Alembic and Django integrations; the Alembic ones carry the `alembic` mark (`pytest -m alembic`), which CI also runs on the oldest Alembic the extra allows; the Django ones configure Django once per session with `settings.configure()` (no pytest-django) and point its default database at a database of their own |
 | `scripts/check_pins.py` | Checks that pins declared in several places agree |
@@ -116,24 +118,35 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
 - **Schema.** Tables are created with `CREATE TABLE IF NOT EXISTS` when
   `run_migrations=True`, so existing deployments keep their tables. Columns
   added later (the broker's `channel` and `not_before` and their index) come
-  from `AddColumnsQuery` with `ADD COLUMN IF NOT EXISTS`, so a table created by
-  an older release gets them too; DDL is additive, or relaxes `NOT NULL`
-  (`DropNotNullQuery`, a step's `StepObjects.nullable_columns`, ADR 0011);
-  nothing is removed or renamed. Changing a column is a schema change for
-  existing deployments; `tests/unit/test_components.py` and
+  from `AddColumnsQuery` with `ADD COLUMN IF NOT EXISTS`, so a table created
+  by an older release gets them too; DDL is additive, or relaxes `NOT NULL`
+  (`DropNotNullQuery`, a step's `StepObjects.nullable_columns`, ADR 0011: the
+  result backend's step 2 adds `progress` and relaxes `result`); nothing is
+  removed or renamed. A table's steps after `CREATE TABLE` are an ordered
+  list, `TableDeclaration.steps` of `DeclaredStep`, kept once on the driver as
+  `QueryDriver.steps` (`added_columns` and `added_indexes` are read from it),
+  so a later release adds one item to it. Each component defines its step once
+  (`result_backend.RESULTS_STEPS`, `broker.claim_step`), and one function in
+  `core/sql/catalog/` (`declared_step_statements`) builds each step's
+  statements for both `run_migrations=True` and `migrations.py`, which cannot
+  then differ. Changing a column is a schema change for existing deployments;
+  `tests/unit/test_components.py` and
   `tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql`
-  pin the current DDL. `migrations.py` builds its steps from the same builders,
-  and
+  pin the current DDL. `migrations.py` builds its steps from the same
+  builders, and
   `tests/test_migration_script.py::test_the_steps_are_the_sql_run_migrations_executes`
-  checks that they are the statements the drivers build for `on_startup`. The
+  and
+  `tests/unit/test_schema_store.py::test_a_table_is_migrated_with_the_statements_of_every_step`
+  check that they are the statements the drivers build for `on_startup`. The
   bundled drivers' `on_startup` is one flow (`start_table` in
-  `core/stores/startup.py`, reached through the component's store) that starts with the engine's one read-only catalog
-  query: with `run_migrations=True` it skips the lock and the DDL when no step
-  is pending; without it, it runs no DDL and raises `SchemaNotReadyError` when
-  a table or column is missing, or a column a step relaxes is still `NOT NULL`.
-  Both log what no step fixes. A driver without `component_kind` keeps the
-  `RelationsExistQuery` probe when it migrates. The migration's advisory lock
-  key (`MigrationLockQuery` in `core/sql/catalog/`) is a contract between releases;
+  `core/stores/startup.py`, reached through the component's store) that starts
+  with the engine's one read-only catalog query: with `run_migrations=True` it
+  skips the lock and the DDL when no step is pending; without it, it runs no
+  DDL and raises `SchemaNotReadyError` when a table or column is missing, or a
+  column a step relaxes is still `NOT NULL`. Both log what no step fixes. A
+  driver without `component_kind` keeps the `RelationsExistQuery` probe when
+  it migrates. The migration's advisory lock key (`MigrationLockQuery` in
+  `core/sql/catalog/`) is a contract between releases;
   `tests/test_migrations.py::test_migration_lock_key_is_pinned` pins it.
 - **Types.** `ty` checks `taskiq_postgresql/` at the Python 3.10 floor and must
   stay clean. Fix the code; a `# ty: ignore[<rule>]` is allowed only with a

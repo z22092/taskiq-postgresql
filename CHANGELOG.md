@@ -72,16 +72,61 @@ Upgrading from 0.4.x:
 - Downgrading to 0.4.x: the columns and the index can stay, 0.4.x ignores
   them. Delayed messages stored by this version and not delivered yet stay in
   the table, because 0.4.x delivers only the ids it is notified of.
+- The results table gets a `progress` column, and its `result` column stops
+  being `NOT NULL`, so that a row can hold the progress of a task before it
+  holds the result. With `run_migrations=True`, `startup()` adds the column and
+  relaxes the constraint, and so do `taskiq postgresql migrate` and the script
+  `taskiq postgresql generate` prints. Otherwise run this once per results
+  table before deploying (shown for the default `taskiq_results`):
+
+  ```sql
+  ALTER TABLE taskiq_results
+    ADD COLUMN IF NOT EXISTS progress BYTEA;
+  ALTER TABLE taskiq_results ALTER COLUMN result DROP NOT NULL;
+  ```
+
+  `taskiq postgresql plan` prints the same statements for your own table
+  names, and `taskiq postgresql check` tells whether they have run. This is the
+  first step that changes a column and does not only add: `ALTER COLUMN ...
+  DROP NOT NULL` takes an `ACCESS EXCLUSIVE` lock on the table for a moment,
+  and every query on it waits, so the steps bound the wait with `lock_timeout`
+  like the others. With `run_migrations=False`, a results table without them
+  makes `startup()` raise `SchemaNotReadyError`, whatever `store_progress` says.
+- Update every process that reads results (`wait_result`, `get_result`,
+  `is_result_ready`) together, before any worker stores progress. A reader of
+  0.4.x takes a row that holds only progress for a ready result and fails with
+  `ResultGetError`: the empty `result` cannot be unpickled. With
+  `keep_results=False` it is worse, because that reader deletes the row before
+  it fails, and the progress is lost. The order is: the SQL above, or one start
+  with `run_migrations=True`; then the readers; then the workers. Until every
+  reader runs this version, pass `store_progress=False` to the result backend
+  of the workers (the default is `True`), and remove it afterwards.
+- A query driver you wrote yourself (a `QueryDriver` subclass, passed in place
+  of the bundled one) must accept the new `not_null` argument in `select` and
+  `exists`. Without it, `get_result` and `is_result_ready` raise `TypeError`.
 
 ### Added
 
+- `PostgresqlResultBackend` stores the progress of a task, which taskiq's
+  `ProgressTracker` reports: `set_progress` writes it and `get_progress` reads
+  it, in the `progress` column of the task's result row, and a row may hold
+  progress, a result, or both, each written on its own. It is JSON, whatever
+  `serializer` is set, so a database never holds a pickle that a reader would
+  unpickle for it, and `meta` must be JSON serializable (`set_progress` raises
+  `ValueError`, and writes nothing, when it is not). `get_progress` returns
+  `None` for a task with no row or no progress. `store_progress=True`, the
+  default, is the new argument of the backend; `False` makes `set_progress` do
+  nothing, and reading and the table do not depend on it. With
+  `keep_results=False`, reading a result deletes the whole row, progress
+  included. See the upgrade notes above for the rolling deploy.
 - A migration step can now make a column nullable: `StepObjects` has a
   `nullable_columns` field, and `PendingStep` a `not_null_columns` field naming
   the columns of a pending step that are still `NOT NULL` (`taskiq postgresql
   check --json` reports it as `not_null_columns`). Such a step is `required`
   (`check` exits 3 while it is pending), and the Alembic integration leaves its
   `ALTER COLUMN ... DROP NOT NULL` to the step instead of proposing it twice.
-  No step of this release relaxes a column.
+  The result backend's step 2, which makes `result` nullable, is the first
+  step that does.
 - `taskiq_postgresql.migrations.catalog_state`, `catalog_tables` and
   `keep_table_schema`: the catalog read of `taskiq postgresql check` and the
   one-description-per-table rule the integrations share.
@@ -145,7 +190,8 @@ Upgrading from 0.4.x:
   describes each table once) and renders the script (`render_sql`), or its
   statements one by one (`migration_statements`, which stops after a given
   step with `through=N`; `step_statements`, which also bounds their lock waits
-  inside a transaction they share), for tools that build their own
+  inside a transaction they share and takes `kind=` to run a step for one
+  component's tables only), for tools that build their own
   migrations. Other packages can add output formats to `generate --format`
   through the `taskiq_postgresql.migration_formats` entry point group; the
   README has the contract. A format that writes another tool's migration file
@@ -206,8 +252,8 @@ Upgrading from 0.4.x:
   components in `TASKIQ_POSTGRESQL_TARGETS`, as `module:object` paths or as
   dicts such as `{"kind": "broker", "table_name": "jobs"}`:
   `manage.py migrate taskiq_postgresql` then creates their tables with the SQL
-  `run_migrations=True` runs, one migration per migration step, each in its
-  transaction with the advisory lock and a lock timeout
+  `run_migrations=True` runs, one migration per migration step and kind of
+  table, each in its transaction with the advisory lock and a lock timeout
   (`TASKIQ_POSTGRESQL_LOCK_TIMEOUT`, 10 seconds by default, `0` for none),
   after which the transaction gets its own `lock_timeout` back. The
   migrations read the settings when they run: missing or empty settings, or a
@@ -299,7 +345,20 @@ Upgrading from 0.4.x:
 - `taskiq_postgresql.abc.query` still exports the same builders with the same
   SQL; they now live in `taskiq_postgresql.core.sql.catalog`, and a builder
   refuses a table name the rule refuses. A third-party driver built on
-  `QueryDriver` needs no change.
+  `QueryDriver` needs no change for the builders alone; see the next two
+  entries for what changed in the driver's own methods.
+- **BREAKING:** the results table's `result` column accepts `NULL`, and a row
+  that holds only progress is not a ready result: `is_result_ready` is `False`
+  for it, `get_result` raises `ResultIsMissingError` and, with
+  `keep_results=False`, leaves the row where it is. A release that does not
+  know about progress reads such a row as a ready result: update the readers
+  first, as the upgrade notes above say.
+- **BREAKING:** `QueryDriver.select` and `QueryDriver.exists` take a `not_null`
+  argument, the columns that must not be `NULL` for a row to count; the result
+  backend passes `result`. A query driver you wrote yourself must accept it.
+  `SelectQuery.make_query`, `SelectQuery.statement`, `ExistsQuery.make_query`
+  and `ExistsQuery.statement` take it too and write the text they always wrote
+  without it.
 - **BREAKING:** with `run_migrations=False` (the default), `startup()` checks
   the component's table before anything else starts. It reads the catalog in
   one read-only query, through the component's own pool, and runs no DDL. When
