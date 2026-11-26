@@ -255,8 +255,8 @@ class Identifier:
         if warn and folded != value:
             warnings.warn(
                 f"{what} {value!r} has upper case letters; PostgreSQL folds it "
-                f"to {folded!r}, which the package now uses. Configure "
-                f"{folded!r}: mixed case will be refused in a later release.",
+                f"to {folded!r}, the name the table or channel really has. "
+                f"Configure {folded!r}.",
                 DeprecationWarning,
                 stacklevel=stacklevel,
             )
