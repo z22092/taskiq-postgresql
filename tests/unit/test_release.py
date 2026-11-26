@@ -725,4 +725,7 @@ def test_when_a_recipe_is_read__then_no_release_variable_is_pasted_into_it() -> 
     ]
     pasted = re.compile(r"\$\((?:VERSION|SOURCE|DATE|ALLOW_MISMATCH)\)")
 
+    # The release recipes exist and read the shell variable, so the check
+    # below cannot pass on a Makefile that has no release target at all.
+    assert any('--version "$$VERSION"' in line for line in recipes)
     assert [line for line in recipes if pasted.search(line)] == []
