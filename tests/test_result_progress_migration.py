@@ -8,6 +8,7 @@ component that does not migrate refuses to start on it until it has run.
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from typing import AsyncGenerator
 
@@ -127,7 +128,9 @@ async def test_migrating_adds_progress_and_lets_result_be_null(
     await start(backend_of(postgresql_dsn, table, driver, run_migrations=True))
 
     assert await columns_of(postgresql_dsn, table) == AT_STEP_2
-    assert plan_of(postgresql_dsn, [schema_of(table)]).is_current
+    # plan_of runs its own event loop, so it runs in a thread here.
+    plan = await asyncio.to_thread(plan_of, postgresql_dsn, [schema_of(table)])
+    assert plan.is_current
     # The row an older release wrote is kept, a ready result with no progress.
     (row,) = await fetch_on_server(
         postgresql_dsn,
