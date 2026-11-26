@@ -136,7 +136,7 @@ pins the `CREATE TABLE` and hash index DDL below, and
 added columns and their index.
 
 The three drivers' `on_startup` is one flow, `start_table` in
-`core/stores/schema.py` (a component starts it through its store, which calls
+`core/stores/startup.py` (a component starts it through its store, which calls
 `on_startup`); each driver lends it only its primitives, a `Session`
 (fetch one value, execute a statement or a script) on one pooled connection in
 one transaction. With `run_migrations` it first reads the catalog with the

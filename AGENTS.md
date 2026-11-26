@@ -31,8 +31,8 @@ as extras: `asyncpg`, `psqlpy` and `psycopg`.
 | `taskiq_postgresql/contrib/django_format.py` | The `django` migration format (`django_format`), which imports no Django, so `generate --format django` needs no extra |
 | `taskiq_postgresql/cli.py` | `taskiq postgresql generate` (prints a migration script), `migrate` (creates the tables once), `plan` (prints the SQL one database still lacks) and `check` (reports it, exit 3 or 4), a `taskiq_cli` entry point |
 | `taskiq_postgresql/abc/driver.py` | `QueryDriver` and `ListenDriver` interfaces |
-| `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces; `_params.py` (bind parameters), `_health.py` (the `LISTEN` health check) are shared; each driver's `on_startup` runs `start_driver` from `core/stores/schema.py` on its own `Session` |
-| `taskiq_postgresql/core/stores/` | The layer between a component and its driver: a component calls only its store, and the store calls the `QueryDriver`. `declaration.py`: `TableDeclaration` (what a component hands its driver, and `of_driver` to read it back); `schema.py`: `SchemaStore` (builds, binds, starts, migrates and closes the driver; `schema_store` is how the CLI and `migrations.py` reach it), `read_database`, and `start_table`, `start_driver`, `Session` (the one `on_startup` flow); `messages.py`: `MessageStore` (insert, NOTIFY, the two claims); `results.py`: `ResultStore` (set, exists, get, delete, delete by date); `schedules.py`: `ScheduleStore` (rows, add, delete). No module there imports a driver or `migrations` at module level |
+| `taskiq_postgresql/drivers/` | One module per driver, each implementing both interfaces; `_params.py` (bind parameters), `_health.py` (the `LISTEN` health check) are shared; each driver's `on_startup` runs `start_driver` from `core/stores/startup.py` on its own `Session` |
+| `taskiq_postgresql/core/stores/` | The layer between a component and its driver: a component calls only its store, and the store calls the `QueryDriver`. `declaration.py`: `TableDeclaration` (what a component hands its driver, and `of_driver` to read it back); `schema.py`: `build_driver`, `SchemaStore` (binds, starts, migrates and closes the driver; `schema_store` is how the CLI and `migrations.py` reach it) and `read_database`; `startup.py`: `start_table`, `start_driver` and `Session` (the one `on_startup` flow, the only core module the drivers import); `messages.py`: `MessageStore` (insert, NOTIFY, the two claims); `results.py`: `ResultStore` (set, exists, get, delete, delete by date); `schedules.py`: `ScheduleStore` (rows, add, delete). No module there imports a driver or `migrations` at module level |
 | `taskiq_postgresql/utils/` | Driver lookup by name, DSN helpers, optional-import checks |
 | `tests/` | Integration tests against a real PostgreSQL |
 | `tests/conftest.py`, `tests/helpers.py` | Fixtures (`postgresql_dsn`, drivers, teardown, `django_configured` and `django_db`, which import Django only when a test asks) and shared helpers: teardown, scratch databases, DSN and port utilities, the 0.4.x broker table, the expected bounded statements, catalogs and plans |
@@ -127,7 +127,7 @@ suite. Raise `fail_under` when coverage rises; never lower it to pass.
   `tests/test_migration_script.py::test_the_steps_are_the_sql_run_migrations_executes`
   checks that they are the statements the drivers build for `on_startup`. The
   bundled drivers' `on_startup` is one flow (`start_table` in
-  `core/stores/schema.py`, reached through the component's store) that starts with the engine's one read-only catalog
+  `core/stores/startup.py`, reached through the component's store) that starts with the engine's one read-only catalog
   query: with `run_migrations=True` it skips the lock and the DDL when no step
   is pending; without it, it runs no DDL and raises `SchemaNotReadyError` when
   a table or column is missing, or a column a step relaxes is still `NOT NULL`.

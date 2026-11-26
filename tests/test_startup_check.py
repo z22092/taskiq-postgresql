@@ -19,7 +19,7 @@ import asyncpg
 import pytest
 
 from taskiq_postgresql import exceptions
-from taskiq_postgresql.core.stores import schema as stores_schema
+from taskiq_postgresql.core.stores import startup as stores_startup
 from taskiq_postgresql.migrations import CatalogState, render_sql, table_schema
 from tests.helpers import (
     Component,
@@ -252,7 +252,7 @@ async def test_a_step_that_relaxes_not_null_stops_a_component_until_it_has_run(
     schema = relaxing_schema(postgres_table)
     # No released step relaxes a column, so the component checks a table that
     # a test describes: the flow is the one every component runs.
-    monkeypatch.setattr(stores_schema, "described_table", lambda _driver: schema)
+    monkeypatch.setattr(stores_startup, "described_table", lambda _driver: schema)
     await run_script(postgresql_dsn, driver, script_of(schema.steps[0].statements))
 
     component = build("result_backend", postgresql_dsn, postgres_table, driver)

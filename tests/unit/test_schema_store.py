@@ -27,11 +27,10 @@ from taskiq_postgresql.core.stores import schema as schema_module
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
 from taskiq_postgresql.core.stores.schema import (
     SchemaStore,
-    Session,
     read_database,
     schema_store,
-    start_table,
 )
+from taskiq_postgresql.core.stores.startup import Session, start_table
 
 DSN = "postgresql://postgres@localhost:5432/postgres"
 OTHER_DSN = "postgresql://postgres@localhost:5432/other"
