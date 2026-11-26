@@ -268,6 +268,35 @@ def index_relation_name(table: Identifier, column: str) -> str:
     return truncate(f"{table.name}_{column}_idx")
 
 
+def derived_names(
+    table: Identifier,
+    *,
+    index_names: Iterable[str],
+    serial_column: Optional[str],
+) -> tuple[tuple[str, str], ...]:
+    """
+    Return the names PostgreSQL gives the objects of a table, kind first.
+
+    Args:
+        table: The checked table name.
+        index_names: Index names as the package writes them, with the
+            configured case; each is folded and then cut here.
+        serial_column: The ``SERIAL`` column, or None when there is none.
+
+    Returns:
+        ``(kind, name)`` pairs: the table, each index, the primary key's
+        index and, with a ``SERIAL`` column, its sequence.
+    """
+    named: list[tuple[str, str]] = [("table", table.name)]
+    named.extend(("index", truncate(fold(name))) for name in index_names)
+    named.append(("primary key", object_name(table.name, None, "pkey")))
+    if serial_column is not None:
+        named.append(
+            ("sequence", object_name(table.name, serial_column, "seq")),
+        )
+    return tuple(named)
+
+
 def check_table_names(
     table: Identifier,
     *,
@@ -289,13 +318,11 @@ def check_table_names(
     Raises:
         IdentifierError: Two of the names, the table name included, are equal.
     """
-    named: list[tuple[str, str]] = [("table", table.name)]
-    named.extend(("index", truncate(fold(name))) for name in index_names)
-    named.append(("primary key", object_name(table.name, None, "pkey")))
-    if serial_column is not None:
-        named.append(
-            ("sequence", object_name(table.name, serial_column, "seq")),
-        )
+    named = derived_names(
+        table,
+        index_names=index_names,
+        serial_column=serial_column,
+    )
     clashes = [
         f"{excerpt(first[1])} ({first[0]}) and {excerpt(second[1])} ({second[0]})"
         for position, first in enumerate(named)
