@@ -38,7 +38,9 @@ from taskiq_postgresql.core.sql.catalog import (
     NotBeforeColumn,
     PrimaryKeyColumn,
     index_name,
+    notify_statement,
 )
+from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
@@ -300,6 +302,13 @@ class PostgresqlBroker(AsyncBroker):
                 ``query_timeout`` is not a finite number of seconds above \
                 zero.
         """
+        # stacklevel 3: the warning points at the line that built the broker.
+        Identifier.parse(table_name, what="table name", stacklevel=3)
+        self._channel: Identifier = Identifier.parse(
+            channel_name,
+            what="channel name",
+            stacklevel=3,
+        )
         dsn = require_dsn(dsn, type(self).__name__)
         self.poll_interval: float = _parse_seconds(poll_interval, "poll_interval")
         self.health_check_interval: float = _parse_seconds(
@@ -369,7 +378,7 @@ class PostgresqlBroker(AsyncBroker):
         )
         self.listen_driver: ListenDriver = get_db_listen_driver(driver)(
             connection_string=dsn_before_startup(dsn),
-            channel_name=self.channel_name,
+            channel_name=self._channel.name,
             **self.connection_kwargs,
         )
         self._configure_drivers()
@@ -500,7 +509,12 @@ class PostgresqlBroker(AsyncBroker):
     async def _send_notification(self, message_id: int) -> None:
         """Send a notification with the message ID as payload."""
         try:
-            await self.driver.execute(f"NOTIFY {self.channel_name}, '{message_id}'")
+            statement = notify_statement()
+            await self.driver.execute(
+                statement.text,
+                self._channel.name,
+                str(message_id),
+            )
         except Exception as error:
             # The row is committed and the sweep delivers it: raising would
             # make a caller that retries send the task twice.

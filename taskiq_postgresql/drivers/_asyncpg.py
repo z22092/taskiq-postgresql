@@ -12,7 +12,13 @@ from asyncpg import Connection, Pool, connect, create_pool
 from typing_extensions import Self
 
 from taskiq_postgresql.abc.driver import ListenDriver, QueryDriver
-from taskiq_postgresql.abc.query import AddedIndex, Column
+from taskiq_postgresql.core.sql.catalog import (
+    AddedIndex,
+    Column,
+    exists_statement,
+    listen_script,
+)
+from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.drivers._health import check_listen
 from taskiq_postgresql.drivers._params import encode_params
 from taskiq_postgresql.drivers._schema import Session, start_table
@@ -189,7 +195,7 @@ class AsyncpgDriver(QueryDriver):
         """Check if a row exists in a table."""
         async with self, self.connection() as connection:
             return await connection.fetchval(
-                self.select_query.make_query([Column("1", "")], [self.primary_key]),
+                exists_statement(self.table_name, self.primary_key).text,
                 id,
             )
 
@@ -241,11 +247,6 @@ class AsyncpgDriver(QueryDriver):
             return await connection.fetch(query, *values)
 
 
-def _quote_ident(name: str) -> str:
-    """Quote ``name`` as asyncpg's add_listener() does, so LISTEN reads the same."""
-    return '"' + name.replace('"', '""') + '"'
-
-
 async def _terminate(connection: Connection) -> None:
     """Abort ``connection`` without waiting on a server that stopped answering."""
     connection.terminate()
@@ -261,9 +262,12 @@ class AsyncpgListenDriver(ListenDriver):
         **connection_kwargs: Any,
     ) -> None:
         """Initialize the listen driver."""
-        super().__init__(connection_string, channel_name, **connection_kwargs)
+        # The folded name: add_listener() quotes what it is given, so only the
+        # name PostgreSQL folds an unquoted LISTEN to receives the NOTIFY.
+        channel = Identifier.parse(channel_name, what="channel name", warn=False)
+        super().__init__(connection_string, channel.name, **connection_kwargs)
         self.connection: Optional[Connection] = None
-        self._listen_statement = f"LISTEN {_quote_ident(channel_name)}"
+        self._listen_statement = listen_script(channel).text
         # None: a connection closed, see _termination_handler.
         self._queue: AsyncQueue[Optional[str]] = AsyncQueue()
 

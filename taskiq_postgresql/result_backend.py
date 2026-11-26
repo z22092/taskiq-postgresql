@@ -8,6 +8,7 @@ from taskiq.serializers.pickle import PickleSerializer
 
 from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.core.sql.catalog import Column, PrimaryKeyColumn
+from taskiq_postgresql.core.sql.identifier import Identifier
 from taskiq_postgresql.exceptions import ResultIsMissingError
 from taskiq_postgresql.utils import (
     Dsn,
@@ -66,6 +67,8 @@ class PostgresqlResultBackend(AsyncResultBackend[_ReturnType]):
         Raises:
             TypeError: if ``dsn`` is ``None``, empty or blank.
         """
+        # stacklevel 3: the warning points at the line that built the backend.
+        Identifier.parse(table_name, what="table name", stacklevel=3)
         dsn = require_dsn(dsn, type(self).__name__)
         self._dsn: Final[Dsn] = dsn
         self.keep_results: Final = keep_results

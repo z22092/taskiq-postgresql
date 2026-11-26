@@ -507,10 +507,18 @@ async def test_a_refused_length_collides_as_predicted(
     connection: asyncpg.Connection,
     family: Family,
     size: int,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The builders accept the name; the server loses the index the check predicts."""
+    """Without the check the server loses the index the check predicts."""
     table = _table_of_length(family, size)
-    component = family.build(table)
+    # The component refuses this name at construction; the check is switched
+    # off for the build only, to run the DDL it would otherwise stop.
+    with monkeypatch.context() as unchecked:
+        unchecked.setattr(
+            "taskiq_postgresql.abc.driver.check_table_names",
+            lambda *args, **kwargs: None,
+        )
+        component = family.build(table)
     driver = component.driver
     declared = _declared_indexes(component)
     identifier = Identifier.parse(table, what="table name", warn=False)

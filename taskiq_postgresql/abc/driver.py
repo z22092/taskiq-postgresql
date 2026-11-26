@@ -19,7 +19,9 @@ from taskiq_postgresql.core.sql.catalog import (
     MigrationLockQuery,
     RelationsExistQuery,
     SelectQuery,
+    index_name,
 )
+from taskiq_postgresql.core.sql.identifier import Identifier, check_table_names
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 
 if TYPE_CHECKING:
@@ -92,6 +94,10 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         ``CREATE TABLE``: ``on_startup`` adds them last, so a table created by
         an older release gets them too.
         """
+        # A component warns about a mixed-case name where the user wrote it;
+        # here the name is only checked, so a driver built on its own, or by
+        # a third party, gets the same refusals without a second warning.
+        table = Identifier.parse(table_name, what="table name", warn=False)
         self.connection_string = connection_string
         self.table_name = table_name
         self.columns = columns
@@ -101,6 +107,24 @@ class QueryDriver(_ConnectionStringHolder, ABC):
         self.added_columns = added_columns
         self.added_indexes = added_indexes
         self.connection_kwargs = connection_kwargs
+        # The same inputs as migrations._schema: CREATE INDEX IF NOT EXISTS
+        # skips an index whose cut name already exists, so a collision would
+        # lose an index without an error.
+        check_table_names(
+            table,
+            index_names=[
+                *(index_name(table_name, column) for column in index_columns or ()),
+                *(index.name for index in added_indexes),
+            ],
+            serial_column=next(
+                (
+                    column.name
+                    for column in (self.primary_key, *columns, self.created_at)
+                    if column.type.upper() == "SERIAL"
+                ),
+                None,
+            ),
+        )
 
         self.create_table_query = CreateTableQuery(
             self.table_name,
