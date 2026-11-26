@@ -653,7 +653,7 @@ def test_callback_module__sees_through_partials_and_bound_methods() -> None:
         "taskiq_postgresql.broker",
         "taskiq_postgresql.broker",
         "taskiq_postgresql.broker",
-        "taskiq_postgresql.core.sql.catalog",
+        "taskiq_postgresql.core.sql.catalog.columns",
     ]
     # A callback of asyncio or of the builtins stays theirs.
     assert callback_module(print) == "builtins"
