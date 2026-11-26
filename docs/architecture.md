@@ -22,6 +22,16 @@ at construction, so creating one never opens a connection.
 | `PostgresqlResultBackend` | `taskiq_postgresql/result_backend.py` | `AsyncResultBackend` | `taskiq_results` |
 | `PostgresqlSchedulerSource` | `taskiq_postgresql/scheduler_source.py` | `ScheduleSource` | `taskiq_schedulers` |
 
+A component does not call its driver directly: it holds a store from
+`taskiq_postgresql/core/stores/` (`MessageStore`, `ResultStore`,
+`ScheduleStore`), which calls the `QueryDriver`. The layers are component,
+store, driver. Each component has its own `SchemaStore`, which keeps the
+component's `TableDeclaration` and runs its driver's startup and shutdown;
+`build_driver` makes the driver from that declaration. The CLI and
+`migrations.py` reach the component's `SchemaStore` through `schema_store`, so
+they too never read `component.driver`. A test that reads the source keeps the
+boundary.
+
 Every component takes a `dsn` (a string, or a callable returning one) and a
 `driver` name. The DSN helpers live in `utils/dsn.py`: `require_dsn` rejects
 `None`, an empty or blank string, or a value that is neither a string nor a
@@ -127,7 +137,8 @@ pins the `CREATE TABLE` and hash index DDL below, and
 added columns and their index.
 
 The three drivers' `on_startup` is one flow, `start_table` in
-`drivers/_schema.py`; each driver lends it only its primitives, a `Session`
+`core/stores/startup.py` (a component starts it through its store, which calls
+`on_startup`); each driver lends it only its primitives, a `Session`
 (fetch one value, execute a statement or a script) on one pooled connection in
 one transaction. With `run_migrations` it first reads the catalog with the
 comparison engine described below (`read_catalog`, then `plan_migration`); if
@@ -146,8 +157,8 @@ Without `run_migrations`, `on_startup` runs the same catalog query through
 or a problem the components cannot work with, raises `SchemaNotReadyError`,
 which names the table, the steps, the missing columns and indexes, and, when
 a step is what is missing, the commands that run it (`HOW_TO_MIGRATE`); a
-missing index, or an index no step can fix, is logged as a warning. The driver
-describes its table from its own builders and `QueryDriver.component_kind`
+missing index, or an index no step can fix, is logged as a warning. The flow
+describes the table from the driver's declaration and `QueryDriver.component_kind`
 (`table_schema(driver)`), which each component sets at construction and again
 in `startup()`. A driver no component owns cannot describe its table: without
 `run_migrations` it checks nothing, and with it it keeps the probe of the
@@ -165,8 +176,8 @@ so that a run against a live database fails instead of queueing behind open
 transactions. `taskiq postgresql migrate` runs the migration of
 `run_migrations=True` once. `taskiq postgresql plan` and `check` read one
 database's catalog, in one `SELECT` that also returns `current_database()`
-and `current_schemas(false)`, through the driver of a component (or a
-throwaway one with `--component`): `plan` prints `MigrationPlan.render_sql`
+and `current_schemas(false)`, through the schema store of a component (or a
+throwaway catalog driver with `--component`; `read_database`): `plan` prints `MigrationPlan.render_sql`
 with a comment naming that database, or hands the tables cut down to their
 pending steps (`MigrationPlan.pending_schemas`) to another format, and the same
 comment, as the file's first line, to any format that declares a keyword-only

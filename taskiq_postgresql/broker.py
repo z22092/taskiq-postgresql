@@ -13,6 +13,7 @@ from asyncio import (
 )
 from asyncio import Queue as AsyncQueue
 from asyncio import TimeoutError as AsyncTimeoutError
+from collections.abc import Awaitable
 from contextlib import suppress
 from dataclasses import dataclass
 from logging import getLogger
@@ -30,21 +31,20 @@ from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessag
 from taskiq_postgresql.abc.driver import ListenDriver
 from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
-    ClaimByIdQuery,
     ClaimColumns,
-    ClaimDueQuery,
     Column,
     CreatedAtColumn,
     NotBeforeColumn,
     PrimaryKeyColumn,
     index_name,
-    notify_statement,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier, excerpt
+from taskiq_postgresql.core.stores.declaration import TableDeclaration
+from taskiq_postgresql.core.stores.messages import MessageStore
+from taskiq_postgresql.core.stores.schema import SchemaStore, build_driver
 from taskiq_postgresql.utils import (
     Dsn,
     dsn_before_startup,
-    get_db_driver,
     get_db_listen_driver,
     require_dsn,
     resolve_dsn,
@@ -331,19 +331,17 @@ class PostgresqlBroker(AsyncBroker):
             not_before=self.columns.not_before,
         )
 
-        self.driver = get_db_driver(driver)(
-            connection_string=dsn_before_startup(dsn),
-            table_name=table,
+        declaration = TableDeclaration(
+            table=table,
+            primary_key=self.columns.primary_key,
             columns=[
                 self.columns.task_id,
                 self.columns.task_name,
                 self.columns.message,
                 self.columns.labels,
             ],
-            primary_key=self.columns.primary_key,
             created_at=self.columns.created_at,
             index_columns=[self.columns.primary_key],
-            run_migrations=run_migrations,
             added_columns=claim_columns,
             added_indexes=[
                 AddedIndex(
@@ -351,19 +349,22 @@ class PostgresqlBroker(AsyncBroker):
                     columns=[*claim_columns, self.columns.primary_key],
                 ),
             ],
+        )
+        self.driver = build_driver(
+            "broker",
+            declaration,
+            driver,
+            dsn_before_startup(dsn),
+            run_migrations=run_migrations,
             **self.connection_kwargs,
         )
-        returning = [self.columns.message]
-        self._claim_due_query = ClaimDueQuery(table).make_query(
-            self.columns.primary_key,
-            claim_columns,
-            returning,
+        self._store = MessageStore(
+            SchemaStore("broker", declaration, lambda: self.driver),
+            self.columns,
         )
-        self._claim_by_id_query = ClaimByIdQuery(table).make_query(
-            self.columns.primary_key,
-            claim_columns,
-            returning,
-        )
+        # The text of the claims, which tests read.
+        self._claim_due_query = self._store.claim_due_statement.text
+        self._claim_by_id_query = self._store.claim_by_id_statement.text
         self.listen_driver: ListenDriver = get_db_listen_driver(driver)(
             connection_string=dsn_before_startup(dsn),
             channel_name=self._channel,
@@ -372,11 +373,10 @@ class PostgresqlBroker(AsyncBroker):
         self._configure_drivers()
 
     def _configure_drivers(self) -> None:
-        """Hand the recovery settings, and the kind of the table, to the drivers."""
+        """Hand the recovery settings to the drivers."""
         # Attributes, not constructor arguments: the bundled drivers pass every
         # keyword argument on to the connection.
-        self.driver.component_kind = "broker"
-        self.driver.query_timeout = self.query_timeout
+        self._store.configure(self.query_timeout)
         self.listen_driver.health_check_interval = self.health_check_interval
         self.listen_driver.query_timeout = self.query_timeout
 
@@ -402,13 +402,13 @@ class PostgresqlBroker(AsyncBroker):
         """
         # Resolved once, so both drivers connect to the same server.
         dsn = self.dsn
-        self.driver.connection_string = dsn
+        self._store.bind(dsn)
         self.listen_driver.connection_string = dsn
         # Again here, for drivers swapped in after the constructor.
         self._configure_drivers()
         await super().startup()
 
-        await self.driver.on_startup()
+        await self._store.start()
         await self.listen_driver.on_startup()
         self._stopping = Event()
 
@@ -424,7 +424,7 @@ class PostgresqlBroker(AsyncBroker):
         # query_timeout, not two; closing the LISTEN socket also ends a health
         # check the reader may still be waiting on.
         closed = await gather(
-            self._close(self.driver.on_shutdown()),
+            self._close(self._store.close()),
             self._close(self.listen_driver.on_shutdown()),
             return_exceptions=True,
         )
@@ -467,26 +467,10 @@ class PostgresqlBroker(AsyncBroker):
         delay_value = message.labels.get("delay")
         delay_seconds = 0.0 if delay_value is None else _parse_delay(delay_value)
 
-        message_inserted_id = await self.driver.insert(
-            [
-                self.columns.task_id,
-                self.columns.task_name,
-                self.columns.message,
-                self.columns.labels,
-                self.columns.channel,
-                self.columns.not_before,
-            ],
-            [
-                message.task_id,
-                message.task_name,
-                message.message,
-                message.labels,
-                self.channel_name,
-                delay_seconds,
-            ],
-            [
-                self.columns.primary_key,
-            ],
+        message_inserted_id = await self._store.insert(
+            message,
+            self.channel_name,
+            delay_seconds,
         )
 
         # No NOTIFY for a delayed message: a 0.4.x worker claims any id it is
@@ -497,12 +481,7 @@ class PostgresqlBroker(AsyncBroker):
     async def _send_notification(self, message_id: int) -> None:
         """Send a notification with the message ID as payload."""
         try:
-            statement = notify_statement()
-            await self.driver.execute(
-                statement.text,
-                self._channel.name,
-                str(message_id),
-            )
+            await self._store.notify(self._channel, message_id)
         except Exception as error:
             # The row is committed and the sweep delivers it: raising would
             # make a caller that retries send the task twice.
@@ -672,32 +651,27 @@ class PostgresqlBroker(AsyncBroker):
         """Claim the oldest due message of the channel, see ``ClaimDueQuery``."""
         return await self._claim(
             "a due message",
-            self._claim_due_query,
-            self.channel_name,
+            self._store.claim_due(self.channel_name),
         )
 
     async def _claim_notified(self, message_id: int) -> Optional[AckableMessage]:
         """Claim the message a NOTIFY named, see ``ClaimByIdQuery``."""
         return await self._claim(
             f"message {message_id}",
-            self._claim_by_id_query,
-            self.channel_name,
-            message_id,
+            self._store.claim_by_id(self.channel_name, message_id),
         )
 
     async def _claim(
         self,
         what: str,
-        query: str,
-        *values: Any,
+        claiming: Awaitable[Optional[dict[str, Any]]],
     ) -> Optional[AckableMessage]:
         """
         Run one claim; log a failure instead of raising, so listen() goes on.
 
         Args:
             what: the claimed message, as the log names it.
-            query: the claim query, run through ``fetch_row``.
-            values: the query's bind parameters.
+            claiming: the store's claim of it, not yet awaited.
 
         Returns:
             The message, or None if no row matched or the claim failed.
@@ -707,7 +681,7 @@ class PostgresqlBroker(AsyncBroker):
             # query_timeout themselves, and cancelling it would leave psycopg
             # waiting on a silent socket, see drivers/_psycopg.py. psqlpy's
             # claims are not bounded at all, see the README.
-            row = await self.driver.fetch_row(query, *values)
+            row = await claiming
         except AsyncTimeoutError:
             # A connection that went silent: a traceback would only show the
             # wait. asyncpg and psycopg give that connection up.
