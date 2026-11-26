@@ -11,12 +11,6 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Optional
 
 import pytest
-from taskiq_postgresql.core.stores.schema import (
-    SchemaStore,
-    Session,
-    read_database,
-    start_table,
-)
 from typing_extensions import override
 
 from taskiq_postgresql import migrations
@@ -30,6 +24,12 @@ from taskiq_postgresql.core.sql.catalog import (
 )
 from taskiq_postgresql.core.stores import schema as schema_module
 from taskiq_postgresql.core.stores.declaration import TableDeclaration
+from taskiq_postgresql.core.stores.schema import (
+    SchemaStore,
+    Session,
+    read_database,
+    start_table,
+)
 
 DSN = "postgresql://postgres@localhost:5432/postgres"
 OTHER_DSN = "postgresql://postgres@localhost:5432/other"
@@ -385,7 +385,11 @@ async def test_read_database_without_a_store_uses_a_catalog_only_driver(
 async def test_read_database_leaves_a_pool_that_never_opened() -> None:
     driver = FakeDriver()
 
-    await read_database(OTHER_DSN, [], SchemaStore("broker", driver))
+    await read_database(
+        OTHER_DSN,
+        [migrations.table_schema("broker")],
+        SchemaStore("broker", driver),
+    )
 
     assert driver.calls == []
 

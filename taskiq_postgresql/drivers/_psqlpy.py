@@ -20,8 +20,8 @@ from taskiq_postgresql.core.sql.catalog import (
     Column,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
+from taskiq_postgresql.core.stores.schema import Session, start_driver
 from taskiq_postgresql.drivers._health import check_listen
-from taskiq_postgresql.drivers._schema import Session, start_table
 from taskiq_postgresql.exceptions import DatabaseConnectionError
 from taskiq_postgresql.utils.dsn import UNREADABLE_DSN, is_ambiguous_uri
 
@@ -291,11 +291,11 @@ class PsqlpyDriver(QueryDriver):
 
     async def on_startup(self) -> None:
         """Check the table, or migrate it; see ``QueryDriver.on_startup``."""
-        await start_table(self, self._session)
+        await start_driver(self, self._session)
 
     @asynccontextmanager
     async def _session(self) -> AsyncGenerator[Session, None]:
-        """One pooled connection in one transaction, for ``start_table``."""
+        """One pooled connection in one transaction, for ``start_driver``."""
         async with (
             self,
             self.connection() as connection,
