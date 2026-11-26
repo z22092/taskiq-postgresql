@@ -28,7 +28,7 @@ from typing import (
 from taskiq import AckableMessage, AsyncBroker, AsyncResultBackend, BrokerMessage
 
 from taskiq_postgresql.abc.driver import ListenDriver
-from taskiq_postgresql.abc.query import (
+from taskiq_postgresql.core.sql.catalog import (
     AddedIndex,
     ClaimByIdQuery,
     ClaimColumns,

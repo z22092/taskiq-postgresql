@@ -7,7 +7,7 @@ from taskiq.abc.serializer import TaskiqSerializer
 from taskiq.serializers.pickle import PickleSerializer
 
 from taskiq_postgresql.abc.driver import QueryDriver
-from taskiq_postgresql.abc.query import Column, PrimaryKeyColumn
+from taskiq_postgresql.core.sql.catalog import Column, PrimaryKeyColumn
 from taskiq_postgresql.exceptions import ResultIsMissingError
 from taskiq_postgresql.utils import (
     Dsn,

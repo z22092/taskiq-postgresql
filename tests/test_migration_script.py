@@ -29,6 +29,7 @@ from taskiq.schedule_sources import LabelScheduleSource
 from taskiq_postgresql import migrations
 from taskiq_postgresql.abc.query import MIGRATION_LOCK_NAMESPACE, Column
 from taskiq_postgresql.broker import PostgresqlBroker
+from taskiq_postgresql.core.sql.catalog import migration_lock_script
 from taskiq_postgresql.migrations import (
     DEFAULT_LOCK_TIMEOUT,
     ColumnSchema,
@@ -545,26 +546,15 @@ def test_locks_are_taken_in_table_name_order() -> None:
 
 
 @pytest.mark.parametrize(
-    ("name", "literal"),
-    [
-        ("o'brien", "'o''brien'"),
-        ("back\\slash", "E'back\\\\slash'"),
-        ("both'\\", "E'both''\\\\'"),
-    ],
+    "name",
+    ["o'brien", "back\\slash", "both'\\"],
     ids=["quote", "backslash", "both"],
 )
-def test_a_quote_or_backslash_in_the_table_name_is_escaped(
-    name: str,
-    literal: str,
-) -> None:
-    script = render_sql([table_schema("result_backend", table_name=name)])
-
-    assert lock_lines(script) == [
-        (
-            "SELECT pg_advisory_xact_lock(hashtext('taskiq_postgresql'), "
-            f"hashtext({literal}));"
-        ),
-    ]
+def test_a_quote_or_backslash_in_the_table_name_is_refused(name: str) -> None:
+    # The Identifier rule (ADR 0008) refuses these before any SQL is written;
+    # the escaping itself is pinned by tests/unit/test_catalog.py.
+    with pytest.raises(ValueError, match="is not a plain SQL identifier"):
+        table_schema("result_backend", table_name=name)
 
 
 @pytest.mark.parametrize(
@@ -1008,7 +998,11 @@ async def test_an_escaped_table_name_hashes_to_the_runtime_lock_key(
     driver: str,
     empty_dsn: str,
 ) -> None:
-    (lock_line,) = lock_lines(render_sql([table_schema("broker", table_name=name)]))
+    # No table can carry this name any more (ADR 0008), so the lock is built
+    # from the name directly: the escaping still has to match the server.
+    with pytest.raises(ValueError, match="is not a plain SQL identifier"):
+        table_schema("broker", table_name=name)
+    lock_line = f"{migration_lock_script(name).text};"
     rendered = re.fullmatch(
         r"SELECT pg_advisory_xact_lock\(hashtext\('taskiq_postgresql'\), "
         r"hashtext\((?P<literal>.+)\)\);",

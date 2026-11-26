@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Any, AsyncIterator, Optional, Sequence, Union
 
 from typing_extensions import Self
 
-from taskiq_postgresql.abc.query import (
+from taskiq_postgresql.core.sql.catalog import (
     AddColumnsQuery,
     AddedIndex,
     Column,

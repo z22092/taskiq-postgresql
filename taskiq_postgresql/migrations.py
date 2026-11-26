@@ -43,8 +43,7 @@ from typing import (
 )
 
 from taskiq_postgresql.abc.driver import QueryDriver
-from taskiq_postgresql.abc.query import (
-    MIGRATION_LOCK_NAMESPACE,
+from taskiq_postgresql.core.sql.catalog import (
     AddColumnsQuery,
     AddedIndex,
     ClaimColumns,
@@ -53,8 +52,14 @@ from taskiq_postgresql.abc.query import (
     CreateIndexQuery,
     CreateTableQuery,
     PrimaryKeyColumn,
+    catalog_read,
+    check_lock_timeout,
     index_name,
+    lock_timeout_scripts,
+    migration_lock_script,
+    script_transaction,
 )
+from taskiq_postgresql.core.sql.identifier import Identifier
 
 if TYPE_CHECKING:
     from taskiq_postgresql.broker import PostgresqlBroker
@@ -174,12 +179,6 @@ MIGRATION_FORMATS_GROUP: Final = "taskiq_postgresql.migration_formats"
 DEFAULT_LOCK_TIMEOUT: Final = 10
 """Seconds a script's statement waits for a lock before the script fails."""
 
-# The server keeps lock_timeout as an int of milliseconds and refuses a larger
-# value when the script runs.
-_MAX_LOCK_TIMEOUT: Final = 2_147_483
-# A custom setting (two-part name) that holds a transaction's own lock_timeout
-# while steps that share the transaction run with theirs.
-_SAVED_LOCK_TIMEOUT: Final = "taskiq_postgresql_step.lock_timeout"
 _DISTRIBUTION: Final = "taskiq-postgresql"
 
 # Keyed by the upper-cased SQL spelling; PostgreSQL type names ignore case.
@@ -272,33 +271,6 @@ def check_comment(text: str) -> str:
             "on the first two lines of a file",
         )
     return text
-
-
-def check_lock_timeout(seconds: int) -> int:
-    """
-    Refuse a lock timeout that no migration could set.
-
-    Args:
-        seconds: The seconds a statement waits for a lock; ``0`` for none.
-
-    Returns:
-        ``seconds``, unchanged.
-
-    Raises:
-        ValueError: if ``seconds`` is not a whole number from 0 to 2147483
-            (the server keeps it as milliseconds in an int).
-    """
-    # A bool is an int, and True would read as one second.
-    if (
-        isinstance(seconds, bool)
-        or not isinstance(seconds, int)
-        or not 0 <= seconds <= _MAX_LOCK_TIMEOUT
-    ):
-        raise ValueError(
-            "lock_timeout must be a whole number of seconds from 0 to "
-            f"{_MAX_LOCK_TIMEOUT}, got {seconds!r}",
-        )
-    return seconds
 
 
 def parse_target(spec: str) -> tuple[str, str]:
@@ -795,19 +767,8 @@ def scoped_lock_timeout(statements: Sequence[str], lock_timeout: int) -> list[st
     bounded = _lock_timeout_first(statements, lock_timeout)
     if not lock_timeout:
         return bounded
-    saved = _sql_literal(_SAVED_LOCK_TIMEOUT)
-    # missing_ok and NULLIF turn a value this transaction never saved (missing
-    # or empty) into NULL, which set_config reads as a reset, instead of an
-    # error.
-    restore = (
-        "SELECT set_config('lock_timeout', "
-        f"NULLIF(current_setting({saved}, true), ''), true)"
-    )
-    return [
-        f"SELECT set_config({saved}, current_setting('lock_timeout'), true)",
-        *bounded,
-        restore,
-    ]
+    scripts = lock_timeout_scripts(lock_timeout)
+    return [scripts.save.text, *bounded, scripts.restore.text]
 
 
 # --- comparing a database with the description -------------------------------
@@ -1203,11 +1164,15 @@ def catalog_query(schemas: Iterable[TableSchema]) -> str:
         raise ValueError("a catalog query needs at least one table schema")
     for table in tables:
         _check_table_name(table.name)
-    return (
-        "SELECT json_build_object('tables', json_build_array("
-        + ", ".join(_table_state_sql(table) for table in tables)
-        + "))::text AS catalog"
-    )
+    return catalog_read(
+        [
+            (
+                Identifier.parse(table.name, what="table name", warn=False),
+                [index.name for index in table.indexes],
+            )
+            for table in tables
+        ],
+    ).text
 
 
 async def read_catalog(
@@ -1694,25 +1659,6 @@ def _checked_tables(schemas: Iterable[TableSchema]) -> list[TableSchema]:
     return tables
 
 
-def _sql_literal(value: str) -> str:
-    quoted = value.replace("'", "''")
-    if "\\" in value:
-        # E'' reads a doubled backslash as one whatever
-        # standard_conforming_strings is set to; a plain literal does not.
-        return "E'" + quoted.replace("\\", "\\\\") + "'"
-    return f"'{quoted}'"
-
-
-def _lock_statement(table_name: str) -> str:
-    # The key run_migrations takes (MigrationLockQuery), with the arguments
-    # written as literals: a script has no bind parameters.
-    return (
-        "SELECT pg_advisory_xact_lock("
-        f"hashtext({_sql_literal(MIGRATION_LOCK_NAMESPACE)}), "
-        f"hashtext({_sql_literal(table_name)}))"
-    )
-
-
 def _script_statements(
     tables: Sequence[tuple[str, Sequence[MigrationStep]]],
     *,
@@ -1723,7 +1669,8 @@ def _script_statements(
         # Sorted, so two scripts that lock the same tables take the locks in
         # the same order and cannot deadlock each other.
         statements.extend(
-            _lock_statement(name) for name in sorted({name for name, _ in tables})
+            migration_lock_script(name).text
+            for name in sorted({name for name, _ in tables})
         )
     statements.extend(
         statement
@@ -1757,7 +1704,7 @@ def _script_text(
     transaction: bool,
 ) -> str:
     if transaction:
-        statements = ["BEGIN", *statements, "COMMIT"]
+        statements = script_transaction(statements)
     lines = [
         f"-- taskiq-postgresql {package_version()}",
         *header,
@@ -1771,7 +1718,7 @@ def _lock_timeout_first(statements: Sequence[str], lock_timeout: int) -> list[st
     if not lock_timeout:
         return list(statements)
     # First, so that it also bounds the wait for the advisory lock.
-    return [f"SET LOCAL lock_timeout = '{lock_timeout}s'", *statements]
+    return [lock_timeout_scripts(lock_timeout).set_local.text, *statements]
 
 
 # The type format_type() reports for each TypeName. SERIAL is an integer
@@ -1794,54 +1741,6 @@ _INDEX_RELKINDS: Final = frozenset({"i", "I"})
 def _catalog_type(column: ColumnSchema) -> str:
     spelling = _CATALOG_TYPES[column.type_name]
     return spelling if column.length is None else f"{spelling}({column.length})"
-
-
-def _table_state_sql(table: TableSchema) -> str:
-    # Names go in as escaped literals: the query has no bind parameters, so
-    # every driver runs it the same way.
-    name = _sql_literal(table.name)
-    indexes = ", ".join(_index_state_sql(index.name) for index in table.indexes)
-    return (
-        "(SELECT json_build_object("  # noqa: S608
-        f"'name', {name}, "
-        "'relkind', c.relkind, "
-        "'columns', ac.columns, "
-        # Beside the columns, not inside them: the pairs keep their shape.
-        "'not_null', ac.not_null, "
-        f"'indexes', json_build_array({indexes})) "
-        f"FROM (SELECT to_regclass({name}) AS oid) AS t "
-        "LEFT JOIN pg_class c ON c.oid = t.oid "
-        # One scan of pg_attribute for both. An aggregate without GROUP BY
-        # yields one row even for none, with NULL, as the subqueries did.
-        "LEFT JOIN LATERAL (SELECT json_agg(json_build_array(a.attname,"
-        " format_type(a.atttypid, a.atttypmod)) ORDER BY a.attnum) AS columns,"
-        " json_agg(a.attname ORDER BY a.attnum) FILTER (WHERE a.attnotnull)"
-        " AS not_null FROM pg_attribute a WHERE a.attrelid = c.oid"
-        " AND a.attnum > 0 AND NOT a.attisdropped) AS ac ON true)"
-    )
-
-
-def _index_state_sql(index_name: str) -> str:
-    # Correlated with the table's pg_class row (c) of _table_state_sql.
-    name = _sql_literal(index_name)
-    return (
-        "(SELECT json_build_object("  # noqa: S608
-        f"'name', {name}, "
-        "'relkind', ic.relkind, "
-        "'on_table', i.indrelid IS NOT DISTINCT FROM c.oid, "
-        "'valid', i.indisvalid, "
-        "'method', am.amname, "
-        "'unique', i.indisunique, "
-        "'partial', i.indpred IS NOT NULL, "
-        "'columns', (SELECT json_agg(a.attname ORDER BY k.n)"
-        " FROM unnest(i.indkey::int2[]) WITH ORDINALITY AS k(attnum, n)"
-        " LEFT JOIN pg_attribute a ON a.attrelid = i.indrelid"
-        " AND a.attnum = k.attnum WHERE k.n <= i.indnkeyatts)) "
-        f"FROM (SELECT to_regclass({name}) AS oid) AS r "
-        "LEFT JOIN pg_class ic ON ic.oid = r.oid "
-        "LEFT JOIN pg_index i ON i.indexrelid = r.oid "
-        "LEFT JOIN pg_am am ON am.oid = ic.relam)"
-    )
 
 
 def _compare_table(

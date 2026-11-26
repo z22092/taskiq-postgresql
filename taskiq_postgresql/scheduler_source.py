@@ -11,7 +11,7 @@ from pydantic import TypeAdapter, ValidationError
 from taskiq import ScheduledTask, ScheduleSource
 from taskiq.abc.broker import AsyncBroker
 
-from taskiq_postgresql.abc.query import (
+from taskiq_postgresql.core.sql.catalog import (
     Column,
     CreatedAtColumn,
     PrimaryKeyColumn,
