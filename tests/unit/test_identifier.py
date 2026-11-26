@@ -48,19 +48,19 @@ def source_line(lineno: int) -> str:
     return Path(__file__).read_text(encoding="utf-8").splitlines()[lineno - 1]
 
 
-# R1
+# Type
 
 
 @pytest.mark.parametrize("value", [123, None, b"jobs", 1.5])
-def test_r1_a_non_string_is_a_type_error_naming_the_type(value: object) -> None:
+def test_a_non_string_is_a_type_error_naming_the_type(value: object) -> None:
     with pytest.raises(TypeError, match=type(value).__name__):
         parse(value)
 
 
-# R2
+# Empty and outside the grammar
 
 
-def test_r2_empty_message() -> None:
+def test_an_empty_name_is_refused_with_the_text() -> None:
     with pytest.raises(IdentifierError) as caught:
         parse("")
     assert str(caught.value) == "table name '' cannot be written in SQL: it is empty"
@@ -80,7 +80,7 @@ def test_r2_empty_message() -> None:
         "with space",
     ],
 )
-def test_r2_outside_the_grammar_is_refused_with_the_text(value: str) -> None:
+def test_outside_the_grammar_is_refused_with_the_text(value: str) -> None:
     with pytest.raises(IdentifierError) as caught:
         parse(value, what="channel name")
     assert str(caught.value) == (
@@ -125,10 +125,10 @@ def test_a_refused_long_value_does_not_leak_whole() -> None:
     assert "z" * 100 not in str(caught.value)
 
 
-# R3
+# Length
 
 
-def test_r3_64_bytes_is_refused_with_the_size() -> None:
+def test_64_bytes_is_refused_with_the_size() -> None:
     value = "a" * 64
     with pytest.raises(IdentifierError) as caught:
         parse(value)
@@ -137,15 +137,15 @@ def test_r3_64_bytes_is_refused_with_the_size() -> None:
     )
 
 
-def test_r3_63_bytes_is_accepted() -> None:
+def test_63_bytes_is_accepted() -> None:
     assert parse("a" * 63).name == "a" * 63
 
 
-# R4
+# Reserved words
 
 
 @pytest.mark.parametrize("value", ["order", "User", "left", "SELECT", "table"])
-def test_r4_a_reserved_word_is_refused(value: str) -> None:
+def test_a_reserved_word_is_refused(value: str) -> None:
     with pytest.raises(IdentifierError) as caught:
         parse(value, what="channel name")
     assert str(caught.value) == (
@@ -154,7 +154,7 @@ def test_r4_a_reserved_word_is_refused(value: str) -> None:
 
 
 @pytest.mark.parametrize("value", ["name", "text", "key", "user_", "orders", "int"])
-def test_r4_an_unreserved_word_is_accepted(value: str) -> None:
+def test_an_unreserved_word_is_accepted(value: str) -> None:
     assert parse(value).name == value
 
 
@@ -166,24 +166,40 @@ def test_reserved_words_are_lower_case_and_include_both_categories() -> None:
     assert len(RESERVED_WORDS) == RESERVED_COUNT
 
 
-# R5 and R6
+# Mixed case
 
 
-def test_r5_mixed_case_is_accepted_and_folded() -> None:
+def test_mixed_case_is_accepted_and_folded() -> None:
     with pytest.warns(DeprecationWarning, match="jobs_mixed"):
         identifier = Identifier.parse("Jobs_Mixed", what="table name")
     assert identifier.configured == "Jobs_Mixed"
     assert identifier.name == "jobs_mixed"
 
 
-def test_r5_warns_once_per_parse() -> None:
+def test_the_channel_warning_says_rows_keep_the_configured_spelling() -> None:
+    with pytest.warns(DeprecationWarning) as caught:
+        Identifier.parse("Jobs_Mixed", what="channel name")
+    text = str(caught[0].message)
+    assert "keep 'Jobs_Mixed' in the channel column" in text
+    assert "UPDATE" in text
+
+
+def test_the_table_warning_says_the_lock_key_changes() -> None:
+    with pytest.warns(DeprecationWarning) as caught:
+        Identifier.parse("Jobs_Mixed", what="table name")
+    text = str(caught[0].message)
+    assert "lock key" in text
+    assert "channel column" not in text
+
+
+def test_mixed_case_warns_once_per_parse() -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         Identifier.parse("Jobs_Mixed", what="table name")
     assert [w.category for w in caught] == [DeprecationWarning]
 
 
-def test_r5_the_warning_points_at_the_caller_line() -> None:
+def test_the_warning_points_at_the_caller_line() -> None:
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         Identifier.parse("Jobs_Mixed", what="table name")  # CALLER-LINE
@@ -192,7 +208,7 @@ def test_r5_the_warning_points_at_the_caller_line() -> None:
     assert "CALLER-LINE" in source_line(caught[0].lineno)
 
 
-def test_r5_stacklevel_moves_the_warning_to_the_callers_caller() -> None:
+def test_stacklevel_moves_the_warning_to_the_callers_caller() -> None:
     def component() -> Identifier:
         return Identifier.parse("Jobs_Mixed", what="table name", stacklevel=3)
 
@@ -202,14 +218,14 @@ def test_r5_stacklevel_moves_the_warning_to_the_callers_caller() -> None:
     assert "USER-LINE" in source_line(caught[0].lineno)
 
 
-def test_r5_warn_false_is_silent() -> None:
+def test_warn_false_is_silent() -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         assert Identifier.parse("Jobs", what="name", warn=False).name == "jobs"
 
 
 @pytest.mark.parametrize("value", ["taskiq_messages", "jobs$1", "_x", "a"])
-def test_r6_a_plain_name_is_accepted_without_a_warning(value: str) -> None:
+def test_a_plain_name_is_accepted_without_a_warning(value: str) -> None:
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         identifier = Identifier.parse(value, what="table name")
@@ -277,7 +293,7 @@ def test_relation_name_folds_before_it_cuts() -> None:
     assert relation_name("Jobs_ID_idx") == "jobs_id_idx"
 
 
-# M3.derivados
+# Derived names
 
 
 @pytest.mark.parametrize("length", [1, 48, 49, 61])

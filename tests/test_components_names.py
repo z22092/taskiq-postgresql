@@ -7,25 +7,24 @@ notifications.
 """
 
 import asyncio
-import inspect
 import logging
 import uuid
 import warnings
+from collections.abc import Callable
 from contextlib import aclosing
-from typing import Any
+from typing import Any, Optional
 
-import asyncpg
 import pytest
 from taskiq import AckableMessage, BrokerMessage
 
 from taskiq_postgresql import PostgresqlBroker, PostgresqlResultBackend
+from taskiq_postgresql.core.sql.catalog import notify_statement
 from taskiq_postgresql.core.sql.identifier import IdentifierError
 from taskiq_postgresql.scheduler_source import PostgresqlSchedulerSource
 from taskiq_postgresql.utils import get_db_listen_driver
 from tests.helpers import (
     NOTIFY_DELIVERS_WITHIN,
     UNUSED_DSN,
-    WAIT_SECONDS,
     build_component,
     drop_and_shutdown,
     fetch_on_server,
@@ -60,15 +59,6 @@ def message_for(payload: bytes) -> BrokerMessage:
     )
 
 
-def at_line(caught: list[warnings.WarningMessage], line: int) -> None:
-    """Assert every warning is a DeprecationWarning pointing at this file's ``line``."""
-    assert caught
-    for entry in caught:
-        assert issubclass(entry.category, DeprecationWarning)
-        assert entry.filename == __file__
-        assert entry.lineno == line
-
-
 @pytest.mark.parametrize("kind", ["broker", "result_backend", "scheduler_source"])
 @pytest.mark.parametrize("name", REFUSED_NAMES)
 def test_a_table_name_outside_the_rule_is_refused_when_the_component_is_built(
@@ -76,7 +66,7 @@ def test_a_table_name_outside_the_rule_is_refused_when_the_component_is_built(
     name: str,
     driver: str,
 ) -> None:
-    with pytest.raises((IdentifierError, TypeError), match="table name"):
+    with pytest.raises(IdentifierError, match="table name"):
         build_component(kind, table_name=name, driver=driver)
 
 
@@ -85,7 +75,7 @@ def test_a_channel_name_outside_the_rule_is_refused_when_the_broker_is_built(
     name: str,
     driver: str,
 ) -> None:
-    with pytest.raises((IdentifierError, TypeError), match="channel name"):
+    with pytest.raises(IdentifierError, match="channel name"):
         PostgresqlBroker(dsn=UNUSED_DSN, driver=driver, channel_name=name)  # type: ignore[arg-type]
 
 
@@ -108,64 +98,55 @@ def test_the_first_table_name_whose_derived_names_collide_is_refused(
         build_with_table(kind, "t" * first_refused, driver)
 
 
-def test_a_mixed_case_broker_table_warns_at_the_line_that_built_it(
-    driver: str,
-) -> None:
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        line = inspect.currentframe().f_lineno + 1  # type: ignore[union-attr]
-        broker = PostgresqlBroker(
+MIXED_CASE_BUILDERS = [
+    pytest.param(
+        lambda driver: PostgresqlBroker(
             dsn=UNUSED_DSN, driver=driver, table_name="Jobs_Mixed"
-        )
-
-    at_line(caught, line)
-    assert len(caught) == 1
-    assert broker.table_name == "Jobs_Mixed"
-
-
-def test_a_mixed_case_broker_channel_warns_at_the_line_that_built_it(
-    driver: str,
-) -> None:
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        line = inspect.currentframe().f_lineno + 1  # type: ignore[union-attr]
-        broker = PostgresqlBroker(
+        ),
+        "table_name",
+        id="broker-table",
+    ),
+    pytest.param(
+        lambda driver: PostgresqlBroker(
             dsn=UNUSED_DSN, driver=driver, channel_name="Jobs_Mixed"
-        )
+        ),
+        "channel_name",
+        id="broker-channel",
+    ),
+    pytest.param(
+        lambda driver: PostgresqlResultBackend(
+            dsn=UNUSED_DSN, driver=driver, table_name="Jobs_Mixed"
+        ),
+        "table_name",
+        id="result-backend-table",
+    ),
+    pytest.param(
+        lambda driver: PostgresqlSchedulerSource(
+            dsn=UNUSED_DSN, driver=driver, table_name="Jobs_Mixed"
+        ),
+        "table_name",
+        id="scheduler-source-table",
+    ),
+]
 
-    at_line(caught, line)
-    assert len(caught) == 1
-    assert broker.channel_name == "Jobs_Mixed"
 
-
-def test_a_mixed_case_result_backend_table_warns_at_the_line_that_built_it(
+@pytest.mark.parametrize(("build", "attribute"), MIXED_CASE_BUILDERS)
+def test_a_mixed_case_name_warns_once_and_is_kept_as_configured(
+    build: Callable[[str], Any],
+    attribute: str,
     driver: str,
 ) -> None:
+    # The warning points at the line that built the component, which is the
+    # builder's own.
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
-        line = inspect.currentframe().f_lineno + 1  # type: ignore[union-attr]
-        backend: Any = PostgresqlResultBackend(
-            dsn=UNUSED_DSN, driver=driver, table_name="Jobs_Mixed"
-        )
+        component = build(driver)
 
-    at_line(caught, line)
     assert len(caught) == 1
-    assert backend.table_name == "Jobs_Mixed"
-
-
-def test_a_mixed_case_scheduler_source_table_warns_at_the_line_that_built_it(
-    driver: str,
-) -> None:
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        line = inspect.currentframe().f_lineno + 1  # type: ignore[union-attr]
-        source = PostgresqlSchedulerSource(
-            dsn=UNUSED_DSN, driver=driver, table_name="Jobs_Mixed"
-        )
-
-    at_line(caught, line)
-    assert len(caught) == 1
-    assert source.table_name == "Jobs_Mixed"
+    assert issubclass(caught[0].category, DeprecationWarning)
+    assert caught[0].filename == __file__
+    assert caught[0].lineno == build.__code__.co_firstlineno
+    assert getattr(component, attribute) == "Jobs_Mixed"
 
 
 async def first_message(worker: PostgresqlBroker) -> AckableMessage:
@@ -191,6 +172,14 @@ async def test_a_mixed_case_channel_is_delivered_by_notify_on_every_driver(
             poll_interval=SWEEP_OUT_OF_THE_WAY,
             run_migrations=True,
         )
+    claimed: list[Optional[AckableMessage]] = []
+    claim_notified = worker._claim_notified
+
+    async def spy(message_id: int) -> Optional[AckableMessage]:
+        claimed.append(await claim_notified(message_id))
+        return claimed[-1]
+
+    worker._claim_notified = spy  # type: ignore[method-assign]
     await worker.startup()
     try:
         task = asyncio.create_task(first_message(worker))
@@ -199,10 +188,12 @@ async def test_a_mixed_case_channel_is_delivered_by_notify_on_every_driver(
         sent = message_for(b"mixed-case-channel")
         await worker.kick(sent)
 
+        # The next sweep is 60 s away, so only the NOTIFY can deliver here.
         received = await asyncio.wait_for(task, timeout=NOTIFY_DELIVERS_WITHIN)
     finally:
         await drop_and_shutdown(worker, postgres_table)
 
+    assert [message is not None for message in claimed] == [True]
     assert received.data == sent.message
 
 
@@ -218,7 +209,6 @@ async def test_a_listen_driver_built_with_mixed_case_receives_the_folded_notify(
     try:
         assert listener.channel_name == channel.lower()
         await asyncio.sleep(0.3)  # let the listener subscribe before notifying
-        # psqlpy cannot map the void result of pg_notify, hence the cast.
         await fetch_on_server(
             postgresql_dsn,
             "SELECT pg_notify($1, $2)::text",
@@ -235,54 +225,37 @@ async def test_a_listen_driver_built_with_mixed_case_receives_the_folded_notify(
 
 
 @pytest.mark.anyio
-async def test_a_kick_sends_pg_notify_with_the_channel_and_id_as_binds(
-    broker: PostgresqlBroker,
-    postgresql_dsn: str,
-) -> None:
-    # The statement is on the server for well under a millisecond and cannot
-    # be held with a lock, so a second connection watches pg_stat_activity
-    # while kicks go on until it has seen one (an idle pooled connection may
-    # keep the last statement too, on a driver that does not reset it).
-    watcher = await asyncpg.connect(postgresql_dsn)
-    seen: set[str] = set()
-
-    async def observe() -> None:
-        rows = await watcher.fetch(
-            "SELECT query FROM pg_stat_activity "
-            "WHERE pid <> pg_backend_pid() AND "
-            "(query ILIKE '%pg_notify%' OR query ILIKE 'NOTIFY%')",
-        )
-        seen.update(row["query"] for row in rows)
-
-    async def watch() -> None:
-        while True:
-            await observe()
-
-    watching = asyncio.ensure_future(watch())
-    try:
-        deadline = asyncio.get_running_loop().time() + WAIT_SECONDS
-        while (
-            not any("pg_notify($1, $2)" in query for query in seen)
-            and asyncio.get_running_loop().time() < deadline
-        ):
-            await broker.kick(message_for(b"binds"))
-    finally:
-        watching.cancel()
-        await asyncio.gather(watching, return_exceptions=True)
-        await watcher.close()
-
-    assert any("pg_notify($1, $2)" in query for query in seen), seen
-    assert not any(query.upper().startswith("NOTIFY") for query in seen), seen
-
-
-@pytest.mark.anyio
-async def test_a_kick_logs_no_notify_failure(
+async def test_a_kick_sends_the_notify_statement_with_the_channel_and_id_as_binds(
     broker: PostgresqlBroker,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    with caplog.at_level(logging.WARNING):
-        await broker.kick(message_for(b"no-failure"))
+    # The values reach the server as binds: tests/test_driver_binds.py proves
+    # that for every driver. Here the broker is held to what it hands over.
+    executed: list[tuple[Any, ...]] = []
+    inserted: list[int] = []
+    execute = broker.driver.execute
+    insert = broker.driver.insert
 
+    async def spy_execute(*args: Any) -> Any:
+        executed.append(args)
+        return await execute(*args)
+
+    async def spy_insert(*args: Any) -> int:
+        inserted.append(await insert(*args))
+        return inserted[-1]
+
+    broker.driver.execute = spy_execute  # type: ignore[method-assign]
+    broker.driver.insert = spy_insert  # type: ignore[method-assign]
+
+    with caplog.at_level(logging.WARNING):
+        await broker.kick(message_for(b"binds"))
+
+    # A positive control: the spies saw the kick, so the empty log below means
+    # no failure rather than no call.
+    assert len(inserted) == 1
+    assert executed == [
+        (notify_statement().text, broker._channel.name, str(inserted[0])),
+    ]
     assert "NOTIFY of message" not in caplog.text
 
 

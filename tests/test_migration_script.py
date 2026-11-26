@@ -993,7 +993,7 @@ async def test_the_largest_lock_timeout_is_one_the_server_accepts(
     ["o'brien", "back\\slash", "both'\\"],
     ids=["quote", "backslash", "both"],
 )
-async def test_an_escaped_table_name_hashes_to_the_runtime_lock_key(
+async def test_the_sql_literal_of_a_quoted_name_hashes_like_the_raw_value(
     name: str,
     driver: str,
     empty_dsn: str,

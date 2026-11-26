@@ -188,6 +188,27 @@ def object_name(name1: str, name2: Optional[str], label: str) -> str:
     return result + "_" + label
 
 
+def _mixed_case_message(what: str, value: str, folded: str) -> str:
+    """Return the warning for a name with upper case: what it costs to switch."""
+    head = (
+        f"{what} {value!r} has upper case letters; PostgreSQL folds it to "
+        f"{folded!r}, the name it really has. Configure {folded!r}."
+    )
+    if what == "channel name":
+        # The channel column is written from the configured spelling, so a
+        # worker on the new spelling never claims those rows by NOTIFY or sweep.
+        return (
+            f"{head} Rows already stored keep {value!r} in the channel column: "
+            "before switching, stop producers and workers, then drain the queue "
+            f"or UPDATE the rows' channel from {value!r} to {folded!r}."
+        )
+    # The migration lock key hashes the table name as configured.
+    return (
+        f"{head} Switching changes the migration lock key: switch with no "
+        "migration pending or with the workers stopped."
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Identifier:
     """
@@ -254,9 +275,7 @@ class Identifier:
             raise IdentifierError(msg)
         if warn and folded != value:
             warnings.warn(
-                f"{what} {value!r} has upper case letters; PostgreSQL folds it "
-                f"to {folded!r}, the name the table or channel really has. "
-                f"Configure {folded!r}.",
+                _mixed_case_message(what, value, folded),
                 DeprecationWarning,
                 stacklevel=stacklevel,
             )

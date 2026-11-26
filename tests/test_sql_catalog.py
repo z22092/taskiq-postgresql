@@ -337,7 +337,7 @@ async def test_the_server_infers_the_declared_types(
     )
 
 
-async def test_every_param_type_has_a_server_type() -> None:
+def test_every_param_type_has_a_server_type() -> None:
     """The map above leaves no ParamType out, so a new member needs a line."""
     assert set(REGTYPES) == set(ParamType)
 

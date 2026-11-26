@@ -257,7 +257,12 @@ Upgrading from 0.4.x:
   schema-qualified name, leave the table where it is and put the schema on the
   role's `search_path` (`ALTER ROLE <role> SET search_path TO app, public;`),
   then configure the name without the schema. Names that pass keep their SQL
-  and their lock key.
+  and their lock key. A broker whose `channel_name` is refused does the
+  following: stop the producers and the workers, configure a name the rule
+  accepts, and either drain the queue first or move the stored rows with
+  `UPDATE <table> SET channel = '<new>' WHERE channel = '<old>'`, because the
+  `channel` column keeps the spelling that was configured when the row was
+  stored and a worker on the new name does not claim those rows.
 - **BREAKING:** `taskiq_postgresql.migrations.check_plain_identifier` applies
   the same rule: besides the grammar it now refuses a reserved word and a name
   over 63 bytes. It still returns the name unchanged, with no fold and no
@@ -273,7 +278,16 @@ Upgrading from 0.4.x:
   the same notification.
 - A table or channel name with upper case letters is accepted and warns with a
   `DeprecationWarning` that names the folded form PostgreSQL uses. Configure
-  that form. The `channel` column and the claim keep the name as configured.
+  that form. Python hides a `DeprecationWarning` raised outside `__main__` by
+  default; it shows under pytest, with `python -W default`, or when your
+  logging setup captures warnings. The `channel` column and the claim keep the
+  name as configured, so switching a channel to its folded spelling strands the
+  rows stored under the old one (delayed messages, a backlog, a producer on the
+  old setting during a rolling deploy): stop producers and workers, then drain
+  the queue or run `UPDATE <table> SET channel = '<new>' WHERE channel =
+  '<old>'`. A table name is hashed as configured into the migration lock key,
+  so switching its spelling changes the key: switch with no migration pending
+  or with the workers stopped.
 - `taskiq_postgresql.abc.query` still exports the same builders with the same
   SQL; they now live in `taskiq_postgresql.core.sql.catalog`, and a builder
   refuses a table name the rule refuses. A third-party driver built on
@@ -391,7 +405,9 @@ Upgrading from 0.4.x:
   receives the broker's notification at once. asyncpg quoted the name in
   `LISTEN` while `NOTIFY` folded it, so such a worker delivered only through
   the sweep, up to `poll_interval` seconds late. All three drivers now
-  `LISTEN` on the folded name.
+  `LISTEN` on the folded name, so a `pg_notify('Jobs', ...)` sent from outside
+  the broker reaches an asyncpg worker only through the sweep, as it already
+  did for the other two drivers: the worker listens on `jobs`.
 - `PostgresqlResultBackend.delete_by_date` without `to_date` deleted nothing;
   it now deletes every result created at or after `from_date`. A call that
   relied on that no-op now deletes the newer results; to delete older ones,

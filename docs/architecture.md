@@ -38,7 +38,7 @@ driver for `LISTEN`.
 - `QueryDriver` holds the table definition (primary key, columns,
   `created_at`, index columns, and the `added_columns` and `added_indexes`
   that `on_startup` adds to a table that may already exist) and one builder
-  per statement from `abc/query.py`, created in its `__init__`. Drivers
+  per statement from `core/sql/catalog/`, created in its `__init__`. Drivers
   implement `insert`, `insert_or_update`, `delete`, `fetch_row`,
   `delete_by_date`, `select`, `exists`, `execute`, `on_startup` and
   `on_shutdown`. `fetch_row(query, *values)` runs a query its caller built
@@ -95,7 +95,7 @@ anything reaches the server.
 
 ## SQL
 
-`taskiq_postgresql/core/sql/catalog.py` is the one owner of SQL: it builds
+`taskiq_postgresql/core/sql/catalog/` is the one owner of SQL: it builds
 every DDL statement, row query, the `pg_notify` call, the `LISTEN` script and
 the catalog read, each as a `Statement` or `Script` that declares the type of
 its binds and result columns (`statement.py`). `abc/query.py` re-exports the

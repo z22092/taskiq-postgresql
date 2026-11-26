@@ -7,8 +7,6 @@ No database: each builder's typed ``statement()`` must carry the text its
 
 from __future__ import annotations
 
-from typing import Any
-
 import pytest
 
 from taskiq_postgresql.core.sql import catalog
@@ -255,7 +253,6 @@ def test_make_query_accepts_the_drivers_literal_column() -> None:
 
 
 def test_exists_query_statement_is_the_text_the_drivers_build_today() -> None:
-
     key = Column("id", "SERIAL")
 
     statement = catalog.ExistsQuery("jobs").statement(key)
@@ -267,7 +264,6 @@ def test_exists_query_statement_is_the_text_the_drivers_build_today() -> None:
 
 
 def test_notify_statement_has_no_result_column() -> None:
-
     statement = catalog.notify_statement()
 
     assert statement.text == "SELECT FROM pg_notify($1, $2)"
@@ -276,14 +272,12 @@ def test_notify_statement_has_no_result_column() -> None:
 
 
 def test_listen_script_names_the_folded_channel() -> None:
-
     channel = Identifier.parse("Jobs_Mixed", what="channel name", warn=False)
 
     assert catalog.listen_script(channel) == Script("LISTEN jobs_mixed")
 
 
 def test_both_lock_forms_come_from_one_template() -> None:
-
     script = catalog.migration_lock_script(
         Identifier.parse("Jobs_Mixed", what="table name", warn=False),
     )
@@ -304,8 +298,7 @@ def test_both_lock_forms_come_from_one_template() -> None:
 
 
 def test_lock_timeout_scripts_keep_today_s_text() -> None:
-
-    scripts: Any = catalog.lock_timeout_scripts(7)
+    scripts = catalog.lock_timeout_scripts(7)
 
     assert scripts.set_local == Script("SET LOCAL lock_timeout = '7s'")
     assert scripts.save == Script(
@@ -322,7 +315,6 @@ def test_lock_timeout_scripts_keep_today_s_text() -> None:
 
 
 def test_drop_table_and_transaction_scripts() -> None:
-
     assert catalog.drop_table_script("jobs") == Script("DROP TABLE IF EXISTS jobs")
     assert catalog.in_transaction(["SELECT 1"]) == ["BEGIN", "SELECT 1", "COMMIT"]
 
@@ -342,7 +334,6 @@ def test_sql_literal_escapes_quotes_and_backslashes(value: str, literal: str) ->
 
 
 def test_catalog_and_database_reads_wrap_the_same_text() -> None:
-
     table = Identifier.parse("jobs", what="table name", warn=False)
 
     read = catalog.catalog_read([(table, ["jobs_task_id_idx"])])

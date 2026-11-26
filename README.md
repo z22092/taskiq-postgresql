@@ -226,9 +226,20 @@ checked when the component is built and then written into SQL unquoted. A name
 is accepted when it is made of ASCII letters, digits, `_` and `$`, does not
 start with a digit or `$`, is at most 63 bytes, is not a reserved word and is
 not schema-qualified (put the schema on the role's `search_path` instead);
-anything else raises `ValueError`. A name with upper case letters works, as
-PostgreSQL folds it, and warns with a `DeprecationWarning`: configure it in
-lower case. Use identifiers you control, never user input.
+anything else raises `ValueError`. A table name must also leave room for the
+names derived from it (the primary key, the sequence and the indexes): at most
+61 bytes for the broker and the scheduler source, 62 for the result backend.
+A name with upper case letters works, as PostgreSQL folds it, and warns with a
+`DeprecationWarning`: configure it in lower case. Python hides that warning by
+default outside `__main__`; it shows under pytest or with `python -W default`.
+Switching has a cost. The broker's `channel` column keeps the spelling that was
+configured when a row was stored, so after switching a channel name, a worker
+does not claim rows stored under the old spelling: stop producers and workers,
+then drain the queue or run
+`UPDATE <table> SET channel = '<new>' WHERE channel = '<old>'`. A table name is
+hashed as configured into the migration lock key, so switch a table name with
+no migration pending or with the workers stopped. Use identifiers you control,
+never user input.
 
 ### Driver options
 
