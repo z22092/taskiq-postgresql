@@ -10,6 +10,10 @@ ADRs [0007](adr/0007-driver-port-and-core-owned-sql.md),
 [0008](adr/0008-identifiers.md), [0009](adr/0009-delivery-modes.md) and
 [0010](adr/0010-plugin-registry-and-codec-interface.md), with the plan in
 [`spikes/2026-11-25-v1-data-layer.md`](spikes/2026-11-25-v1-data-layer.md).
+Payload encryption is proposed in
+[ADR 0012](adr/0012-payload-encryption-codec.md) and the result serializer
+without pickle in
+[ADR 0013](adr/0013-result-serializer-without-pickle.md).
 
 ## Components
 
