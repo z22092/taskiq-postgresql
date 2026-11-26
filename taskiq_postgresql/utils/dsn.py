@@ -1,9 +1,22 @@
-from typing import Callable, Union
+from typing import Callable, Final, Union
 
 Dsn = Union[str, Callable[[], str]]
 """A PostgreSQL connection string, or a callable that returns one."""
 
 _EXAMPLE_DSN = "postgresql://user@localhost:5432/postgres"
+
+UNREADABLE_DSN: Final = (
+    "the connection string is not valid: in a URL, percent-encode %, /, ?, # "
+    "and @ in the password; in key=value form, quote a value that holds a space"
+)
+"""
+What every driver raises, and the CLI prints, for a string it cannot read.
+
+A parser's own message can quote part of the string, password included, so
+the drivers raise this text instead and never chain the parser's error.
+"""
+
+_URI_SCHEMES: Final = ("postgresql://", "postgres://")
 
 
 def _invalid_dsn(component: str, problem: str) -> TypeError:
@@ -26,6 +39,52 @@ def _describe(value: object) -> str:
     if value is None or (isinstance(value, str) and not value.strip()):
         return repr(value)
     return f"a {type(value).__name__}"
+
+
+def is_ambiguous_uri(dsn: str) -> bool:
+    """
+    Tell whether a connection URI is one libpq and asyncpg would misread.
+
+    A parser reads ``u:pa@ss@host`` as the password ``pa`` and the host
+    ``ss@host``, and reads ``u:12/ss@h/db`` as the port ``12`` and the database
+    ``ss@h/db``. The server's or the resolver's error then quotes the rest of
+    the password, so such a URI is refused before any connection opens. A
+    key=value string, a multi-host URI (``h1:5432,h2:5433``), an IPv6 host
+    (``[::1]:5432``), an empty port and an ``@`` in the query are never
+    refused.
+
+    Args:
+        dsn: the connection string.
+
+    Returns:
+        ``True`` for a ``postgresql://`` or ``postgres://`` URI (the scheme in
+        any case) whose authority holds more than one ``@``, whose path holds
+        an ``@``, or whose port is not all ASCII digits.
+    """
+    lowered = dsn.lower()
+    for scheme in _URI_SCHEMES:
+        if lowered.startswith(scheme):
+            rest = dsn[len(scheme) :]
+            break
+    else:
+        return False
+    end = min(
+        (i for i in (rest.find("/"), rest.find("?")) if i >= 0), default=len(rest)
+    )
+    authority, tail = rest[:end], rest[end:]
+    # Only the path: the query is read apart, and its values may hold an "@".
+    path = tail.partition("?")[0]
+    if authority.count("@") > 1 or "@" in path:
+        return True
+    hosts = authority.rpartition("@")[2]
+    return not all(_is_port(host) for host in hosts.split(","))
+
+
+def _is_port(host: str) -> bool:
+    # The port is what follows the last ":" outside an IPv6 literal's brackets.
+    port = host.rpartition("]")[2] if "]" in host else host
+    port = port.rpartition(":")[2] if ":" in port else ""
+    return port == "" or (port.isascii() and port.isdigit())
 
 
 def require_dsn(dsn: Dsn, component: str) -> Dsn:

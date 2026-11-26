@@ -59,10 +59,6 @@ _CHECK_EXIT_STATUS = (
 )
 _BEHIND: Final = 3
 _NEEDS_A_PERSON: Final = 4
-_UNREADABLE_DSN: Final = (
-    "the connection string is not valid: in a URL, percent-encode %, /, ?, # "
-    "and @ in the password; in key=value form, quote a value that holds a space"
-)
 # libpq's password option: a word of the key=value form, quoted or not, or a
 # parameter of a URL's query.
 _PASSWORD_OPTION: Final = re.compile(
@@ -118,23 +114,13 @@ class _ConnectionStringError(Exception):
     """An error raised while a driver read, or connected with, a connection string."""
 
     def __init__(self, error: Exception, dsn: str) -> None:
-        super().__init__()
-        self.error = error
-        self.dsn = dsn
+        # Only the scrubbed text is kept: an attribute holding the string
+        # would reach an error tracker that captures locals or attributes.
+        super().__init__(f"{type(error).__name__}: {_without_dsn(str(error), dsn)}")
 
     def __str__(self) -> str:
         """The driver's error, without the connection string or its password."""
-        from taskiq_postgresql.utils.dsn import _describe  # noqa: PLC0415
-
-        name = type(self.error).__name__
-        unreadable = _unreadable(self.error)
-        if unreadable is not None:
-            return (
-                f"{name}: {_UNREADABLE_DSN}. The driver raised "
-                f"{_describe(unreadable)}, whose message is left out: it can "
-                "quote the password."
-            )
-        return f"{name}: {_without_dsn(str(self.error), self.dsn)}"
+        return str(self.args[0])
 
 
 def _run(args: list[str]) -> int:
@@ -769,28 +755,6 @@ async def _connecting(dsn: str) -> AsyncGenerator[None, None]:
         yield
     except Exception as error:
         raise _ConnectionStringError(error, dsn) from error
-
-
-def _unreadable(error: Exception) -> BaseException | None:
-    """Return the driver's own exception if it could not read the string."""
-    from taskiq_postgresql.exceptions import DatabaseConnectionError  # noqa: PLC0415
-
-    # asyncpg reads the string as it opens its pool and raises ValueError for
-    # what it cannot read, which the driver wraps; psqlpy refuses to build its
-    # pool. Either message can quote any part of the string.
-    if isinstance(error, DatabaseConnectionError) and isinstance(
-        error.__cause__,
-        ValueError,
-    ):
-        return error.__cause__
-    build_error = getattr(
-        sys.modules.get("psqlpy.exceptions"),
-        "ConnectionPoolBuildError",
-        None,
-    )
-    if build_error is not None and isinstance(error, build_error):
-        return error
-    return None
 
 
 def _without_dsn(text: str, dsn: str) -> str:

@@ -9,8 +9,6 @@ fails before a connection is attempted, or the driver's connect is replaced.
 
 from __future__ import annotations
 
-import random
-import string
 from pathlib import Path
 from typing import NoReturn
 from urllib.parse import unquote, urlsplit
@@ -23,16 +21,12 @@ from tests.helpers import (
     closed_local_port,
     importable_modules,
     with_netloc,
+    word,
 )
 from tests.test_cli import APP, run_in_process
 
 PROG = "taskiq postgresql"
 UNREADABLE = "the connection string is not valid"
-
-
-def word() -> str:
-    """Letters only, so no driver can read one as a port number."""
-    return "".join(random.choices(string.ascii_lowercase, k=12))
 
 
 @pytest.fixture
@@ -90,7 +84,6 @@ def test_a_connection_string_the_driver_cannot_read_is_not_quoted(
     assert code == 1
     assert_no_part_of(halves, out + err)
     assert err.startswith(f"{PROG}: error: DatabaseConnectionError: {UNREADABLE}")
-    assert "ValueError" in err
 
 
 def test_migrate_does_not_quote_a_connection_string_the_driver_cannot_read(
@@ -137,7 +130,7 @@ def test_a_connection_string_psqlpy_cannot_read_is_not_quoted(
 
     assert code == 1
     assert_no_part_of(halves, out + err)
-    assert err.startswith(f"{PROG}: error: ConnectionPoolBuildError: {UNREADABLE}")
+    assert err.startswith(f"{PROG}: error: DatabaseConnectionError: {UNREADABLE}")
 
 
 @pytest.mark.parametrize("value", ["", "  "], ids=["empty", "blank"])
