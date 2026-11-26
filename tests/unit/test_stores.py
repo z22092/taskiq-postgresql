@@ -9,11 +9,12 @@ before the stores existed.
 from __future__ import annotations
 
 import warnings
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 import pytest
 from taskiq import BrokerMessage
-from taskiq_postgresql.core.stores.messages import MessageStore
+from taskiq_postgresql.core.stores.results import ResultStore
 from typing_extensions import override
 
 from taskiq_postgresql.abc.driver import QueryDriver
@@ -27,9 +28,13 @@ from taskiq_postgresql.core.sql.catalog import (
     notify_statement,
 )
 from taskiq_postgresql.core.sql.identifier import Identifier
+from taskiq_postgresql.core.stores.messages import MessageStore
 from taskiq_postgresql.core.stores.schema import SchemaStore
+from taskiq_postgresql.exceptions import ResultIsMissingError
+from taskiq_postgresql.result_backend import Table as ResultTable
 
 DSN = "postgresql://postgres@localhost:5432/postgres"
+OTHER_DSN = "postgresql://postgres@localhost:5432/other"
 
 Call = tuple[str, tuple[Any, ...]]
 
@@ -226,6 +231,112 @@ async def test_a_message_store_binds_starts_and_closes_its_schema_store() -> Non
 def test_a_message_store_follows_a_driver_that_was_swapped() -> None:
     store, driver, _ = _message_store()
     other = RecordingDriver("other_messages")
+
+    assert store.driver is driver
+
+    store.driver = other
+
+    assert store.driver is other
+    assert store.schema.driver is other
+
+
+def _result_store() -> tuple[ResultStore, RecordingDriver, ResultTable]:
+    columns = ResultTable(primary_key=PrimaryKeyColumn(name="task_id", type_="Uuid"))
+    driver = RecordingDriver("taskiq_results")
+    return ResultStore(SchemaStore("result_backend", driver), columns), driver, columns
+
+
+@pytest.mark.anyio
+async def test_a_result_is_upserted_by_task_id() -> None:
+    store, driver, columns = _result_store()
+
+    await store.set("task-1", b"data")
+
+    assert driver.calls == [
+        (
+            "insert_or_update",
+            (
+                [columns.primary_key, columns.result],
+                ["task-1", b"data"],
+                [columns.primary_key],
+                [columns.result],
+            ),
+        ),
+    ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("ready", [True, False])
+async def test_a_result_is_ready_when_the_driver_says_it_exists(ready: bool) -> None:
+    store, driver, _ = _result_store()
+    driver.exists_returns = ready
+
+    assert await store.exists("task-1") is ready
+
+    assert driver.calls == [("exists", ("task-1",))]
+
+
+@pytest.mark.anyio
+async def test_a_result_is_selected_by_task_id() -> None:
+    store, driver, columns = _result_store()
+    driver.select_returns = [{"result": b"data"}, {"result": b"other"}]
+
+    assert await store.get("task-1") == b"data"
+
+    assert driver.calls == [
+        ("select", ([columns.result], [columns.primary_key], ["task-1"])),
+    ]
+
+
+@pytest.mark.anyio
+async def test_a_missing_result_raises_with_the_task_id() -> None:
+    store, driver, _ = _result_store()
+
+    with pytest.raises(ResultIsMissingError) as raised:
+        await store.get("task-1")
+
+    assert str(raised.value) == "Cannot find record with task_id = task-1 in PostgreSQL"
+    assert [name for name, _ in driver.calls] == ["select"]
+
+
+@pytest.mark.anyio
+async def test_a_result_is_deleted_by_task_id() -> None:
+    store, driver, columns = _result_store()
+
+    await store.delete("task-1")
+
+    assert driver.calls == [("delete", (columns.primary_key, "task-1"))]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("to_date", [None, datetime(2026, 2, 1, tzinfo=timezone.utc)])
+async def test_results_are_deleted_by_date_with_both_bounds_as_given(
+    to_date: Optional[datetime],
+) -> None:
+    store, driver, _ = _result_store()
+    from_date = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    await store.delete_by_date(from_date, to_date)
+
+    assert driver.calls == [("delete_by_date", (from_date, to_date))]
+
+
+@pytest.mark.anyio
+async def test_a_result_store_binds_starts_and_closes_its_schema_store() -> None:
+    store, driver, _ = _result_store()
+
+    store.bind(OTHER_DSN)
+    await store.start()
+    await store.close()
+
+    assert driver.connection_string == OTHER_DSN
+    assert driver.component_kind == "result_backend"
+    assert [name for name, _ in driver.calls] == ["on_startup", "on_shutdown"]
+
+
+def test_a_result_store_follows_a_driver_that_was_swapped() -> None:
+    store, driver, _ = _result_store()
+    other = RecordingDriver("other_results")
 
     assert store.driver is driver
 
