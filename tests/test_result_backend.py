@@ -1,6 +1,6 @@
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any, TypeVar
+from typing import Any, Optional, TypeVar
 
 import pytest
 from taskiq import TaskiqResult
@@ -10,6 +10,8 @@ from taskiq_postgresql.result_backend import PostgresqlResultBackend
 from tests.helpers import fetch_on_server
 
 _ReturnType = TypeVar("_ReturnType")
+
+_FROM_DATE = datetime(2024, 6, 15, 12, 0, tzinfo=timezone.utc)
 
 pytestmark = pytest.mark.anyio
 
@@ -182,12 +184,10 @@ async def test_when_the_backend_shuts_down__then_its_pool_is_closed(
     assert getattr(result_backend.driver, "pool", None) is None
 
 
-_FROM_DATE = datetime(2024, 6, 15, 12, 0, tzinfo=timezone.utc)
-
-
 async def _seed_results_around_from_date(
     backend: PostgresqlResultBackend[_ReturnType],
     dsn: str,
+    table: str,
     result: TaskiqResult[_ReturnType],
 ) -> dict[str, str]:
     """
@@ -206,7 +206,6 @@ async def _seed_results_around_from_date(
         "later": timedelta(days=2),
     }
     ids = {name: str(uuid.uuid4()) for name in offsets}
-    table = backend.driver.table_name
     for name, task_id in ids.items():
         await backend.set_result(task_id=task_id, result=result)
         await fetch_on_server(
@@ -223,35 +222,33 @@ async def _stored_task_ids(dsn: str, table: str) -> set[str]:
     return {str(row["task_id"]) for row in rows}
 
 
-async def test_when_to_date_is_left_out__then_everything_from_from_date_goes(
+@pytest.mark.parametrize(
+    ("to_date", "kept"),
+    [
+        pytest.param(None, {"before"}, id="no_to_date"),
+        pytest.param(
+            _FROM_DATE + timedelta(days=1),
+            {"before", "later"},
+            id="one_day_after",
+        ),
+    ],
+)
+async def test_when_delete_by_date_runs__then_the_rows_in_range_go(
     result_backend: PostgresqlResultBackend[_ReturnType],
     postgresql_dsn: str,
+    postgres_table: str,
     default_taskiq_result: TaskiqResult[_ReturnType],
+    to_date: Optional[datetime],
+    kept: set[str],
 ) -> None:
     ids = await _seed_results_around_from_date(
         result_backend,
         postgresql_dsn,
+        postgres_table,
         default_taskiq_result,
     )
 
-    await result_backend.delete_by_date(_FROM_DATE)
+    await result_backend.delete_by_date(_FROM_DATE, to_date)
 
-    remaining = await _stored_task_ids(postgresql_dsn, result_backend.driver.table_name)
-    assert remaining == {ids["before"]}
-
-
-async def test_when_to_date_is_given__then_only_the_inclusive_range_goes(
-    result_backend: PostgresqlResultBackend[_ReturnType],
-    postgresql_dsn: str,
-    default_taskiq_result: TaskiqResult[_ReturnType],
-) -> None:
-    ids = await _seed_results_around_from_date(
-        result_backend,
-        postgresql_dsn,
-        default_taskiq_result,
-    )
-
-    await result_backend.delete_by_date(_FROM_DATE, _FROM_DATE + timedelta(days=1))
-
-    remaining = await _stored_task_ids(postgresql_dsn, result_backend.driver.table_name)
-    assert remaining == {ids["before"], ids["later"]}
+    remaining = await _stored_task_ids(postgresql_dsn, postgres_table)
+    assert remaining == {ids[name] for name in kept}
