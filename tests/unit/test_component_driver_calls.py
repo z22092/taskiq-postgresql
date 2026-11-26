@@ -11,10 +11,12 @@ import asyncio
 import json
 import logging
 import warnings
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from datetime import datetime, timezone
+from functools import partial
 from types import TracebackType
 from typing import Any, Optional
+from unittest import mock
 
 import pytest
 from taskiq import BrokerMessage, ScheduledTask, TaskiqResult
@@ -52,6 +54,7 @@ class RecordingDriver(QueryDriver):
         self.select_returns: list[dict[str, Any]] = []
         self.exists_returns = True
         self.execute_raises: Optional[BaseException] = None
+        self.on_startup_raises: Optional[BaseException] = None
 
     def _record(self, name: str, *args: Any, **kwargs: Any) -> None:
         self.calls.append((name, args, kwargs))
@@ -146,6 +149,8 @@ class RecordingDriver(QueryDriver):
                 "query_timeout": self.query_timeout,
             },
         )
+        if self.on_startup_raises is not None:
+            raise self.on_startup_raises
 
     async def on_shutdown(self) -> None:
         """Record the call."""
@@ -259,6 +264,88 @@ def a_schedule(**fields: Any) -> ScheduledTask:
         kwargs={},
         **fields,
     )
+
+
+Operation = Callable[[], Awaitable[Any]]
+
+
+def a_broker_operation() -> tuple[Any, Operation, str]:
+    """Return a fresh broker, one operation on its driver and that call's name."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        broker = PostgresqlBroker(DSN, channel_name="MixedChannel")
+    return broker, partial(broker.kick, broker_message({"delay": "2.5"})), "insert"
+
+
+def a_result_backend_operation() -> tuple[Any, Operation, str]:
+    """Return a fresh result backend, one operation and that call's name."""
+    backend: PostgresqlResultBackend[Any] = PostgresqlResultBackend(DSN)
+    return backend, partial(backend.is_result_ready, "task-1"), "exists"
+
+
+def a_scheduler_source_operation() -> tuple[Any, Operation, str]:
+    """Return a fresh scheduler source, one operation and that call's name."""
+    source = PostgresqlSchedulerSource(DSN)
+    return source, partial(source.delete_schedule, "schedule-1"), "delete"
+
+
+OPERATIONS = pytest.mark.parametrize(
+    "operation_of",
+    [a_broker_operation, a_result_backend_operation, a_scheduler_source_operation],
+    ids=["broker", "result-backend", "scheduler-source"],
+)
+
+
+@pytest.mark.anyio
+@OPERATIONS
+async def test_when_the_driver_is_patched__then_the_operation_goes_to_the_patch(
+    operation_of: Callable[[], tuple[Any, Operation, str]],
+) -> None:
+    component, operation, method = operation_of()
+    original = component.driver
+    recording = recording_like(original)
+
+    with mock.patch.object(component, "driver", recording):
+        await operation()
+
+    assert [call[0] for call in recording.calls] == [method]
+    assert component.driver is original
+
+
+@pytest.mark.anyio
+@OPERATIONS
+async def test_when_the_driver_is_deleted_and_assigned__then_the_operation_goes_to_it(
+    operation_of: Callable[[], tuple[Any, Operation, str]],
+) -> None:
+    component, operation, method = operation_of()
+    recording = recording_like(component.driver)
+
+    del component.driver
+    component.driver = recording
+    await operation()
+
+    assert [call[0] for call in recording.calls] == [method]
+    assert component.driver is recording
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "make",
+    [make_broker, make_result_backend, make_scheduler_source],
+    ids=["broker", "result-backend", "scheduler-source"],
+)
+async def test_when_on_startup_raises__then_startup_raises_it_and_nothing_closes(
+    make: Callable[[], tuple[Any, ...]],
+) -> None:
+    component, driver, *_ = make()
+    error = RuntimeError("no startup")
+    driver.on_startup_raises = error
+
+    with pytest.raises(RuntimeError) as raised:
+        await component.startup()
+
+    assert raised.value is error
+    assert [call[0] for call in driver.calls] == ["on_startup"]
 
 
 class TestBroker:
