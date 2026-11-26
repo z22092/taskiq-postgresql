@@ -154,6 +154,36 @@ class SchemaStore:
             await _close_opened(driver)
 
 
+class TableStore:
+    """
+    What the stores of a component's table share: the schema store behind them.
+
+    Attributes:
+        schema: The store of the table, which starts, closes and describes it.
+    """
+
+    def __init__(self, schema: SchemaStore) -> None:
+        """Hold the store of the table."""
+        self.schema = schema
+
+    @property
+    def driver(self) -> QueryDriver:
+        """The query driver in use."""
+        return self.schema.driver
+
+    def bind(self, dsn: str) -> None:
+        """Point the driver at ``dsn`` and tell it which component owns the table."""
+        self.schema.bind(dsn)
+
+    async def start(self) -> None:
+        """Check or migrate the table."""
+        await self.schema.start()
+
+    async def close(self) -> None:
+        """Close the driver's pool."""
+        await self.schema.close()
+
+
 def schema_store(component: Any) -> SchemaStore:
     """
     Return the schema store of a component.

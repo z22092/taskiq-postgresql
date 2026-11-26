@@ -373,7 +373,7 @@ class PostgresqlBroker(AsyncBroker):
         self._configure_drivers()
 
     def _configure_drivers(self) -> None:
-        """Hand the recovery settings, and the kind of the table, to the drivers."""
+        """Hand the recovery settings to the drivers."""
         # Attributes, not constructor arguments: the bundled drivers pass every
         # keyword argument on to the connection.
         self._store.configure(self.query_timeout)

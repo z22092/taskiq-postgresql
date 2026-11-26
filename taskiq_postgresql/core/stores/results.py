@@ -4,23 +4,18 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+from taskiq_postgresql.core.stores.schema import TableStore
 from taskiq_postgresql.exceptions import ResultIsMissingError
 
 if TYPE_CHECKING:
     from datetime import date, datetime
 
-    from taskiq_postgresql.abc.driver import QueryDriver
     from taskiq_postgresql.core.stores.schema import SchemaStore
     from taskiq_postgresql.result_backend import Table
 
 
-class ResultStore:
-    """
-    The serialized results of one result backend.
-
-    Attributes:
-        schema: The store of the table, which starts, closes and describes it.
-    """
+class ResultStore(TableStore):
+    """The serialized results of one result backend."""
 
     def __init__(self, schema: SchemaStore, table: Table) -> None:
         """
@@ -30,25 +25,8 @@ class ResultStore:
             schema: The store of the table.
             table: The columns of the result backend's table.
         """
-        self.schema = schema
+        super().__init__(schema)
         self._table = table
-
-    @property
-    def driver(self) -> QueryDriver:
-        """The query driver in use."""
-        return self.schema.driver
-
-    def bind(self, dsn: str) -> None:
-        """Point the driver at ``dsn`` and tell it the backend owns the table."""
-        self.schema.bind(dsn)
-
-    async def start(self) -> None:
-        """Check or migrate the table."""
-        await self.schema.start()
-
-    async def close(self) -> None:
-        """Close the driver's pool."""
-        await self.schema.close()
 
     async def set(self, task_id: Any, data: bytes) -> None:
         """

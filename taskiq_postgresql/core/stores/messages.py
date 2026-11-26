@@ -10,22 +10,21 @@ from taskiq_postgresql.core.sql.catalog import (
     ClaimDueQuery,
     notify_statement,
 )
+from taskiq_postgresql.core.stores.schema import TableStore
 
 if TYPE_CHECKING:
     from taskiq import BrokerMessage
 
-    from taskiq_postgresql.abc.driver import QueryDriver
     from taskiq_postgresql.broker import Table
     from taskiq_postgresql.core.sql.identifier import Identifier
     from taskiq_postgresql.core.stores.schema import SchemaStore
 
 
-class MessageStore:
+class MessageStore(TableStore):
     """
     The messages of one broker.
 
     Attributes:
-        schema: The store of the table, which starts, closes and describes it.
         claim_due_statement: The claim of the oldest due message of a channel.
         claim_by_id_statement: The claim of the message a NOTIFY named.
     """
@@ -38,7 +37,7 @@ class MessageStore:
             schema: The store of the table.
             table: The columns of the broker's table.
         """
-        self.schema = schema
+        super().__init__(schema)
         self._table = table
         identifier = schema.declaration.table
         claim_columns = ClaimColumns(
@@ -57,34 +56,14 @@ class MessageStore:
             returning,
         )
 
-    @property
-    def driver(self) -> QueryDriver:
-        """The query driver in use."""
-        return self.schema.driver
-
-    def bind(self, dsn: str) -> None:
-        """Point the driver at ``dsn`` and tell it the broker owns the table."""
-        self.schema.bind(dsn)
-
     def configure(self, query_timeout: float) -> None:
         """
-        Hand the driver the kind of the table and the broker's query timeout.
+        Hand the driver the broker's query timeout.
 
         Args:
             query_timeout: Seconds a claim and a close may wait.
         """
-        # Attributes, not constructor arguments: the bundled drivers pass every
-        # keyword argument on to the connection.
-        self.driver.component_kind = self.schema.kind
         self.driver.query_timeout = query_timeout
-
-    async def start(self) -> None:
-        """Check or migrate the table."""
-        await self.schema.start()
-
-    async def close(self) -> None:
-        """Close the driver's pool."""
-        await self.schema.close()
 
     async def insert(
         self,

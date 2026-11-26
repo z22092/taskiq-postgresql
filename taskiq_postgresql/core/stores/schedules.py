@@ -4,19 +4,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+from taskiq_postgresql.core.stores.schema import TableStore
+
 if TYPE_CHECKING:
-    from taskiq_postgresql.abc.driver import QueryDriver
     from taskiq_postgresql.core.stores.schema import SchemaStore
     from taskiq_postgresql.scheduler_source import Table
 
 
-class ScheduleStore:
-    """
-    The schedules of one scheduler source.
-
-    Attributes:
-        schema: The store of the table, which starts, closes and describes it.
-    """
+class ScheduleStore(TableStore):
+    """The schedules of one scheduler source."""
 
     def __init__(self, schema: SchemaStore, table: Table) -> None:
         """
@@ -26,25 +22,8 @@ class ScheduleStore:
             schema: The store of the table.
             table: The columns of the scheduler source's table.
         """
-        self.schema = schema
+        super().__init__(schema)
         self._table = table
-
-    @property
-    def driver(self) -> QueryDriver:
-        """The query driver in use."""
-        return self.schema.driver
-
-    def bind(self, dsn: str) -> None:
-        """Point the driver at ``dsn`` and tell it the source owns the table."""
-        self.schema.bind(dsn)
-
-    async def start(self) -> None:
-        """Check or migrate the table."""
-        await self.schema.start()
-
-    async def close(self) -> None:
-        """Close the driver's pool."""
-        await self.schema.close()
 
     async def rows(self) -> Any:
         """

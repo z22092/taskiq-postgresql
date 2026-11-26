@@ -220,13 +220,13 @@ async def test_a_claim_by_id_runs_the_claim_query_with_the_id() -> None:
     assert store.claim_by_id_statement.text == query
 
 
-def test_configure_sets_the_kind_and_the_query_timeout_on_the_driver() -> None:
+def test_configure_sets_the_query_timeout_on_the_driver() -> None:
     store, driver, _ = _message_store()
 
     store.configure(QUERY_TIMEOUT)
 
-    assert driver.component_kind == "broker"
     assert driver.query_timeout == QUERY_TIMEOUT
+    assert driver.component_kind is None
 
 
 @pytest.mark.anyio
