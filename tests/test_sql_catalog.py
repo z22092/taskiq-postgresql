@@ -190,6 +190,28 @@ def _result_backend_cases() -> Cases:
             [c.columns.result],
             [c.columns.primary_key],
         ),
+        "select_ready": lambda c: c.driver.select_query.statement(
+            [c.columns.result],
+            [c.columns.primary_key],
+            [c.columns.result],
+        ),
+        "exists_ready": lambda c: ExistsQuery(c.table_name).statement(
+            c.columns.primary_key,
+            [c.columns.result],
+        ),
+        "progress_insert_or_update": lambda c: (
+            c.driver.insert_or_update_query.statement(
+                [c.columns.primary_key, c.columns.progress],
+                None,
+                [c.columns.primary_key],
+                "UPDATE",
+                [c.columns.progress],
+            )
+        ),
+        "progress_select": lambda c: c.driver.select_query.statement(
+            [c.columns.progress],
+            [c.columns.primary_key],
+        ),
         "delete": lambda c: c.driver.delete_query.statement(c.columns.primary_key),
         "delete_by_date": lambda c: c.driver.delete_by_date_query.statement(
             c.driver.created_at,

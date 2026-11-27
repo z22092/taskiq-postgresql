@@ -365,7 +365,7 @@ def test_pending_steps_come_by_table_name_then_by_step() -> None:
 
     plan = plan_migration(schemas, empty)
 
-    assert pending_of(plan) == [("a", 1), ("b", 1), ("b", 2), ("c", 1)]
+    assert pending_of(plan) == [("a", 1), ("a", 2), ("b", 1), ("b", 2), ("c", 1)]
     assert plan.statements() == migration_statements(
         sorted(schemas, key=lambda schema: schema.name),
     )
@@ -459,12 +459,28 @@ def test_through_stops_after_that_step() -> None:
     assert migration_statements([broker], through=2) == migration_statements([broker])
 
 
-@pytest.mark.parametrize("through", [0, 2, 3])
+@pytest.mark.parametrize("through", [0, 3])
 def test_through_must_name_a_step_every_table_has(through: int) -> None:
     schemas = [table_schema("broker"), table_schema("result_backend")]
 
     with pytest.raises(ValueError, match=f"not step {through}"):
         migration_statements(schemas, through=through)
+
+
+def test_through_2_names_a_step_the_broker_and_the_results_tables_both_have() -> None:
+    schemas = [table_schema("broker"), table_schema("result_backend")]
+
+    statements = migration_statements(schemas, through=2)
+
+    assert statements == migration_statements(schemas)
+    assert any("ALTER COLUMN result DROP NOT NULL" in text for text in statements)
+
+
+def test_through_2_is_refused_while_the_scheduler_table_has_one_step() -> None:
+    schemas = [table_schema("broker"), table_schema("scheduler_source")]
+
+    with pytest.raises(ValueError, match="not step 2"):
+        migration_statements(schemas, through=2)
 
 
 # --- released steps never change ----------------------------------------------
@@ -491,7 +507,16 @@ def golden_text() -> str:
                     f"-- {kind}{f' {field}' if field else ''}: step {step.number}",
                     f"-- creates table: {'yes' if objects.creates_table else 'no'}",
                     f"-- columns: {', '.join(objects.columns)}",
-                    f"-- indexes: {indexes}",
+                    # A step with no index leaves no trailing space for the
+                    # whitespace hook to strip.
+                    f"-- indexes: {indexes}".rstrip(),
+                    # Only a step that relaxes a column says so, so the lines of
+                    # the steps released before it stay as they were.
+                    *(
+                        [f"-- nullable columns: {', '.join(objects.nullable_columns)}"]
+                        if objects.nullable_columns
+                        else []
+                    ),
                     *(f"{statement};" for statement in step.statements),
                 ],
             )

@@ -1,11 +1,12 @@
 """
 Test-only tables whose steps relax a ``NOT NULL`` column.
 
-No released step does that yet, so the tests that need one describe their own
-table. ``relaxing_schema``: step 1 creates it with ``note TEXT NOT NULL``,
-step 2 runs ``ALTER COLUMN note DROP NOT NULL``, and the final description has
-``note`` nullable. ``late_relaxing_schema``: step 1 creates the table without
-``note``, step 2 adds it ``NOT NULL`` and step 3 relaxes it.
+The one step the package ships that does it is the result backend's step 2,
+so the tests that need every shape of such a step describe their own table.
+``relaxing_schema``: step 1 creates it with ``note TEXT NOT NULL``, step 2 runs
+``ALTER COLUMN note DROP NOT NULL``, and the final description has ``note``
+nullable. ``late_relaxing_schema``: step 1 creates the table without ``note``,
+step 2 adds it ``NOT NULL`` and step 3 relaxes it.
 """
 
 from __future__ import annotations

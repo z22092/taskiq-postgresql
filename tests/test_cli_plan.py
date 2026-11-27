@@ -35,6 +35,7 @@ from tests.helpers import (
     importable_modules,
     new_database,
     run_script,
+    script_of,
     with_netloc,
 )
 from tests.relax_schema import RELAXED, relaxing_schema
@@ -52,6 +53,7 @@ from tests.test_migrations import BROKER_TABLE_0_4_SQL, role_with
 
 PROG = "taskiq postgresql"
 BROKER = table_schema("broker")
+RESULTS = table_schema("result_backend")
 OLD_SQL = BROKER_TABLE_0_4_SQL.format(table=BROKER.name)
 CURRENT_SQL = render_sql([BROKER])
 # What a failed CREATE INDEX CONCURRENTLY leaves (superuser only).
@@ -377,7 +379,8 @@ def test_the_plan_brings_a_database_to_what_a_new_install_holds(
     code, script, err = run_in_process(["plan", *target], capsys)
     assert code == 0, err
     assert (
-        "\n-- pending: cli_messages step 2, cli_results step 1, cli_schedules step 1\n"
+        "\n-- pending: cli_messages step 2, cli_results step 1, cli_results step 2, "
+        "cli_schedules step 1\n"
     ) in script
     asyncio.run(run_script(scratch_dsn, driver, script))
 
@@ -419,13 +422,14 @@ def test_plan_reads_one_database_and_check_reads_each(
     assert code == 0, err
     assert (
         "\n-- pending: taskiq_messages step 1, taskiq_messages step 2, "
-        "taskiq_results step 1\n"
+        "taskiq_results step 1, taskiq_results step 2\n"
     ) in out
 
     code, out, err = run_in_process(["check", *target], capsys)
     assert (code, out) == (3, "")
     assert f"{PROG}: pending: taskiq_messages step 1 (required): " in err
     assert f"{PROG}: pending: taskiq_results step 1 (required): " in err
+    assert f"{PROG}: pending: taskiq_results step 2 (required): " in err
 
 
 def test_plan_fails_with_1_on_a_target_without_a_component(
@@ -716,3 +720,44 @@ def test_check_without_any_driver_helps_and_says_what_to_install() -> None:
     assert "--json" in helped.stdout
     assert failed.returncode == 1
     assert "pip install taskiq-postgresql[asyncpg]" in failed.stderr
+
+
+def test_plan_and_check_find_progress_missing_from_a_results_table_of_step_1(
+    scratch_dsn: str,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # The table a released version creates: step 1 of the results table.
+    execute(scratch_dsn, script_of(RESULTS.steps[0].statements))
+    options = ["--component", "result_backend", "--dsn", scratch_dsn]
+
+    code, out, err = run_in_process(["check", *options, "--json"], capsys)
+
+    assert code == 3  # noqa: PLR2004
+    (item,) = json.loads(out)["pending"]
+    assert (item["table"], item["step"], item["severity"]) == (
+        RESULTS.name,
+        2,
+        "required",
+    )
+    assert item["missing"] == {"table": False, "columns": ["progress"], "indexes": []}
+    assert item["not_null_columns"] == ["result"]
+    assert (
+        f"{PROG}: pending: {RESULTS.name} step 2 (required): missing columns: "
+        "progress; columns still NOT NULL: result\n"
+    ) in err
+
+    code, out, err = run_in_process(["plan", *options], capsys)
+
+    assert code == 0, err
+    assert f"\n-- pending: {RESULTS.name} step 2\n" in out
+    for statement in RESULTS.steps[1].statements:
+        assert f"{statement};\n" in out
+    assert "step 1 " not in out
+    assert "ACCESS EXCLUSIVE" in err
+
+    execute(scratch_dsn, out)
+    code, out, err = run_in_process(["check", *options], capsys)
+
+    assert (code, out) == (0, "")
+    assert f"tables up to date: {RESULTS.name}" in err
+    assert run_in_process(["plan", *options], capsys)[:2] == (0, "")

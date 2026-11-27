@@ -6,7 +6,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
-from taskiq_postgresql.core.sql.catalog import AddedIndex, Column
+from taskiq_postgresql.core.sql.catalog import AddedIndex, Column, DeclaredStep
 
 if TYPE_CHECKING:
     from taskiq_postgresql.abc.driver import QueryDriver
@@ -29,9 +29,9 @@ class TableDeclaration:
             of ``CREATE TABLE``.
         created_at: The ``created_at`` column.
         index_columns: The columns with a hash index; ``None`` creates none.
-        added_columns: Columns added after ``CREATE TABLE``, so that a table an
-            older release created gets them too.
-        added_indexes: Indexes added with ``added_columns``.
+        steps: The migration steps after ``CREATE TABLE``, in the order they
+            run: step 2 is the first of them. What a step adds goes in after
+            the ``CREATE``s, so a table an older release created gets it too.
     """
 
     table: Identifier
@@ -39,8 +39,17 @@ class TableDeclaration:
     columns: Sequence[Column]
     created_at: Column
     index_columns: Optional[Sequence[Column]]
-    added_columns: Sequence[Column] = ()
-    added_indexes: Sequence[AddedIndex] = ()
+    steps: Sequence[DeclaredStep] = ()
+
+    @property
+    def added_columns(self) -> tuple[Column, ...]:
+        """The columns every step adds, in the order the steps run."""
+        return tuple(column for step in self.steps for column in step.added_columns)
+
+    @property
+    def added_indexes(self) -> tuple[AddedIndex, ...]:
+        """The indexes every step adds, in the order the steps run."""
+        return tuple(index for step in self.steps for index in step.added_indexes)
 
     @property
     def table_columns(self) -> tuple[Column, ...]:
@@ -56,7 +65,8 @@ class TableDeclaration:
             driver: The query driver of a component, or one a third party wrote.
 
         Returns:
-            The driver's own objects, not copies.
+            The driver's own objects, not copies. A driver built the old way,
+            with ``added_columns`` and ``added_indexes``, has them as one step.
         """
         return cls(
             table=driver.table,
@@ -64,6 +74,5 @@ class TableDeclaration:
             columns=driver.columns,
             created_at=driver.created_at,
             index_columns=driver.index_columns,
-            added_columns=driver.added_columns,
-            added_indexes=driver.added_indexes,
+            steps=driver.steps,
         )

@@ -198,6 +198,77 @@ class DropNotNullQuery(QueryBase):
         return Script(self.make_query(column))
 
 
+class DeclaredStep(NamedTuple):
+    """
+    One migration step after ``CREATE TABLE``, as a component declares it.
+
+    The steps of a table run in the order they are declared, as steps 2, 3 and
+    so on (step 1 is ``CREATE TABLE`` and its hash indexes), and a released
+    step never changes: a later release declares one more.
+
+    Attributes:
+        added_columns: Columns the step adds with ``ADD COLUMN IF NOT EXISTS``.
+        added_indexes: Indexes the step creates, after its columns.
+        nullable_columns: Names of columns the step makes accept ``NULL``
+            (``DropNotNullQuery``), after it added what it adds.
+    """
+
+    added_columns: Sequence[Column] = ()
+    added_indexes: Sequence[AddedIndex] = ()
+    nullable_columns: Sequence[str] = ()
+
+
+def declared_step_statements(
+    table: Union[str, Identifier],
+    step: DeclaredStep,
+) -> tuple[str, ...]:
+    """
+    Return the statements of a step, one by one, without the trailing ``;``.
+
+    The one place that turns a declared step into SQL: ``run_migrations=True``
+    runs them (``declared_step_script``) and the migration description holds
+    them, so the two cannot differ.
+
+    Args:
+        table: The table, as configured or already checked.
+        step: The step.
+
+    Returns:
+        The ``ALTER TABLE ... ADD COLUMN`` statement when the step adds
+        columns, then one ``CREATE INDEX`` for each added index, then one
+        ``ALTER COLUMN ... DROP NOT NULL`` for each nullable column.
+    """
+    add = AddColumnsQuery(table)
+    drop = DropNotNullQuery(table)
+    statements = []
+    if step.added_columns:
+        statements.append(add.make_query(step.added_columns).removesuffix(";"))
+    statements.extend(
+        add.make_query((), [index]).removesuffix(";") for index in step.added_indexes
+    )
+    statements.extend(
+        drop.make_query(column).removesuffix(";") for column in step.nullable_columns
+    )
+    return tuple(statements)
+
+
+def declared_step_script(table: Union[str, Identifier], step: DeclaredStep) -> str:
+    """
+    Return the statements of a step as one script, each ending with ``;``.
+
+    Args:
+        table: The table, as configured or already checked.
+        step: The step.
+
+    Returns:
+        The statements of ``declared_step_statements``, one per line, to run in
+        one call without parameters.
+    """
+    return "\n".join(
+        f"{statement};" for statement in declared_step_statements(table, step)
+    )
+
+
 class RelationsExistQuery(QueryBase):
     """
     Query telling whether a table and every index it gets all exist.

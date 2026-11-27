@@ -132,10 +132,15 @@ Created by `on_startup` only when the component gets `run_migrations=True`,
 with `CREATE TABLE IF NOT EXISTS` and hash indexes. The broker's table then
 gets its `channel` and `not_before` columns and a btree index on them from
 `AddColumnsQuery` (`ALTER TABLE ... ADD COLUMN IF NOT EXISTS`, then `CREATE
-INDEX IF NOT EXISTS`), so a table created by 0.4.x ends up with the same
-columns as a new one. The DDL is additive, or relaxes `NOT NULL`
-(`DropNotNullQuery`; [ADR 0011](adr/0011-steps-may-relax-not-null.md)): nothing
-is removed or renamed. `tests/unit/test_components.py::test_default_schema`
+INDEX IF NOT EXISTS`), and the result backend's table its `progress` column
+and a `result` that accepts `NULL` (`ADD COLUMN IF NOT EXISTS`, then
+`DropNotNullQuery`), so a table created by 0.4.x ends up with the same columns
+as a new one. The DDL is additive, or relaxes `NOT NULL`
+([ADR 0011](adr/0011-steps-may-relax-not-null.md)): nothing is removed or
+renamed. The result backend's step 2 is the first step that relaxes a column of
+a real table, which is why a reader that does not know about progress breaks on
+it; the changelog's upgrade notes give the order (readers first, then
+workers). `tests/unit/test_components.py::test_default_schema`
 pins the `CREATE TABLE` and hash index DDL below, and
 `tests/test_migrations.py::test_add_claim_columns_query_is_the_upgrade_sql` the
 added columns and their index.
@@ -150,7 +155,9 @@ no migration step is pending, it returns without a lock or DDL, so a role with
 only DML privileges can start. Otherwise it takes
 `pg_advisory_xact_lock(hashtext('taskiq_postgresql'), hashtext(<table name>))`
 (`MigrationLockQuery`) and runs the DDL in that transaction: `CREATE TABLE`,
-the hash indexes, then the added columns and their index, before the commit.
+the hash indexes, then each later step's statements as one script (the added
+columns and their index, the `progress` column and the relaxed `result`),
+before the commit.
 A concurrent startup waits for the commit, and its `IF NOT EXISTS` then finds
 the objects. The lock key stays the same across releases, so two versions in a
 rolling deploy also wait for each other. Then it logs a warning for each
@@ -172,8 +179,11 @@ DDL once its table and indexes exist.
 `taskiq_postgresql/migrations.py` describes each table twice, from the same
 builders: as columns and indexes (`TableSchema`), and as the ordered
 statements `on_startup` runs (`MigrationStep`: step 1 is `CREATE TABLE` and
-its indexes; step 2, on the broker's table only, the added columns and their
-index). `taskiq postgresql
+its indexes; step 2 and later come from the declaration's ordered list of
+`DeclaredStep`: on the broker's table the added columns and their index, on the
+result backend's the `progress` column and the relaxed `result`, and none on
+the scheduler's). One catalog function, `declared_step_statements`, builds each
+step's statements for both. `taskiq postgresql
 generate` (`cli.py`) renders the steps as a script for another migration tool,
 with the same advisory lock and, by default, a `SET LOCAL lock_timeout` first,
 so that a run against a live database fails instead of queueing behind open
@@ -270,12 +280,15 @@ hand-written revision (`step_statements(..., through=N)`), and `alembic check`
 fails while a step is missing because `TaskiqStepOp` is an upgrade operation.
 
 `contrib/django/` is a Django app (label `taskiq_postgresql`) with
-migrations and no models. Its migration `000N` holds one `RunTaskiqStep(N)`
-(`operations.py`): when `migrate` applies it, the operation reads
+migrations and no models. Migration `0001` holds `RunTaskiqStep(1)` and each
+later one a `RunTaskiqStep(N, kind=...)` (`operations.py`): `0002` the broker's
+step 2 and `0003` the result backend's. When `migrate` applies one, the
+operation reads
 `TASKIQ_POSTGRESQL_TARGETS` (`conf.py`: `module:object` paths and dicts given
 to `table_schema`, all resolved by `collect_schemas`, which describes each
 table once) and `TASKIQ_POSTGRESQL_LOCK_TIMEOUT`, and runs
-`step_statements(..., step=N)` for the configured tables through the schema
+`step_statements(..., step=N, kind=kind)` for the configured tables of its kind
+(every table for step 1) through the schema
 editor, one statement at a time and without parameters, in the migration's
 transaction: the advisory locks in name order and the steps' statements,
 bounded as the Alembic steps are. So `sqlmigrate` shows the SQL, a router's
@@ -286,8 +299,11 @@ empty targets, and a table name that is not a plain SQL identifier, raise
 a system check (`taskiq_postgresql.E001`, `E002`) that reads the settings, and
 the names of the dicts, without importing the paths (`parse_target` only
 checks their form). Because the migrations are static and read the settings
-when they run, a step added by a release needs a new migration file;
-`tests/test_contrib_django.py` pins one migration per step.
+when they run, a step added by a release needs a new migration file, one per
+step and kind of table, because step 2 of the broker's table and step 2 of the
+result backend's are two steps (`RunTaskiqStep(number, kind=...)` runs one of
+them through `step_statements(..., kind=...)`);
+`tests/test_contrib_django.py` pins one migration per step and kind.
 `contrib/django_format.py` is the `django` migration format: one
 `migrations.RunSQL` per step and table with the SQL written out, so the file
 imports only Django, `RunSQL.noop` as reverse, and the option `dependencies`
@@ -297,12 +313,16 @@ Django itself, so `generate --format django` works without the extra.
 | Table | Columns | Indexes |
 |---|---|---|
 | `taskiq_messages` | `id SERIAL` (PK), `task_id` (type from `field_for_task_id`), `task_name VARCHAR`, `message BYTEA`, `labels JSONB`, `created_at`; added: `channel VARCHAR`, `not_before TIMESTAMP WITH TIME ZONE` | hash on `id`; added: btree `taskiq_messages_not_before_idx` on `(channel, not_before, id)` |
-| `taskiq_results` | `task_id` (PK, type from `field_for_task_id`), `result BYTEA`, `created_at` | hash on `task_id` |
+| `taskiq_results` | `task_id` (PK, type from `field_for_task_id`), `result BYTEA` (nullable), `created_at`; added: `progress BYTEA` (nullable) | hash on `task_id` |
 | `taskiq_schedulers` | `id UUID` (PK), `task_name VARCHAR(100)`, `schedule JSONB`, `updated_at`, `created_at` | hash on `id` and on `task_name` |
 
-All columns but the broker's `channel` are `NOT NULL`; `created_at`,
-`updated_at` and `not_before` default to `NOW()`. A row stored by 0.4.x has no
-`channel`.
+All columns but the broker's `channel` and the result backend's `result` and
+`progress` are `NOT NULL`; `created_at`, `updated_at` and `not_before` default
+to `NOW()`. A row stored by 0.4.x has no `channel`. A row of the results table
+holds a result, a progress report or both, each written by its own upsert; only
+a row with `result IS NOT NULL` is a ready result. `progress` is UTF-8 JSON
+(`TaskProgress.model_dump_json()`), whatever the backend's `serializer` is, and
+`keep_results=False` deletes the row, progress included, when a result is read.
 
 ### Queries by operation
 
@@ -312,8 +332,10 @@ All columns but the broker's `channel` are `NOT NULL`; `created_at`,
 | `PostgresqlBroker.listen`, sweep | `ClaimDueQuery`, run by `fetch_row` | `DELETE FROM ... WHERE id = (SELECT id ... WHERE channel = $1 AND not_before <= NOW() ORDER BY not_before, id LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING message` |
 | `PostgresqlBroker.listen`, notified id | `ClaimByIdQuery`, run by `fetch_row` | `DELETE FROM ... WHERE id = $2 AND not_before <= NOW() AND (channel = $1 OR channel IS NULL) RETURNING message` |
 | `PostgresqlResultBackend.set_result` | `InsertOrUpdateQuery` | `INSERT ... ON CONFLICT (task_id) DO UPDATE SET result = EXCLUDED.result` |
-| `is_result_ready` | `SelectQuery` | `SELECT 1 FROM ... WHERE task_id = $1` |
-| `get_result` | `SelectQuery`, then `DeleteQuery` unless `keep_results` | `SELECT result ... WHERE task_id = $1` |
+| `is_result_ready` | `ExistsQuery` | `SELECT 1 FROM ... WHERE task_id = $1 AND result IS NOT NULL` |
+| `get_result` | `SelectQuery`, then `DeleteQuery` unless `keep_results` | `SELECT result ... WHERE task_id = $1 AND result IS NOT NULL`; a row without a result raises `ResultIsMissingError` before any `DELETE` |
+| `set_progress` (nothing when `store_progress` is `False`) | `InsertOrUpdateQuery` | `INSERT (task_id, progress) ... ON CONFLICT (task_id) DO UPDATE SET progress = EXCLUDED.progress` |
+| `get_progress` | `SelectQuery` | `SELECT progress ... WHERE task_id = $1`; `None` without a row or with a `NULL` |
 | `delete_by_date` | `DeleteByDateQuery` | `DELETE ... WHERE created_at >= $1 AND ($2::... IS NULL OR created_at <= $2)`, so a `NULL` `to_date` means no upper bound |
 | `PostgresqlSchedulerSource.get_schedules` | `SelectQuery` | `SELECT id, schedule FROM ...` |
 | `add_schedule` | `InsertQuery` | `INSERT (id, task_name, schedule) ...` |
@@ -394,7 +416,8 @@ sequenceDiagram
     `async with driver`, before any pool exists;
   - a component built with a callable DSN raises it when used before
     `startup()`, since its drivers have no connection string yet.
-- `ResultIsMissingError`: `get_result` finds no row for the task id.
+- `ResultIsMissingError`: `get_result` finds no result for the task id: no
+  row, or a row that holds only progress.
 - `asyncio.TimeoutError`: asyncpg's and psycopg's `fetch_row` got no answer
   within `query_timeout`; asyncpg's `connection()` found no free pooled
   connection within it, so `kick()` raises it when the pool stays exhausted.

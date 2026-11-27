@@ -273,6 +273,72 @@ def test_exists_query_statement_is_the_text_the_drivers_build_today() -> None:
     assert statement.columns == (("?column?", ParamType.INT4),)
 
 
+def test_select_can_leave_out_a_row_whose_column_is_null() -> None:
+    key = Column("task_id", "UUID")
+    result = Column("result", "BYTEA")
+    query = SelectQuery("taskiq_results")
+
+    text = query.make_query([result], [key], not_null=[result])
+    statement = query.statement([result], [key], not_null=[result])
+
+    assert text == (
+        "SELECT result FROM taskiq_results WHERE task_id = $1 AND result IS NOT NULL"
+    )
+    assert isinstance(statement, Statement)
+    assert statement.text == text
+    assert statement.params == (ParamType.UUID,)
+    assert statement.columns == (("result", ParamType.BYTEA),)
+
+
+def test_select_with_no_filter_column_still_applies_the_null_check() -> None:
+    result = Column("result", "BYTEA")
+
+    assert SelectQuery("taskiq_results").make_query([result], not_null=[result]) == (
+        "SELECT result FROM taskiq_results WHERE result IS NOT NULL"
+    )
+
+
+def test_select_without_a_null_check_is_the_text_it_always_was() -> None:
+    key = Column("task_id", "UUID")
+    result = Column("result", "BYTEA")
+    query = SelectQuery("taskiq_results")
+
+    assert query.make_query([result], [key]) == (
+        "SELECT result FROM taskiq_results WHERE task_id = $1"
+    )
+    assert query.make_query([result], [key], []) == query.make_query([result], [key])
+    assert query.make_query([result]) == "SELECT result FROM taskiq_results "
+
+
+def test_exists_can_require_columns_not_null() -> None:
+    key = Column("task_id", "UUID")
+    result = Column("result", "BYTEA")
+    query = catalog.ExistsQuery("taskiq_results")
+
+    text = query.make_query(key, not_null=[result])
+    statement = query.statement(key, not_null=[result])
+
+    assert text == (
+        "SELECT 1 FROM taskiq_results WHERE task_id = $1 AND result IS NOT NULL"
+    )
+    assert isinstance(statement, Statement)
+    assert statement.text == text
+    assert statement.params == (ParamType.UUID,)
+    assert statement.columns == (("?column?", ParamType.INT4),)
+    # No check, no change.
+    assert query.make_query(key) == "SELECT 1 FROM taskiq_results WHERE task_id = $1"
+    assert query.make_query(key, []) == query.make_query(key)
+
+
+def test_exists_names_each_column_that_must_not_be_null() -> None:
+    key = Column("task_id", "UUID")
+
+    assert catalog.ExistsQuery("t").make_query(
+        key,
+        not_null=[Column("a", "TEXT"), Column("b", "TEXT")],
+    ) == ("SELECT 1 FROM t WHERE task_id = $1 AND a IS NOT NULL AND b IS NOT NULL")
+
+
 def test_notify_statement_has_no_result_column() -> None:
     statement = catalog.notify_statement()
 

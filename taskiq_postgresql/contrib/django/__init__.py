@@ -5,7 +5,7 @@ Install it with ``pip install 'taskiq-postgresql[django]'``, add
 ``"taskiq_postgresql.contrib.django"`` to ``INSTALLED_APPS`` and name the
 components in ``TASKIQ_POSTGRESQL_TARGETS``: ``manage.py migrate`` then
 creates their tables with the SQL ``run_migrations=True`` runs. The app has no
-models, only migrations, one per migration step (see
+models, only migrations, one per migration step and kind of table (see
 ``taskiq_postgresql.contrib.django.operations``), under the label
 ``taskiq_postgresql``.
 

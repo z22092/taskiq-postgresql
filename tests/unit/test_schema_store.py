@@ -7,8 +7,9 @@ here needs a database.
 
 from __future__ import annotations
 
+import dataclasses
 from contextlib import asynccontextmanager
-from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional
+from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, cast
 
 import pytest
 from typing_extensions import override
@@ -32,6 +33,7 @@ from taskiq_postgresql.core.stores.schema import (
     schema_store,
 )
 from taskiq_postgresql.core.stores.startup import Session, start_table
+from tests.helpers import build_component
 
 if TYPE_CHECKING:
     from taskiq_postgresql.migrations import ComponentKind
@@ -225,6 +227,8 @@ def test_the_schema_is_the_declared_one() -> None:
 
 
 def test_build_driver_makes_the_driver_the_declaration_describes() -> None:
+    from taskiq_postgresql.core.sql.catalog import DeclaredStep  # noqa: PLC0415
+
     key = PrimaryKeyColumn(name="id", type_="SERIAL")
     body = Column("body", "TEXT")
     created_at = CreatedAtColumn()
@@ -236,8 +240,7 @@ def test_build_driver_makes_the_driver_the_declaration_describes() -> None:
         columns=[body],
         created_at=created_at,
         index_columns=[key],
-        added_columns=[added],
-        added_indexes=[index],
+        steps=[DeclaredStep(added_columns=[added], added_indexes=[index])],
     )
 
     driver = build_driver(
@@ -254,6 +257,11 @@ def test_build_driver_makes_the_driver_the_declaration_describes() -> None:
     assert TableDeclaration.of_driver(driver) == declaration
     assert driver.primary_key is key
     assert driver.created_at is created_at
+    # The constructor keeps what every step adds, for the checks that need all
+    # of it; the steps themselves are set after it.
+    assert driver.steps is declaration.steps
+    assert list(driver.added_columns) == [added]
+    assert list(driver.added_indexes) == [index]
 
 
 class _Connection:
@@ -326,6 +334,54 @@ async def test_a_table_is_created_with_the_statements_the_driver_builds() -> Non
             (),
         ),
     ]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("kind", ["broker", "result_backend", "scheduler_source"])
+async def test_a_table_is_migrated_with_the_statements_of_every_step(
+    kind: str,
+) -> None:
+    from taskiq_postgresql.core.stores.startup import _migrate  # noqa: PLC0415
+
+    # Every table runs the lock, step 1, then each later step as one script of
+    # its statements, which the table's description holds one by one.
+    driver = build_component(kind, table_name="jobs").driver
+    declaration = TableDeclaration.of_driver(driver)
+    schema = migrations.table_schema(driver)
+    connection = _Connection(probe_answer=None)
+
+    await _migrate(declaration, cast("Session", connection))
+
+    lock = driver.migration_lock_query
+    create, *indexes = schema.steps[0].statements
+    expected: list[tuple[str, tuple[Any, ...]]] = [
+        (lock.make_query(), tuple(lock.params())),
+        (create, ()),
+        ("\n".join(f"{statement};" for statement in indexes), ()),
+        *(
+            ("\n".join(f"{statement};" for statement in step.statements), ())
+            for step in schema.steps[1:]
+        ),
+    ]
+    assert connection.executed == expected
+    assert len(schema.steps) == len(declaration.steps) + 1
+
+
+@pytest.mark.anyio
+async def test_a_step_that_declares_nothing_runs_nothing() -> None:
+    from taskiq_postgresql.core.sql.catalog import DeclaredStep  # noqa: PLC0415
+    from taskiq_postgresql.core.stores.startup import _migrate  # noqa: PLC0415
+
+    driver = FakeDriver()
+    declaration = dataclasses.replace(
+        TableDeclaration.of_driver(driver),
+        steps=[DeclaredStep()],
+    )
+    connection = _Connection(probe_answer=None)
+
+    await _migrate(declaration, cast("Session", connection))
+
+    assert len(connection.executed) == 3  # noqa: PLR2004
 
 
 @pytest.mark.anyio

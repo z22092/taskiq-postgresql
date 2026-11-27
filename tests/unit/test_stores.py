@@ -66,6 +66,9 @@ class RecordingDriver(QueryDriver):
         self.fetch_row_returns: Optional[dict[str, Any]] = None
         self.select_returns: list[dict[str, Any]] = []
         self.exists_returns = True
+        # The keywords a read was given, by call: only ``not_null`` is one, and
+        # each test asserts the keywords of its store, so none passes unseen.
+        self.keywords: list[tuple[str, dict[str, Any]]] = []
 
     @override
     async def __aenter__(self) -> Any:
@@ -104,13 +107,15 @@ class RecordingDriver(QueryDriver):
     @override
     async def select(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append(("select", args))
-        assert kwargs == {}
+        assert set(kwargs) <= {"not_null"}
+        self.keywords.append(("select", kwargs))
         return self.select_returns
 
     @override
     async def exists(self, *args: Any, **kwargs: Any) -> Any:
         self.calls.append(("exists", args))
-        assert kwargs == {}
+        assert set(kwargs) <= {"not_null"}
+        self.keywords.append(("exists", kwargs))
         return self.exists_returns
 
     @override
@@ -286,12 +291,14 @@ async def test_a_result_is_upserted_by_task_id() -> None:
 @pytest.mark.anyio
 @pytest.mark.parametrize("ready", [True, False])
 async def test_a_result_is_ready_when_the_driver_says_it_exists(ready: bool) -> None:
-    store, driver, _ = _result_store()
+    store, driver, columns = _result_store()
     driver.exists_returns = ready
 
     assert await store.exists("task-1") is ready
 
+    # A row that holds only progress has no result: it does not count.
     assert driver.calls == [("exists", ("task-1",))]
+    assert driver.keywords == [("exists", {"not_null": [columns.result]})]
 
 
 @pytest.mark.anyio
@@ -304,17 +311,82 @@ async def test_a_result_is_selected_by_task_id() -> None:
     assert driver.calls == [
         ("select", ([columns.result], [columns.primary_key], ["task-1"])),
     ]
+    assert driver.keywords == [("select", {"not_null": [columns.result]})]
 
 
 @pytest.mark.anyio
 async def test_a_missing_result_raises_with_the_task_id() -> None:
-    store, driver, _ = _result_store()
+    store, driver, columns = _result_store()
 
     with pytest.raises(ResultIsMissingError) as raised:
         await store.get("task-1")
 
     assert str(raised.value) == "Cannot find record with task_id = task-1 in PostgreSQL"
     assert [name for name, _ in driver.calls] == ["select"]
+    assert driver.keywords == [("select", {"not_null": [columns.result]})]
+
+
+@pytest.mark.anyio
+async def test_progress_is_upserted_by_task_id_in_its_own_column() -> None:
+    store, driver, columns = _result_store()
+
+    await store.set_progress("task-1", b'{"state":"STARTED"}')
+
+    # It names the progress column and not the result column, so the upsert
+    # leaves a result already stored alone, and a result's upsert leaves the
+    # progress alone.
+    assert driver.calls == [
+        (
+            "insert_or_update",
+            (
+                [columns.primary_key, columns.progress],
+                ["task-1", b'{"state":"STARTED"}'],
+                [columns.primary_key],
+                [columns.progress],
+            ),
+        ),
+    ]
+    assert columns.progress.name == "progress"
+    assert columns.progress.nullable
+
+
+@pytest.mark.anyio
+async def test_progress_is_selected_by_task_id() -> None:
+    store, driver, columns = _result_store()
+    driver.select_returns = [{"progress": b'{"state":"STARTED"}'}]
+
+    assert await store.get_progress("task-1") == b'{"state":"STARTED"}'
+
+    assert driver.calls == [
+        ("select", ([columns.progress], [columns.primary_key], ["task-1"])),
+    ]
+    # No readiness check: a row with progress and no result has progress.
+    assert driver.keywords == [("select", {})]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("returned", [[], [{"progress": None}]])
+async def test_there_is_no_progress_without_a_row_or_with_a_null(
+    returned: list[dict[str, Any]],
+) -> None:
+    store, driver, _ = _result_store()
+    driver.select_returns = returned
+
+    assert await store.get_progress("task-1") is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("returned", [memoryview(b"{}"), bytearray(b"{}"), b"{}"])
+async def test_progress_comes_back_as_bytes_whatever_the_driver_returns(
+    returned: Any,
+) -> None:
+    store, driver, _ = _result_store()
+    driver.select_returns = [{"progress": returned}]
+
+    found = await store.get_progress("task-1")
+
+    assert type(found) is bytes
+    assert found == b"{}"
 
 
 @pytest.mark.anyio
@@ -387,6 +459,9 @@ async def test_the_schedules_are_selected_by_id_and_schedule() -> None:
 
     assert rows == [{"id": "schedule-1", "schedule": "{}"}]
     assert driver.calls == [("select", ([columns.primary_key, columns.schedule],))]
+    # The schedules have no null check: the keyword is not passed at all, as
+    # before select and exists took it.
+    assert driver.keywords == [("select", {})]
 
 
 @pytest.mark.anyio

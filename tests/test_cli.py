@@ -126,6 +126,9 @@ GOLDEN_RESULTS = (
     "created_at TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW());\n"
     "CREATE INDEX IF NOT EXISTS jobs_results_task_id_idx ON jobs_results "
     "USING HASH (task_id);\n"
+    "ALTER TABLE jobs_results\n"
+    "  ADD COLUMN IF NOT EXISTS progress BYTEA;\n"
+    "ALTER TABLE jobs_results ALTER COLUMN result DROP NOT NULL;\n"
 )
 
 

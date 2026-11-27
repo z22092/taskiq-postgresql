@@ -4,9 +4,10 @@ Migration steps that relax ``NOT NULL``, without a database.
 A step may make a column nullable (``StepObjects.nullable_columns``). The plan
 finds such a step pending while the column is still ``NOT NULL``, and every
 consumer of the plan (``check``, the startup check, Alembic) follows from
-that. The tables here are described by hand, because no released step relaxes
-a column yet: see ``tests/relax_schema.py``. The Alembic side is in
-``test_alembic_relax.py``.
+that. Most tables here are described by hand (``tests/relax_schema.py``), to try
+every shape of such a step; the one real step that relaxes a column is the
+result backend's step 2, which the last tests here cover. The Alembic side is
+in ``test_alembic_relax.py``.
 """
 
 from __future__ import annotations
@@ -308,11 +309,49 @@ def test_a_step_cannot_relax_a_column_a_later_step_adds() -> None:
         with_steps(schema, schema.steps[0], relaxes, adds_later)
 
 
-@pytest.mark.parametrize("kind", ["broker", "result_backend", "scheduler_source"])
-def test_the_released_tables_relax_nothing(kind: str) -> None:
+@pytest.mark.parametrize("kind", ["broker", "scheduler_source"])
+def test_the_broker_and_the_scheduler_tables_relax_nothing(kind: str) -> None:
     schema = table_schema(kind)
 
     assert all(step.objects.nullable_columns == () for step in schema.steps)
+
+
+def test_the_results_table_relaxes_result_in_its_second_step_only() -> None:
+    schema = table_schema("result_backend")
+
+    assert [step.objects.nullable_columns for step in schema.steps] == [
+        (),
+        ("result",),
+    ]
+    by_name = {column.name: column for column in schema.columns}
+    assert by_name["result"].nullable
+
+
+def test_a_results_table_at_step_1_makes_step_2_pending() -> None:
+    schema = table_schema("result_backend")
+    at_step_1 = TableState(
+        name=schema.name,
+        relkind="r",
+        columns={
+            "task_id": "uuid",
+            "result": "bytea",
+            "created_at": "timestamp with time zone",
+        },
+        indexes={},
+        not_null=frozenset({"task_id", "result", "created_at"}),
+    )
+
+    plan = plan_migration([schema], CatalogState({schema.name: at_step_1}))
+
+    (pending,) = (item for item in plan.pending if item.step.number == 2)  # noqa: PLR2004
+    assert pending.missing_columns == ("progress",)
+    # The column the step adds is not there to be NOT NULL, and the one it
+    # relaxes still is.
+    assert pending.not_null_columns == ("result",)
+    assert pending.severity == "required"
+    assert pending.describe() == (
+        "missing columns: progress; columns still NOT NULL: result"
+    )
 
 
 # --- the startup check -----------------------------------------------------------

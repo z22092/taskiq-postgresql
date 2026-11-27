@@ -44,20 +44,18 @@ from typing import (
 
 from taskiq_postgresql.abc.driver import QueryDriver
 from taskiq_postgresql.core.sql.catalog import (
-    AddColumnsQuery,
-    AddedIndex,
     CatalogTable,
-    ClaimColumns,
     Column,
     CreatedAtColumn,
     CreateIndexQuery,
     CreateTableQuery,
+    DeclaredStep,
     PrimaryKeyColumn,
     catalog_read,
     check_lock_timeout,
     check_table_objects,
+    declared_step_statements,
     in_transaction,
-    index_name,
     index_names,
     lock_timeout_scripts,
     migration_lock_script,
@@ -713,6 +711,7 @@ def step_statements(
     *,
     step: Optional[int] = None,
     through: Optional[int] = None,
+    kind: Optional[ComponentKind] = None,
     lock: bool = True,
     lock_timeout: int = DEFAULT_LOCK_TIMEOUT,
 ) -> list[str]:
@@ -730,24 +729,34 @@ def step_statements(
         step: Only this step, for each table that has it; a table without it
             adds nothing.
         through: Steps 1 to this one, as for ``migration_statements``.
+        kind: Only the tables of this component, so that a step number two
+            kinds use differently can be run for one of them. Left out, every
+            table is used. The ``step`` and ``through`` rules apply to the
+            tables left.
         lock: Start with the advisory locks, as ``render_sql`` does.
         lock_timeout: Seconds a statement waits for a lock, the advisory lock
             included; ``0`` bounds nothing.
 
     Returns:
         The statements, in the order they run; none when ``step`` is given and
-        no table has it.
+        no table has it, or when ``kind`` leaves no table.
 
     Raises:
         TypeError: if both ``step`` and ``through`` are given.
         ValueError: if ``lock_timeout`` is not a whole number of seconds from
-            0 to 2147483, ``schemas`` is empty, a table name cannot be written
-            in a script, or a table has no step ``through``.
+            0 to 2147483, ``kind`` is not one of ``COMPONENT_KINDS``,
+            ``schemas`` is empty, a table name cannot be written in a script,
+            or a table has no step ``through``.
     """
     if step is not None and through is not None:
         raise TypeError("give step or through, not both")
     check_lock_timeout(lock_timeout)
     tables = _checked_tables(schemas)
+    if kind is not None:
+        wanted = _component_kind(kind)
+        tables = [(table, name) for table, name in tables if table.kind == wanted]
+        if not tables:
+            return []
     if step is None:
         selected = [
             (identifier, _steps_through(table, through)) for table, identifier in tables
@@ -1987,25 +1996,15 @@ def _schema(
     create_index: CreateIndexQuery,
     index_columns: Sequence[Column],
     *,
-    add_columns: AddColumnsQuery,
-    added_columns: Sequence[Column],
-    added_indexes: Sequence[AddedIndex],
+    steps: Sequence[DeclaredStep],
 ) -> TableSchema:
     name = create_table.table_name
-    names = index_names(name, index_columns, added_indexes)
+    added_indexes = [index for step in steps for index in step.added_indexes]
     created_indexes = tuple(
         IndexSchema(name=index, columns=(column.name,), method="hash")
-        for index, column in zip(names, index_columns, strict=False)
-    )
-    added = tuple(
-        IndexSchema(
-            name=index,
-            columns=tuple(column.name for column in added_index.columns),
-            method="btree",
-        )
-        for index, added_index in zip(
-            names[len(index_columns) :],
-            added_indexes,
+        for index, column in zip(
+            index_names(name, index_columns, ()),
+            index_columns,
             strict=True,
         )
     )
@@ -2019,7 +2018,7 @@ def _schema(
         index_columns=index_columns,
         added_indexes=added_indexes,
     )
-    steps = [
+    described = [
         MigrationStep(
             number=1,
             statements=(
@@ -2037,30 +2036,51 @@ def _schema(
             ),
         ),
     ]
-    if added_columns or added_indexes:
-        # What the driver runs after the CREATEs, so a table an older release
-        # created gets it too.
-        steps.append(
+    # What the driver runs after the CREATEs, one step at a time, so a table an
+    # older release created gets it too; the numbers follow step 1. An added
+    # index is named by the declaration, which is the name index_names gives it.
+    for number, step in enumerate(steps, start=2):
+        described.append(
             MigrationStep(
-                number=2,
-                statements=_added_statements(add_columns, added_columns, added_indexes),
+                number=number,
+                statements=_added_statements(create_table.table, step),
                 objects=StepObjects(
                     creates_table=False,
-                    columns=tuple(column.name for column in added_columns),
-                    indexes=added,
+                    columns=tuple(column.name for column in step.added_columns),
+                    indexes=tuple(
+                        IndexSchema(
+                            name=added.name,
+                            columns=tuple(column.name for column in added.columns),
+                            method="btree",
+                        )
+                        for added in step.added_indexes
+                    ),
+                    nullable_columns=tuple(step.nullable_columns),
                 ),
             ),
         )
+    added = tuple(index for step in described[1:] for index in step.objects.indexes)
+    # CREATE TABLE writes the column NOT NULL, and the step that relaxes it
+    # runs after: the final description is the one the last step leaves.
+    relaxed = {name for step in steps for name in step.nullable_columns}
     return TableSchema(
         kind=kind,
         name=name,
         # ADD COLUMN appends, so the added columns come last in the table.
         columns=tuple(
-            _column_schema(column) for column in (*create_table.columns, *added_columns)
+            _relaxed(_column_schema(column), relaxed)
+            for column in (
+                *create_table.columns,
+                *(column for step in steps for column in step.added_columns),
+            )
         ),
         indexes=(*created_indexes, *added),
-        steps=tuple(steps),
+        steps=tuple(described),
     )
+
+
+def _relaxed(column: ColumnSchema, relaxed: set[str]) -> ColumnSchema:
+    return replace(column, nullable=True) if column.name in relaxed else column
 
 
 def declared_schema(kind: ComponentKind, declaration: TableDeclaration) -> TableSchema:
@@ -2087,27 +2107,16 @@ def declared_schema(kind: ComponentKind, declaration: TableDeclaration) -> Table
         CreateTableQuery(table, declaration.table_columns),
         CreateIndexQuery(table),
         declaration.index_columns or (),
-        add_columns=AddColumnsQuery(table),
-        added_columns=declaration.added_columns,
-        added_indexes=declaration.added_indexes,
+        steps=declaration.steps,
     )
 
 
-def _added_statements(
-    add_columns: AddColumnsQuery,
-    added_columns: Sequence[Column],
-    added_indexes: Sequence[AddedIndex],
-) -> tuple[str, ...]:
-    # The driver runs make_query(added_columns, added_indexes) as one string:
-    # the ALTER TABLE, then each CREATE INDEX, each ending with ";". Built one
-    # statement at a time from the same query, so the text stays the same.
-    statements = []
-    if added_columns:
-        statements.append(add_columns.make_query(added_columns).removesuffix(";"))
-    statements.extend(
-        add_columns.make_query((), [index]).removesuffix(";") for index in added_indexes
-    )
-    return tuple(statements)
+# Kept as a module-level name on purpose: tests/test_migration_plan.py patches it
+# to prove that editing a released step breaks the golden file.
+def _added_statements(table: Identifier, step: DeclaredStep) -> tuple[str, ...]:
+    # The statements run_migrations=True runs for the step, built once by the
+    # catalog and held here one by one, so the two cannot differ.
+    return declared_step_statements(table, step)
 
 
 def _component_classes() -> dict[ComponentKind, type]:
@@ -2180,15 +2189,14 @@ def _schema_of_kind(
 
 # Each builder below hands over what the component hands its driver: the key,
 # the columns between it and created_at, the hash-indexed columns, and the
-# columns and indexes added after the CREATEs.
+# steps after the CREATEs.
 # test_a_kind_describes_the_same_table_as_a_component pins them to it.
 
 
 def _broker_parts(table: Identifier, task_id_type: str) -> TableDeclaration:
-    from taskiq_postgresql.broker import Table  # noqa: PLC0415
+    from taskiq_postgresql.broker import Table, claim_step  # noqa: PLC0415
 
     columns = Table(task_id=Column(name="task_id", type_=task_id_type))
-    claim_columns = ClaimColumns(channel=columns.channel, not_before=columns.not_before)
     return TableDeclaration(
         table=table,
         primary_key=columns.primary_key,
@@ -2200,13 +2208,7 @@ def _broker_parts(table: Identifier, task_id_type: str) -> TableDeclaration:
         ],
         created_at=columns.created_at,
         index_columns=[columns.primary_key],
-        added_columns=claim_columns,
-        added_indexes=[
-            AddedIndex(
-                name=index_name(table.configured, columns.not_before),
-                columns=[*claim_columns, columns.primary_key],
-            ),
-        ],
+        steps=[claim_step(table.configured, columns)],
     )
 
 
@@ -2214,7 +2216,10 @@ def _result_backend_parts(
     table: Identifier,
     task_id_type: str,
 ) -> TableDeclaration:
-    from taskiq_postgresql.result_backend import Table  # noqa: PLC0415
+    from taskiq_postgresql.result_backend import (  # noqa: PLC0415
+        RESULTS_STEPS,
+        Table,
+    )
 
     columns = Table(primary_key=PrimaryKeyColumn(name="task_id", type_=task_id_type))
     return TableDeclaration(
@@ -2224,6 +2229,7 @@ def _result_backend_parts(
         # The result backend leaves created_at to the driver's default.
         created_at=CreatedAtColumn(),
         index_columns=[columns.primary_key],
+        steps=RESULTS_STEPS,
     )
 
 
