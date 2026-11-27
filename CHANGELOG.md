@@ -5,6 +5,8 @@ based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-27
+
 Upgrading from 0.4.x:
 
 - Pass `dsn` to `PostgresqlBroker`, `PostgresqlResultBackend` and
@@ -594,4 +596,5 @@ Earlier versions are not described in this file; see the
 [GitHub releases page](https://github.com/z22092/taskiq-postgresql/releases) and
 the [PyPI release history](https://pypi.org/project/taskiq-postgresql/#history).
 
-[unreleased]: https://github.com/z22092/taskiq-postgresql/compare/v0.4.1...HEAD
+[unreleased]: https://github.com/z22092/taskiq-postgresql/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/z22092/taskiq-postgresql/compare/v0.4.1...v0.5.0
